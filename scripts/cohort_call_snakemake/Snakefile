@@ -1,0 +1,970 @@
+from pathlib import Path
+import json
+import os
+import shlex
+import sys
+
+
+configfile: "config/config.yaml"
+
+BASE = Path(workflow.basedir).resolve()
+
+
+def resolve_path(value, relative_to=BASE):
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = Path(relative_to) / path
+    return str(path.resolve())
+
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+RUN_CONFIG_PATH = resolve_path(config["run_config"])
+with open(RUN_CONFIG_PATH, "rt", encoding="utf-8") as handle:
+    RUN = json.load(handle)
+if RUN.get("protocol") != "cohort-call-v1":
+    raise ValueError("unsupported cohort calling run configuration")
+
+
+def load_stage_config(run_key):
+    path = resolve_path(RUN.get(run_key, RUN_CONFIG_PATH))
+    with open(path, "rt", encoding="utf-8") as handle:
+        return path, json.load(handle)
+
+
+LAYOUT_CONFIG_PATH, LAYOUT_RUN = load_stage_config("layout_config")
+LIFTOVER_CONFIG_PATH, LIFTOVER_RUN = load_stage_config("liftover_config")
+GRAPHCIGAR_CONFIG_PATH, GRAPHCIGAR_RUN = load_stage_config("graphcigar_config")
+LOCAL_TEMPLATE_CONFIG_PATH, LOCAL_TEMPLATE_RUN = load_stage_config(
+    "local_template_config"
+)
+VCF_CONFIG_PATH, VCF_RUN = load_stage_config("vcf_config")
+MERGE_CONFIG_PATH, MERGE_RUN = load_stage_config("merge_config")
+
+GRAPH = Path(RUN["graph_folder"])
+SOURCE_GRAPHS = GRAPH / "Graphs"
+SOURCE_GRAPHS_COMPLETE = SOURCE_GRAPHS / "graphs.complete"
+GRAPH_SUMMARY = GRAPH / "summary"
+ALTERNATIVE_BED = GRAPHCIGAR_RUN.get('alternative', '')
+if not ALTERNATIVE_BED and (GRAPH_SUMMARY / 'alternative_intervals.bed').is_file():
+    ALTERNATIVE_BED = str(GRAPH_SUMMARY / 'alternative_intervals.bed')
+ALTERNATIVE_OPTION = '--alternative ' + shlex.quote(ALTERNATIVE_BED) if ALTERNATIVE_BED else ''
+GRAPH_SUMMARY_FILES = (
+    GRAPH_SUMMARY / "local_graphs.tsv",
+    GRAPH_SUMMARY / "alternatives.fasta",
+)
+GRAPH_SUMMARY_AVAILABLE = all(path.is_file() for path in GRAPH_SUMMARY_FILES)
+OUT = Path(RUN["output_folder"])
+CALL_GRAPHS = OUT / "Graphs"
+SAMPLES_ROOT = OUT / "samples"
+SHARDS_ROOT = OUT / "shards"
+CHECKPOINTS = OUT / "checkpoints"
+INPUTS = OUT / "inputs"
+SCRIPT_DIR = Path(RUN["script_folder"])
+GRAPHCIGAR_SCRIPT = SCRIPT_DIR / "graphcigartoref_persample.py"
+MERGE_SCRIPT = SCRIPT_DIR / "graphvcfmerge.py"
+
+
+def script_supports_option(path, option):
+    try:
+        return option in path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
+GRAPH_SUMMARY_SUPPORTED = script_supports_option(
+    GRAPHCIGAR_SCRIPT, "--graph-summary"
+)
+GRAPH_SUMMARY_ENABLED = GRAPH_SUMMARY_AVAILABLE and GRAPH_SUMMARY_SUPPORTED
+if GRAPH_SUMMARY_AVAILABLE and not GRAPH_SUMMARY_SUPPORTED:
+    print(
+        "cohort_call_snakemake: warning: graph summary is available, but "
+        f"{GRAPHCIGAR_SCRIPT} does not support --graph-summary; falling back "
+        "to individual graph FASTAs. Update --script-folder to enable the "
+        "consolidated-summary fast path.",
+        file=sys.stderr,
+    )
+HELPER = BASE / "workflow" / "scripts" / "cohort_call_inputs.py"
+MERGE_STAGE_HELPER = (
+    BASE / "workflow" / "scripts" / "graphvcfmerge_stages.py"
+)
+SLURM_HELPER = (
+    SCRIPT_DIR / "graph_build_snakemake" / "workflow" / "scripts" /
+    "pipeline_inputs.py"
+)
+
+PARTITIONS = list(RUN["partitions"])
+SAMPLES = list(RUN["selected_samples"])
+REFERENCE = RUN["reference"]
+ASSEMBLIES = {row["name"]: row for row in RUN["assemblies"]}
+SAMPLE_THREADS = int(RUN["sample_threads"])
+MATCH_THREADS = int(RUN["match_threads"])
+IO_JOBS = int(RUN.get("io_jobs", 16))
+FORMAT_PROCESSES = int(RUN["format_processes"])
+LIFT_MAX_EXTENSION = int(LIFTOVER_RUN.get(
+    "max_extension", RUN["max_extension"]
+))
+GRAPH_MAX_EXTENSION = int(GRAPHCIGAR_RUN.get(
+    "max_extension", RUN["max_extension"]
+))
+CROSS_VALIDATION_EXTENSION = int(GRAPHCIGAR_RUN.get(
+    "cross_validation_extension", RUN["cross_validation_extension"]
+))
+GRAPHCIGAR_REALIGNMENT = as_bool(GRAPHCIGAR_RUN.get(
+    "realignment", RUN.get("realignment", True)
+))
+GRAPHCIGAR_REALIGNMENT_OPTION = (
+    "--realignment" if GRAPHCIGAR_REALIGNMENT else "--no-realignment"
+)
+EDGE_BLACKREGION = int(VCF_RUN.get(
+    "edge_blackregion", RUN["edge_blackregion"]
+))
+VCF_MAX_IMPUTE = int(VCF_RUN.get(
+    "max_impute", RUN["max_extension"]
+))
+BUFFER_SIZE = int(RUN["buffer_size"])
+BUFFER_BYTES = int(RUN["buffer_bytes"])
+PROGRESS_EVERY = int(RUN["progress_every"])
+PROGRESS_SECONDS = float(RUN["progress_seconds"])
+MAXTASKSPERCHILD = int(RUN["maxtasksperchild"])
+EXTRACT_BATCH_SIZE = int(RUN["extract_batch_size"])
+SV_ONLY_CUTOFF = VCF_RUN.get(
+    "sv_only_retention_cutoff", RUN.get("sv_only_retention_cutoff")
+)
+SEQCOMPRESS = as_bool(VCF_RUN.get(
+    "seqcompress", RUN.get("seqcompress", False)
+))
+PA_TAG = as_bool(VCF_RUN.get("pa_tag", RUN.get("pa_tag", True)))
+RESOLVE_CONFLICTS_BY_ALIGNMENT_SCORE = as_bool(VCF_RUN.get(
+    "resolve_conflicts_by_alignment_score", True
+))
+CONFLICT_POLICY_OPTION = (
+    "--resolve-conflicts-by-alignment-score"
+    if RESOLVE_CONFLICTS_BY_ALIGNMENT_SCORE
+    else "--no-resolve-conflicts-by-alignment-score"
+)
+VCF_REALIGNMENT = as_bool(VCF_RUN.get(
+    "realignment", RUN.get("realignment", True)
+))
+VCF_REALIGNMENT_OPTION = (
+    "--realignment" if VCF_REALIGNMENT else "--no-realignment"
+)
+SEPARATE_ADJACENT_INDELS = as_bool(VCF_RUN.get(
+    "separate_adjacent_indels", False
+))
+SEPARATE_ADJACENT_INDELS_OPTION = (
+    "--separate-adjacent-indels" if SEPARATE_ADJACENT_INDELS else ""
+)
+MERGE_MINSVSIZE = int(MERGE_RUN.get("minsvsize", 20))
+MERGE_MODE = MERGE_RUN.get("merge_mode", "svonly")
+MERGE_EMIT_SMALL = MERGE_MODE in ("all", "svindel")
+MERGE_SMALL_OPTION = "--output-small" if MERGE_EMIT_SMALL else ""
+MERGE_DISTANCE = int(MERGE_RUN.get("merge_distance", 500))
+MERGE_SIZE_SIMILARITY = float(MERGE_RUN.get("size_similarity", 0.7))
+MERGE_SEQUENCE_SIMILARITY = float(
+    MERGE_RUN.get("sequence_similarity", 0.7)
+)
+MERGE_VAR_IN_INSERT = int(MERGE_RUN.get("var_in_insert", 100))
+MERGE_PROCESSES = int(RUN.get("merge_processes", min(16, SAMPLE_THREADS)))
+MERGE_CHR1_RESOURCE_MULTIPLIER = int(config.get(
+    "merge_chr1_resource_multiplier", RUN.get("merge_chr1_resource_multiplier", 2)
+))
+if MERGE_CHR1_RESOURCE_MULTIPLIER < 1:
+    raise ValueError("merge_chr1_resource_multiplier must be positive")
+MERGE_SCAN_PROCESSES = SAMPLE_THREADS
+MERGE_LOCUS_PROCESSES = int(RUN.get(
+    "merge_locus_processes", min(4, SAMPLE_THREADS)
+))
+MERGE_THREADS = max(MERGE_PROCESSES, MERGE_LOCUS_PROCESSES)
+MERGE_MEMORY_OVERRIDE = str(RUN.get("merge_memory", "")).strip()
+MERGE_SCAN_MEMORY = (
+    MERGE_MEMORY_OVERRIDE or f"{2 * MERGE_SCAN_PROCESSES}G"
+)
+MERGE_CHROM_MEMORY = (
+    MERGE_MEMORY_OVERRIDE or f"{2 * MERGE_PROCESSES}G"
+)
+MERGE_CONCAT_MEMORY = MERGE_MEMORY_OVERRIDE or "2G"
+LOCAL_TEMPLATE_FALLBACK = as_bool(
+    LOCAL_TEMPLATE_RUN.get(
+        "local_template_fallback", RUN.get("local_template_fallback", True)
+    )
+)
+
+SLURM_ENABLED = as_bool(RUN.get("slurm", False))
+SLURM_JOBS = int(RUN.get("slurm_jobs", 20))
+MERGE_CHROM_JOBS = min(25, SLURM_JOBS)
+SLURM_ACCOUNT = str(RUN.get("slurm_account", "")).strip()
+SLURM_TIME = str(RUN.get("slurm_time", "200:00:00")).strip()
+SLURM_PARTITION = str(RUN.get("slurm_partition", "")).strip()
+SLURM_ARGS_TEXT = str(RUN.get("slurm_args", "")).strip()
+SLURM_ARGS = shlex.split(SLURM_ARGS_TEXT) if SLURM_ARGS_TEXT else []
+PYTHON = sys.executable
+WAIT_NONEMPTY = shlex.join([
+    PYTHON, str(SLURM_HELPER), "wait-nonempty",
+    "--timeout", "60", "--interval", "1",
+])
+
+
+def slurm_prefix(job_name, cpus, memory):
+    if not SLURM_ENABLED:
+        return ""
+    command = [
+        PYTHON, str(SLURM_HELPER), "run-slurm",
+        "--sbatch", "sbatch",
+        "--cpus", str(cpus),
+        "--memory", str(memory),
+    ]
+    if SLURM_ACCOUNT:
+        command.extend(["--account", SLURM_ACCOUNT])
+    if SLURM_TIME:
+        command.extend(["--time", SLURM_TIME])
+    if SLURM_PARTITION:
+        command.extend(["--partition", SLURM_PARTITION])
+    command.extend("--sbatch-arg=" + argument for argument in SLURM_ARGS)
+    command.extend([
+        "--job-name", job_name,
+        "--log-dir", str(OUT / "slurm_logs"),
+        "--",
+    ])
+    return shlex.join(command)
+
+
+def merge_chrom_runner():
+    command = [
+        PYTHON, str(MERGE_STAGE_HELPER), "run-chroms",
+        "--chrom-list", str(MERGE_CHROMS),
+        "--shards-dir", str(MERGE_TMPDIR),
+        "--marker", str(MERGE_CHROMS_COMPLETE),
+        *(["--slurm", "--sbatch", "sbatch"] if SLURM_ENABLED else []),
+        "--cpus", str(MERGE_PROCESSES),
+        "--memory", MERGE_CHROM_MEMORY,
+        "--chr1-resource-multiplier", str(MERGE_CHR1_RESOURCE_MULTIPLIER),
+        "--jobs", str(MERGE_CHROM_JOBS),
+        "--job-name", "merge-cohort-chrom",
+        "--log-dir", str(OUT / "slurm_logs"),
+    ]
+    if SLURM_ACCOUNT:
+        command.extend(["--account", SLURM_ACCOUNT])
+    if SLURM_TIME:
+        command.extend(["--time", SLURM_TIME])
+    if SLURM_PARTITION:
+        command.extend(["--partition", SLURM_PARTITION])
+    command.extend("--sbatch-arg=" + argument for argument in SLURM_ARGS)
+    command.extend([
+        "--", PYTHON, str(MERGE_SCRIPT),
+        "--stage", "chrom", "--shards-dir", str(MERGE_TMPDIR),
+        "--sv", "--minsvsize", str(MERGE_MINSVSIZE),
+        "--merge-distance", str(MERGE_DISTANCE),
+        "--size-similarity", str(MERGE_SIZE_SIMILARITY),
+        "--sequence-similarity", str(MERGE_SEQUENCE_SIMILARITY),
+        "--var-in-insert", str(MERGE_VAR_IN_INSERT),
+        "--processes", str(MERGE_PROCESSES),
+        "--kmermatch", str(RUN["kmermatch"]),
+    ])
+    if MERGE_EMIT_SMALL:
+        command.append("--output-small")
+    if MERGE_MODE == "all":
+        command.extend(["--insertion-snps", str(MERGE_TMPDIR / "insertion_snps")])
+    return shlex.join(command)
+
+
+def extraction_batches():
+    return [
+        (
+            "batch{:06d}".format(index // EXTRACT_BATCH_SIZE + 1),
+            PARTITIONS[index:index + EXTRACT_BATCH_SIZE],
+        )
+        for index in range(0, len(PARTITIONS), EXTRACT_BATCH_SIZE)
+    ]
+
+
+def match_batches():
+    count = min(int(RUN["match_batches"]), len(PARTITIONS))
+    base, remainder = divmod(len(PARTITIONS), count)
+    output = []
+    start = 0
+    for index in range(count):
+        size = base + (1 if index < remainder else 0)
+        output.append((
+            "batch{:06d}".format(index + 1),
+            PARTITIONS[start:start + size],
+        ))
+        start += size
+    return output
+
+
+EXTRACTION_BATCHES = extraction_batches()
+EXTRACTION_NAMES = [name for name, _values in EXTRACTION_BATCHES]
+EXTRACTION_LISTS = [
+    str(INPUTS / "extraction_batches" / (name + ".list"))
+    for name in EXTRACTION_NAMES
+]
+MATCH_BATCHES = match_batches()
+MATCH_NAMES = [name for name, _values in MATCH_BATCHES]
+MATCH_LISTS = [
+    str(INPUTS / "match_batches" / (name + ".list"))
+    for name in MATCH_NAMES
+]
+MATCH_STATUSES = [
+    str(OUT / "batch_status" / "match" / (name + ".tsv"))
+    for name in MATCH_NAMES
+]
+NORMALIZED_QUERY = INPUTS / "query_paths.normalized.txt"
+SELECTED_QUERY = INPUTS / "selected_query_paths.txt"
+SELECTED_SAMPLES = INPUTS / "selected_samples.list"
+LAYOUT = CHECKPOINTS / "layout.json"
+ACTIVE_PARTITIONS = CHECKPOINTS / "Graphs.list"
+COMPLETE = CHECKPOINTS / "cohort_call.complete"
+EXTRACTION_COMPLETE = CHECKPOINTS / "sample_extraction.complete.json"
+LOCAL_TEMPLATES = CHECKPOINTS / "local_reference_templates.fa"
+RAW_LOCAL_TEMPLATES = CHECKPOINTS / "local_reference_templates.unlifted.fa"
+MERGE_VCF_LIST = INPUTS / "mergevcf.list"
+COHORT_VCF = Path(RUN.get("cohort_vcf", str(OUT / "tmp/cohort_merge/cohort.sv.vcf")))
+SV_SMALL_VCFS = [str(COHORT_VCF) + ".small.vcf"] if MERGE_EMIT_SMALL else []
+COHORT_SNP_VCF = OUT / "tmp/cohort_merge/cohort.snp.vcf"
+COHORT_INDEL_VCF = OUT / "tmp/cohort_merge/cohort.indel.vcf"
+FINAL_VCFS = [str(OUT / ("cohort." + kind + ".vcf")) for kind in
+              {"all": ("sv", "indel", "snp"), "svonly": ("sv",), "snp": ("snp",), "svindel": ("sv", "indel")}[MERGE_MODE]]
+SMALL_MERGE_SCRIPT = SCRIPT_DIR / "graphvcfmerge_snp.py"
+SMALL_MERGE_TMPDIR = OUT / "tmp" / "graphvcfmerge_small"
+SMALL_MERGE_MANIFEST = CHECKPOINTS / "small_merge.manifest.json"
+SMALL_VCFS = ([str(COHORT_SNP_VCF), str(COHORT_INDEL_VCF)]
+              if MERGE_MODE in ("all", "snp") else [])
+MERGE_TMPDIR = Path(RUN.get(
+    "merge_tmpdir", str(OUT / "tmp" / "graphvcfmerge")
+))
+MERGE_CHROMS = MERGE_TMPDIR / "chroms.txt"
+MERGE_CHROMS_COMPLETE = MERGE_TMPDIR / "chroms.complete.tsv"
+SAMPLE_VCFS = expand(
+    str(SAMPLES_ROOT / "{sample}" / "{sample}.vcf"), sample=SAMPLES,
+)
+
+
+def sample_fasta(wildcards):
+    return ancient(ASSEMBLIES[wildcards.sample]["fasta"])
+
+
+def sample_fai(wildcards):
+    return ancient(ASSEMBLIES[wildcards.sample]["fai"])
+
+
+def sample_path(wildcards, suffix):
+    return str(SAMPLES_ROOT / wildcards.sample / (wildcards.sample + suffix))
+
+
+rule all:
+    input:
+        str(COMPLETE),
+        FINAL_VCFS,
+        SAMPLE_VCFS
+
+
+rule prepare_calling_layout:
+    input:
+        layout_config=ancient(LAYOUT_CONFIG_PATH),
+        query=ancient(RUN["query_paths"]),
+        partitions=ancient(RUN["partition_list"]),
+    output:
+        layout=str(LAYOUT),
+        active=str(ACTIVE_PARTITIONS),
+        normalized=str(NORMALIZED_QUERY),
+        selected_query=str(SELECTED_QUERY),
+        selected_samples=str(SELECTED_SAMPLES),
+        match_lists=MATCH_LISTS,
+        extraction_lists=EXTRACTION_LISTS,
+    threads: 1
+    shell:
+        """
+        {PYTHON:q} {HELPER:q} prepare --run-config {input.layout_config:q}
+        {WAIT_NONEMPTY} {output.layout:q} {output.active:q} \
+          {output.normalized:q} {output.selected_query:q} \
+          {output.selected_samples:q}
+        """
+
+
+rule match_partition_blocks_batch:
+    input:
+        # Static layout inputs are existence-based checkpoints. A newly
+        # completed graph protocol does invalidate the batch so its internal
+        # per-partition checks can refresh stale RefMatch tables.
+        layout_config=ancient(LAYOUT_CONFIG_PATH),
+        layout=ancient(rules.prepare_calling_layout.output.layout),
+        query=ancient(rules.prepare_calling_layout.output.normalized),
+        selected=ancient(rules.prepare_calling_layout.output.selected_samples),
+        graph_complete=str(SOURCE_GRAPHS_COMPLETE),
+        partition_list=lambda wc: ancient(str(
+            INPUTS / "match_batches" / (wc.batch + ".list")
+        )),
+        script=ancient(str(SCRIPT_DIR / "match_partition_blocks.py")),
+        graphfixbreaks=ancient(str(SCRIPT_DIR / "gfixbreaks.py")),
+        kmermatch=ancient(RUN["kmermatch"]),
+    output:
+        status=str(OUT / "batch_status" / "match" / "{batch}.tsv"),
+    threads: 1 if SLURM_ENABLED else MATCH_THREADS
+    resources:
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        slurm=lambda wc: slurm_prefix(
+            "match-" + wc.batch, MATCH_THREADS, RUN["match_memory"]
+        ),
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {input.script:q} \
+          --partition-list {input.partition_list:q} \
+          --graph-folder {SOURCE_GRAPHS:q} \
+          --output-graph-folder {CALL_GRAPHS:q} \
+          --query-paths {input.query:q} \
+          --sample-list {input.selected:q} \
+          --reference-haplotype {REFERENCE:q} \
+          --manifest {output.status:q} \
+          --graphfixbreaks {input.graphfixbreaks:q} \
+          --kmermatch {input.kmermatch:q} \
+          --jobs {MATCH_THREADS} --resume --strict
+        {WAIT_NONEMPTY} {output.status:q}
+        {PYTHON:q} {HELPER:q} validate-match-batch \
+          --run-config {RUN_CONFIG_PATH:q} \
+          --partition-list {input.partition_list:q} \
+          --manifest {output.status:q}
+        """
+
+
+rule extract_and_concatenate_samples:
+    input:
+        stage_config=ancient(LAYOUT_CONFIG_PATH),
+        layout=ancient(rules.prepare_calling_layout.output.layout),
+        helper=ancient(str(HELPER)),
+        # Rebuilt graph matches change the extracted sample alignments.
+        matches=MATCH_STATUSES,
+        batch_lists=[ancient(path) for path in EXTRACTION_LISTS],
+    output:
+        marker=str(EXTRACTION_COMPLETE),
+        refmatches=expand(
+            str(SAMPLES_ROOT / "{sample}" / "{sample}.refmatch.tsv"),
+            sample=SAMPLES,
+        ),
+        alignments=expand(
+            str(SAMPLES_ROOT / "{sample}" / "{sample}.align.txt"),
+            sample=SAMPLES,
+        ),
+    threads: 1 if SLURM_ENABLED else IO_JOBS
+    resources:
+        io_jobs=IO_JOBS,
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        slurm=slurm_prefix(
+            "extract-samples", IO_JOBS, RUN["extraction_memory"]
+        ),
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {HELPER:q} extract-all \
+          --run-config {RUN_CONFIG_PATH:q} \
+          --marker {output.marker:q} \
+          --jobs {IO_JOBS}
+        {WAIT_NONEMPTY} {output.marker:q}
+        """
+
+
+# Script mtimes must not invalidate completed cohort stages. Keep scripts as
+# required ancient inputs; data and semantic stage configs retain their checks.
+rule discover_local_reference_templates:
+    input:
+        stage_config=LOCAL_TEMPLATE_CONFIG_PATH,
+        extraction=rules.extract_and_concatenate_samples.output.marker,
+        reference_align=ancient(str(
+            SAMPLES_ROOT / REFERENCE / (REFERENCE + ".align.txt")
+        )),
+        graph_list=ancient(str(ACTIVE_PARTITIONS)),
+        script=ancient(str(SCRIPT_DIR / "local_reference_templates.py")),
+        contig_filter=ancient(str(SCRIPT_DIR / "assembly_contigs.py")),
+    output:
+        fasta=str(RAW_LOCAL_TEMPLATES),
+        fai=str(RAW_LOCAL_TEMPLATES) + ".fai",
+    threads: 1
+    resources:
+        io_jobs=1,
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        disabled="" if LOCAL_TEMPLATE_FALLBACK else "--disabled",
+        slurm=slurm_prefix(
+            "local-templates", 1, RUN["extraction_memory"]
+        ),
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {input.script:q} \
+          --graph-folder {SOURCE_GRAPHS:q} \
+          --graph-list {input.graph_list:q} \
+          --align-ref {input.reference_align:q} \
+          --reference-haplotype {REFERENCE:q} \
+          --output {output.fasta:q} {params.disabled}
+        {WAIT_NONEMPTY} {output.fasta:q} {output.fai:q}
+        """
+
+
+rule local_reference_templates:
+    input:
+        raw=rules.discover_local_reference_templates.output.fasta,
+        stage_config=LOCAL_TEMPLATE_CONFIG_PATH,
+        query=str(INPUTS / "query_paths.normalized.txt"),
+        reference=ASSEMBLIES[REFERENCE]["fasta"],
+        sources=[row["fasta"] for row in ASSEMBLIES.values()],
+        source_indexes=[row["fai"] for row in ASSEMBLIES.values()],
+        script=ancient(str(SCRIPT_DIR / "lift_local_templates.py")),
+        localization=ancient(str(SCRIPT_DIR / "minsetref_localize.py")),
+        aligner=ancient(str(SCRIPT_DIR / "minsetref_align.py")),
+    output:
+        fasta=str(LOCAL_TEMPLATES),
+        fai=str(LOCAL_TEMPLATES) + ".fai",
+    threads: 1 if SLURM_ENABLED else SAMPLE_THREADS
+    resources:
+        io_jobs=1,
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        slurm=slurm_prefix("lift-local-templates", SAMPLE_THREADS, RUN["extraction_memory"])
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {input.script:q} \
+          --input {input.raw:q} --assemblies {input.query:q} \
+          --reference-fasta {input.reference:q} --reference-haplotype {REFERENCE:q} \
+          --threads {SAMPLE_THREADS} --output {output.fasta:q}
+        {WAIT_NONEMPTY} {output.fasta:q} {output.fai:q}
+        """
+
+
+rule genomelift_sample:
+    input:
+        stage_config=ancient(LIFTOVER_CONFIG_PATH),
+        refmatch=lambda wc: str(
+            SAMPLES_ROOT / wc.sample / (wc.sample + ".refmatch.tsv")
+        ),
+        align=lambda wc: str(
+            SAMPLES_ROOT / wc.sample / (wc.sample + ".align.txt")
+        ),
+        reference=ancient(RUN["reference_fasta"]),
+        reference_fai=ancient(RUN["reference_fai"]),
+        script=ancient(str(SCRIPT_DIR / "GenomeLift.py")),
+    output:
+        str(SAMPLES_ROOT / "{sample}" / "{sample}.genomelift.tsv"),
+    threads: 1 if SLURM_ENABLED else SAMPLE_THREADS
+    resources:
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        tmpdir=lambda wc: str(
+            SAMPLES_ROOT / wc.sample / (wc.sample + ".GenomeLiftTemp")
+        ),
+        non_reference=(
+            "--non-reference-tags "
+            + shlex.quote(LIFTOVER_RUN.get("non_reference_tags", ""))
+            if LIFTOVER_RUN.get("non_reference_tags") else ""
+        ),
+        slurm=lambda wc: slurm_prefix(
+            "lift-" + wc.sample,
+            SAMPLE_THREADS,
+            RUN["genomelift_memory"],
+        ),
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {input.script:q} \
+          --input {input.refmatch:q} --alignments {input.align:q} \
+          --output {output:q} \
+          --refhaplo {REFERENCE:q} \
+          --threads {SAMPLE_THREADS} --parallel-unit contig \
+          --tmpdir {params.tmpdir:q} --max-extension {LIFT_MAX_EXTENSION} \
+          --filter-hg38-alts {params.non_reference}
+        {WAIT_NONEMPTY} {output:q}
+        """
+
+
+rule graphcigartoref_sample:
+    input:
+        stage_config=GRAPHCIGAR_CONFIG_PATH,
+        alternative=(ALTERNATIVE_BED,) if ALTERNATIVE_BED else (),
+        genomelift=rules.genomelift_sample.output,
+        query_align=lambda wc: ancient(str(
+            SAMPLES_ROOT / wc.sample / (wc.sample + ".align.txt")
+        )),
+        reference_align=ancient(str(
+            SAMPLES_ROOT / REFERENCE / (REFERENCE + ".align.txt")
+        )),
+        query_fasta=sample_fasta,
+        query_fai=sample_fai,
+        reference=ancient(RUN["reference_fasta"]),
+        reference_fai=ancient(RUN["reference_fai"]),
+        graph_list=ancient(str(ACTIVE_PARTITIONS)),
+        graph_summary=(
+            tuple(ancient(str(path)) for path in GRAPH_SUMMARY_FILES)
+            if GRAPH_SUMMARY_ENABLED else ()
+        ),
+        layout=ancient(str(LAYOUT)),
+        local_templates=rules.local_reference_templates.output.fasta,
+        local_templates_fai=rules.local_reference_templates.output.fai,
+        script=ancient(str(GRAPHCIGAR_SCRIPT)),
+    output:
+        str(SAMPLES_ROOT / "{sample}" / "{sample}.graphcigartoref.tsv"),
+    threads: 1 if SLURM_ENABLED else SAMPLE_THREADS
+    resources:
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        graph_summary=(
+            "--graph-summary " + shlex.quote(str(GRAPH_SUMMARY))
+            if GRAPH_SUMMARY_ENABLED else ""
+        ),
+        slurm=lambda wc: slurm_prefix(
+            "gcigar-" + wc.sample,
+            SAMPLE_THREADS,
+            RUN["graphcigar_memory"],
+        ),
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {input.script:q} \
+          --genomelift {input.genomelift:q} \
+          --align-query {input.query_align:q} \
+          --align-ref {input.reference_align:q} \
+          --query-genome {wildcards.sample:q} --refhaplo {REFERENCE:q} \
+          --fasta-query {input.query_fasta:q} \
+          --graph-folder {SOURCE_GRAPHS:q} \
+          {params.graph_summary} \
+          --graph-list {input.graph_list:q} \
+          --reference {input.reference:q} --output {output:q} \
+          --local-reference-templates {input.local_templates:q} \
+          --processes {SAMPLE_THREADS} \
+          {ALTERNATIVE_OPTION} \
+          --max-extension {GRAPH_MAX_EXTENSION} \
+          --cross-validation-extension {CROSS_VALIDATION_EXTENSION} \
+          {GRAPHCIGAR_REALIGNMENT_OPTION} \
+          --buffer-size {BUFFER_SIZE} --buffer-bytes {BUFFER_BYTES} \
+          --progress-every {PROGRESS_EVERY} \
+          --progress-seconds {PROGRESS_SECONDS} \
+          --maxtasksperchild {MAXTASKSPERCHILD}
+        {WAIT_NONEMPTY} {output:q}
+        """
+
+
+rule fill_graphcigartoref_gaps_sample:
+    input:
+        graphcigar=rules.graphcigartoref_sample.output,
+        genomelift=rules.genomelift_sample.output,
+        query_fasta=sample_fasta,
+        query_fai=sample_fai,
+        reference=ancient(RUN["reference_fasta"]),
+        reference_fai=ancient(RUN["reference_fai"]),
+        local_templates=rules.local_reference_templates.output.fasta,
+        local_templates_fai=rules.local_reference_templates.output.fai,
+        script=ancient(str(SCRIPT_DIR / "fill_graphcigartoref_gaps.py")),
+    output:
+        graphcigar=str(
+            SAMPLES_ROOT / "{sample}" / "{sample}.graphcigartoreffix.tsv"
+        ),
+        genomeliftfix=str(
+            SAMPLES_ROOT / "{sample}" / "{sample}.genomeliftfix.tsv"
+        ),
+    threads: 1 if SLURM_ENABLED else SAMPLE_THREADS
+    resources:
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        slurm=lambda wc: slurm_prefix(
+            "gapfill-" + wc.sample,
+            SAMPLE_THREADS,
+            RUN["gapfill_memory"],
+        ),
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {input.script:q} \
+          --input {input.graphcigar:q} \
+          --genomelift {input.genomelift:q} \
+          --genomelift-fix-output {output.genomeliftfix:q} \
+          --query-genome {wildcards.sample:q} \
+          --fasta-query {input.query_fasta:q} \
+          --reference {input.reference:q} --output {output.graphcigar:q} \
+          --local-reference-templates {input.local_templates:q} \
+          --processes {SAMPLE_THREADS}
+        {WAIT_NONEMPTY} {output.graphcigar:q}
+        test -s {output.genomeliftfix:q}
+        """
+
+
+rule graphreftovcf_sample:
+    input:
+        stage_config=VCF_CONFIG_PATH,
+        graphcigar=rules.fill_graphcigartoref_gaps_sample.output.graphcigar,
+        genomelift=rules.genomelift_sample.output,
+        genomeliftfix=rules.fill_graphcigartoref_gaps_sample.output.genomeliftfix,
+        query_fasta=sample_fasta,
+        query_fai=sample_fai,
+        reference=ancient(RUN["reference_fasta"]),
+        reference_fai=ancient(RUN["reference_fai"]),
+        local_templates=rules.local_reference_templates.output.fasta,
+        local_templates_fai=rules.local_reference_templates.output.fai,
+        script=ancient(str(SCRIPT_DIR / "graphreftovcf_persample.py")),
+    output:
+        str(SAMPLES_ROOT / "{sample}" / "{sample}.vcf"),
+    threads: 1 if SLURM_ENABLED else SAMPLE_THREADS
+    resources:
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        sv_only=(
+            "--svcutoff {}".format(int(SV_ONLY_CUTOFF))
+            if SV_ONLY_CUTOFF is not None else ""
+        ),
+        sequence_options=" ".join(
+            option for option in (
+                "--seqcompress" if SEQCOMPRESS else "",
+                "--PAtag" if PA_TAG else "--noPAtag",
+            ) if option
+        ),
+        slurm=lambda wc: slurm_prefix(
+            "vcf-" + wc.sample,
+            SAMPLE_THREADS,
+            RUN["vcf_memory"],
+        ),
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {input.script:q} \
+          --input {input.graphcigar:q} --ref {input.reference:q} \
+          --local-reference-templates {input.local_templates:q} \
+          --fasta-query {input.query_fasta:q} \
+          --coord-map {input.genomelift:q},{input.genomeliftfix:q} \
+          --output {output:q} \
+          --columns {wildcards.sample:q} --processes {SAMPLE_THREADS} \
+          --format-processes {FORMAT_PROCESSES} \
+          --edge-blackregion {EDGE_BLACKREGION} \
+          {CONFLICT_POLICY_OPTION} \
+          {VCF_REALIGNMENT_OPTION} \
+          {SEPARATE_ADJACENT_INDELS_OPTION} \
+          {params.sv_only} \
+          {params.sequence_options} \
+          --max-impute {VCF_MAX_IMPUTE}
+        {WAIT_NONEMPTY} {output:q}
+        """
+
+
+rule merge_vcf_list:
+    input:
+        vcfs=SAMPLE_VCFS
+    output:
+        str(MERGE_VCF_LIST)
+    run:
+        destination = Path(str(output[0]))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(
+            destination.name + ".tmp." + str(os.getpid())
+        )
+        try:
+            with temporary.open("wt", encoding="utf-8") as handle:
+                for path in input.vcfs:
+                    handle.write(str(Path(str(path)).resolve()) + "\n")
+            os.replace(str(temporary), str(destination))
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def merge_temporary(path):
+    # Missing temporary outputs must not cause a completed cohort to remerge.
+    return str(path) if as_bool(RUN.get("keep_merge_tmpdir", False)) else temp(str(path))
+
+
+if MERGE_MODE != "snp":
+    rule graphvcfmerge_scan:
+        input:
+            stage_config=MERGE_CONFIG_PATH,
+            vcf_list=rules.merge_vcf_list.output,
+            script=ancient(str(MERGE_SCRIPT)),
+        output:
+            chroms=merge_temporary(MERGE_CHROMS),
+            raw=[merge_temporary(SMALL_MERGE_TMPDIR / "raw.manifest.json")] if MERGE_MODE == "all" else [],
+        threads: 1 if SLURM_ENABLED else MERGE_SCAN_PROCESSES
+        resources:
+            slurm_jobs=1 if SLURM_ENABLED else 0
+        params:
+            slurm=slurm_prefix(
+                "merge-cohort-scan", MERGE_SCAN_PROCESSES,
+                MERGE_SCAN_MEMORY,
+            ),
+            snps=shlex.join(["--snp-shards-dir", str(SMALL_MERGE_TMPDIR)]) if MERGE_MODE == "all" else "",
+        shell:
+            """
+            {params.slurm} {PYTHON:q} {input.script:q} \
+              -I {input.vcf_list:q} --stage scan \
+              --shards-dir {MERGE_TMPDIR:q} --sv \
+              --processes {MERGE_SCAN_PROCESSES} {params.snps}
+            test -e {output.chroms:q}
+            """
+
+
+    rule graphvcfmerge_chroms:
+        input:
+            stage_config=MERGE_CONFIG_PATH,
+            chroms=rules.graphvcfmerge_scan.output.chroms,
+            script=ancient(str(MERGE_SCRIPT)),
+            helper=ancient(str(MERGE_STAGE_HELPER)),
+        output:
+            merge_temporary(MERGE_CHROMS_COMPLETE),
+        threads: 1 if SLURM_ENABLED else MERGE_THREADS
+        resources:
+            slurm_jobs=1 if SLURM_ENABLED else 0
+        params:
+            runner=merge_chrom_runner(),
+        shell:
+            """
+            {params.runner}
+            {WAIT_NONEMPTY} {output:q}
+            """
+
+
+    rule graphvcfmerge_cohort:
+        input:
+            stage_config=MERGE_CONFIG_PATH,
+            chroms_complete=rules.graphvcfmerge_chroms.output,
+            script=ancient(str(MERGE_SCRIPT)),
+        output:
+            main=merge_temporary(COHORT_VCF),
+            auxiliary=[merge_temporary(path) for path in (SV_SMALL_VCFS +
+                       ([str(MERGE_TMPDIR / "insertion_snps/manifest.json")] if MERGE_MODE == "all" else []))],
+        threads: 1 if SLURM_ENABLED else min(8, MERGE_PROCESSES)
+        resources:
+            slurm_jobs=1 if SLURM_ENABLED else 0
+        params:
+            slurm=slurm_prefix(
+                "merge-cohort-concat", min(8, MERGE_PROCESSES), MERGE_CONCAT_MEMORY
+            ),
+            workers=lambda wc, threads: min(8, MERGE_PROCESSES) if SLURM_ENABLED else threads,
+            snps=shlex.join(["--insertion-snps", str(MERGE_TMPDIR / "insertion_snps")]) if MERGE_MODE == "all" else "",
+        shell:
+            """
+            {params.slurm} {PYTHON:q} {input.script:q} \
+              --stage concat --shards-dir {MERGE_TMPDIR:q} \
+              --output {output.main:q} --sv --processes {params.workers} {MERGE_SMALL_OPTION} {params.snps}
+            {WAIT_NONEMPTY} {output.main:q}
+            """
+
+if SMALL_VCFS:
+    checkpoint graphvcfmerge_small_scan:
+        input:
+            raw=rules.graphvcfmerge_scan.output.raw if MERGE_MODE == "all" else [],
+            stage_config=MERGE_CONFIG_PATH,
+            vcfs=SAMPLE_VCFS,
+            vcf_list=rules.merge_vcf_list.output,
+            script=ancient(str(SMALL_MERGE_SCRIPT)),
+        output:
+            manifest=str(SMALL_MERGE_MANIFEST),
+            shards=merge_temporary(SMALL_MERGE_TMPDIR / "manifest.json"),
+        threads: 1 if SLURM_ENABLED else MERGE_SCAN_PROCESSES
+        resources:
+            slurm_jobs=1 if SLURM_ENABLED else 0
+        params:
+            slurm=slurm_prefix("merge-small-scan", MERGE_SCAN_PROCESSES, MERGE_SCAN_MEMORY),
+            stage=shlex.join(["--stage", "prepare", "--raw-manifest", str(SMALL_MERGE_TMPDIR / "raw.manifest.json")]) if MERGE_MODE == "all" else "--stage scan",
+        shell:
+            """
+            {params.slurm} {PYTHON:q} {input.script:q} -I {input.vcf_list:q} \
+              {params.stage} --shards-dir {SMALL_MERGE_TMPDIR:q} \
+              --manifest-output {output.manifest:q} \
+              --svcutoff {MERGE_MINSVSIZE} --processes {MERGE_SCAN_PROCESSES} --snp-only
+            """
+
+
+    rule graphvcfmerge_small_chrom:
+        input:
+            manifest=lambda wc: checkpoints.graphvcfmerge_small_scan.get().output.shards,
+            script=ancient(str(SMALL_MERGE_SCRIPT)),
+        output:
+            snp=merge_temporary(SMALL_MERGE_TMPDIR / "{generation}" / "parts" / "{chrom}.snp.part"),
+            indel=merge_temporary(SMALL_MERGE_TMPDIR / "{generation}" / "parts" / "{chrom}.indel.part"),
+        wildcard_constraints:
+            generation="scan-[^/]+",
+            chrom="[0-9a-f]{64}",
+        threads: 1 if SLURM_ENABLED else 32
+        resources:
+            slurm_jobs=1 if SLURM_ENABLED else 0
+        params:
+            slurm=lambda wc: slurm_prefix("merge-small-" + wc.chrom[:12], 32, "64G"),
+            workers=lambda wc, threads: 32 if SLURM_ENABLED else threads,
+        shell:
+            """
+            {params.slurm} {PYTHON:q} {input.script:q} \
+              --stage chrom --shards-dir {SMALL_MERGE_TMPDIR:q} --chrom {wildcards.chrom:q} --processes {params.workers}
+            """
+
+
+    def small_merge_parts(wildcards):
+        manifest_path = checkpoints.graphvcfmerge_small_scan.get().output.manifest
+        with open(manifest_path) as handle:
+            manifest = json.load(handle)
+        return [str(Path(manifest["directory"]) / "parts" / (key + "." + kind + ".part"))
+                for key in manifest["chroms"] for kind in ("snp", "indel")]
+
+
+    rule graphvcfmerge_small_cohort:
+        input:
+            parts=small_merge_parts,
+            insertions=[str(MERGE_TMPDIR / "insertion_snps/manifest.json")] if MERGE_MODE == "all" else [],
+            manifest=lambda wc: checkpoints.graphvcfmerge_small_scan.get().output.shards,
+            script=ancient(str(SMALL_MERGE_SCRIPT)),
+        output:
+            snp=merge_temporary(COHORT_SNP_VCF),
+            indel=merge_temporary(COHORT_INDEL_VCF),
+        threads: 1
+        resources:
+            slurm_jobs=1 if SLURM_ENABLED else 0
+        params:
+            prefix=str(COHORT_SNP_VCF).removesuffix(".snp.vcf"),
+            slurm=slurm_prefix("merge-small-concat", 1, MERGE_CONCAT_MEMORY),
+            snps=shlex.join(["--insertion-snps", str(MERGE_TMPDIR / "insertion_snps")]) if MERGE_MODE == "all" else "",
+        shell:
+            """
+            {params.slurm} {PYTHON:q} {input.script:q} \
+              --stage concat --shards-dir {SMALL_MERGE_TMPDIR:q} --output {params.prefix:q} {params.snps}
+            """
+
+
+rule cohort_vcf_publish:
+    input:
+        sv=[str(COHORT_VCF)] if MERGE_MODE != "snp" else [],
+        indel=SV_SMALL_VCFS,
+        snp=[str(COHORT_SNP_VCF)] if MERGE_MODE in ("all", "snp") else [],
+        stage_config=MERGE_CONFIG_PATH,
+        script=ancient(str(SCRIPT_DIR / "cohort_vcf_merge.py")),
+    output:
+        FINAL_VCFS,
+    threads: 1
+    resources:
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        destination=RUN.get("merge_output_folder", str(OUT)),
+        sources=shlex.join(
+            (["--sv-input", str(COHORT_VCF)] if MERGE_MODE != "snp" else []) +
+            (["--indel-input", SV_SMALL_VCFS[0]] if MERGE_EMIT_SMALL else []) +
+            (["--snp-input", str(COHORT_SNP_VCF)] if MERGE_MODE in ("all", "snp") else [])
+        ),
+        slurm=slurm_prefix("merge-cohort-publish", 1, MERGE_CONCAT_MEMORY),
+        cleanup=shlex.join(
+            [item for path in (
+                ([MERGE_TMPDIR] if MERGE_MODE != "snp" else []) +
+                ([SMALL_MERGE_TMPDIR] if SMALL_VCFS else []) +
+                [Path(RUN.get("merge_output_folder", str(OUT))) / "tmp" / "cohort_merge"]
+            ) for item in ("--cleanup-tmpdir", str(path))]
+        ) if not as_bool(RUN.get("keep_merge_tmpdir", False)) else "",
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {input.script:q} publish --{MERGE_MODE} \
+          -O {params.destination:q} {params.sources} {params.cleanup}
+        """
+
+
+rule cohort_call_complete:
+    input:
+        layout=ancient(str(LAYOUT)),
+        cohort_vcf=ancient(rules.cohort_vcf_publish.output),
+    output:
+        str(COMPLETE),
+    threads: 1
+    shell:
+        """
+        touch {output:q}
+        """

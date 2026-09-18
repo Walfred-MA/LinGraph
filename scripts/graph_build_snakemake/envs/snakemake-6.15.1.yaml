@@ -1,0 +1,14 @@
+name: minsetref-snakemake-6.15.1
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.9
+  - snakemake-minimal=6.15.1
+  # Snakemake 6.15.1's DAG statistics are incompatible with tabulate 0.9.
+  - tabulate=0.8.10
+  - samtools
+  - mappy
+  - minimap2
+  - winnowmap
+  - blast

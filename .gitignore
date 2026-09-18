@@ -1,0 +1,44 @@
+# Local caches and build products
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.snakemake/
+*.o
+*.d
+
+# Compiled pipeline executables
+/scripts/KmerSearcher
+/scripts/kmer_searcher
+/scripts/KmerStrd
+/scripts/kmerstrd
+/scripts/KmerMatch
+/scripts/KmerMatch32
+/scripts/KmerRegionHotspot
+/scripts/KmerRefCleaner
+/scripts/kmerindex
+/scripts/kmerblocking
+/scripts/kmerpartitionmerger
+/scripts/build_local_graphs_parallel_hotspots
+/scripts/src/KmerSearcher/kmer_searcher
+/scripts/src/KmerStrd/kmerstrd
+/scripts/src/KmerMatch/KmerMatch
+/scripts/src/KmerRegionHotspot/KmerRegionHotspot
+/scripts/src/KmerRefCleaner/KmerRefCleaner
+/scripts/src/KmerIndex/kmerindex
+/scripts/src/KmerBlocking/kmerblocking
+/scripts/src/KmerPartitionMerger/kmerpartitionmerger
+/scripts/src/build_local_graphs_parallel_hotspots/build_local_graphs_parallel_hotspots
+/scripts/src/KmerMatch/KmerMatch32
+
+# Generated workflow directories in the repository root
+/graph/
+/graph_work/
+/cohort_graph/
+/cohort_calls/
+/sample_calls*/
+/prepared_assemblies/
+/Win50KGraph/
+/cohort_minsetref_v3/
+/Win50KGraph.tar.gz
+/tmp/

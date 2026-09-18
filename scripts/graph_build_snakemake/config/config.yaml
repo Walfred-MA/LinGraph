@@ -1,0 +1,54 @@
+# Paths are resolved relative to graph_build_snakemake/ when running Snakemake
+# directly. The run_graph_pipeline.py launcher passes absolute paths instead.
+# Assembly paths inside query lists resolve from the launch working directory.
+# Lists have exactly NAME FASTA; each index must be adjacent at FASTA.fai.
+# Set reference_defined: false only with a template-defined grouped BED. In
+# that mode `reference` is ignored and BED4/BED5 identifies each block template.
+reference: CHM13_h1
+reference_defined: true
+query_paths: query_paths.txt
+bed: ""
+bed_grouped: false
+alternative_fasta: ""
+find_novel_loci: false
+static_block: false
+novel_query_paths: ""
+novel_locus_jobs: 4
+keep_novel_work: false
+graph_folder: graph_work
+script_folder: ..
+preparation_folder: ../../tools
+large_novel_fasta: ""
+
+threads: 64
+partition_batches: 100
+slurm: false
+slurm_jobs: 20
+slurm_account: ""
+slurm_time: "24:00:00"
+slurm_partition: ""
+slurm_args: ""
+novel_slurm_cpus: 32
+novel_slurm_memory: 128G
+kmersearch_slurm_cpus: 16
+kmersearch_slurm_memory: 32G
+minset_slurm_cpus: 32
+minset_slurm_memory: 64G
+compressgraph: false
+annotate_novels: false
+skip_blastn: false
+alignment_mode: fast
+fast_mode: true
+slow_rigorous: false
+max_rigorous: false
+linear: false
+alignment_payload: false
+
+minimum_block_size: 20000
+block_unmask: 1000
+hotspot_anchor: 30000
+
+# Override any executable by adding it here, for example:
+# executables:
+#   kmerindex: /opt/minsetref/bin/kmerindex
+executables: {}

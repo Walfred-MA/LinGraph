@@ -1,0 +1,1561 @@
+from pathlib import Path
+import os
+import shlex
+import sys
+
+
+configfile: "config/config.yaml"
+
+BASE = Path(workflow.basedir).resolve()
+HELPER_DIR = BASE / "workflow" / "scripts"
+sys.path.insert(0, str(HELPER_DIR))
+from pipeline_inputs import (
+    bed_has_groups,
+    block_policy_inputs,
+    read_assembly_list,
+    resolve_reference_and_assemblies,
+)
+
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_path(value, relative_to=BASE):
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = Path(relative_to) / path
+    return str(path.resolve())
+
+
+QUERY_INPUT = resolve_path(config["query_paths"])
+INPUT_WORKING_DIRECTORY = resolve_path(config.get("input_working_directory", os.getcwd()))
+REFERENCE_DEFINED = as_bool(config.get("reference_defined", True))
+INPUT_ASSEMBLIES = read_assembly_list(QUERY_INPUT, INPUT_WORKING_DIRECTORY)
+if REFERENCE_DEFINED:
+    REFERENCE_ARGUMENT = str(config["reference"])
+    REFERENCE_CANDIDATE = Path(REFERENCE_ARGUMENT).expanduser()
+    ASSEMBLY_INPUT_NAMES = {row.name for row in INPUT_ASSEMBLIES}
+    if REFERENCE_ARGUMENT not in ASSEMBLY_INPUT_NAMES and (
+        os.path.sep in REFERENCE_ARGUMENT
+        or REFERENCE_CANDIDATE.is_file()
+        or (
+            not REFERENCE_CANDIDATE.is_absolute()
+            and (BASE / REFERENCE_CANDIDATE).is_file()
+        )
+    ):
+        REFERENCE_ARGUMENT = resolve_path(REFERENCE_ARGUMENT)
+    ASSEMBLIES = resolve_reference_and_assemblies(
+        QUERY_INPUT, REFERENCE_ARGUMENT, INPUT_WORKING_DIRECTORY,
+    )
+else:
+    REFERENCE_ARGUMENT = ""
+    ASSEMBLIES = INPUT_ASSEMBLIES
+ASSEMBLY_BY_NAME = {row.name: row.fasta for row in ASSEMBLIES}
+SAMPLES = [row.name for row in ASSEMBLIES]
+REFERENCE_NAME = ASSEMBLIES[0].name
+REFERENCE_FASTA = ASSEMBLIES[0].fasta
+
+GRAPH = Path(resolve_path(config.get("graph_folder", "graph_work")))
+# Graphs, packages, annotations, and checkpoints are one graph-build artifact.
+# Keep the complete run below GRAPH instead of splitting final files into a
+# second output root.
+# Initial blocks, persistent headers, final graphs, and alignment outputs all
+# share one per-partition tree. Existing runs were consolidated into Graphs,
+# so this is the single canonical partition root.
+GRAPH_OUTPUTS = GRAPH / "Graphs"
+SCRIPT_DIR = Path(resolve_path(config.get("script_folder", "..")))
+PREPARATION_DIR = resolve_path(config.get("preparation_folder", "../../tools"))
+BED = str(config.get("bed", "")).strip()
+BED = resolve_path(BED) if BED else ""
+ALTERNATIVE_CONFIG = str(config.get("alternative_fasta", "")).strip()
+ALTERNATIVE_FASTA = resolve_path(ALTERNATIVE_CONFIG) if ALTERNATIVE_CONFIG else ""
+ALTERNATIVE_FAI = ALTERNATIVE_FASTA + ".fai" if ALTERNATIVE_FASTA else ""
+FIND_NOVEL_LOCI = as_bool(config.get("find_novel_loci", False))
+STATIC_BLOCK = as_bool(config.get("static_block", False))
+if STATIC_BLOCK and (FIND_NOVEL_LOCI or as_bool(config.get("annotate_novels", False))):
+    raise ValueError("static_block cannot use find_novel_loci or annotate_novels")
+BLOCK_POLICY_INPUTS = [] if "--unlock" in sys.argv else block_policy_inputs(GRAPH, STATIC_BLOCK)
+NOVEL_QUERY_CONFIG = str(config.get("novel_query_paths", "")).strip()
+NOVEL_QUERY_INPUT = (
+    resolve_path(NOVEL_QUERY_CONFIG) if NOVEL_QUERY_CONFIG else QUERY_INPUT
+)
+NOVEL_ASSEMBLIES = read_assembly_list(NOVEL_QUERY_INPUT, INPUT_WORKING_DIRECTORY) if FIND_NOVEL_LOCI else []
+NOVEL_LOCUS_JOBS = int(config.get("novel_locus_jobs", 4))
+KEEP_NOVEL_WORK = as_bool(config.get("keep_novel_work", False))
+if FIND_NOVEL_LOCI and str(config.get("large_novel_fasta", "")).strip():
+    raise ValueError("find_novel_loci and large_novel_fasta are mutually exclusive")
+BED_GROUPED = bool(BED) and (
+    as_bool(config.get("bed_grouped", False)) or bed_has_groups(BED)
+)
+TEMPLATE_DEFINED = BED_GROUPED and not REFERENCE_DEFINED
+if not REFERENCE_DEFINED and not BED_GROUPED:
+    raise ValueError(
+        "reference_defined=false requires a supplied pre-grouped BED"
+    )
+ANNOTATE_NOVELS = as_bool(config.get("annotate_novels", False))
+if TEMPLATE_DEFINED and (
+    ALTERNATIVE_FASTA or FIND_NOVEL_LOCI
+    or str(config.get("large_novel_fasta", "")).strip()
+    or ANNOTATE_NOVELS
+):
+    raise ValueError(
+        "template-defined mode cannot use alternative/novel stages "
+        "that require one cohort-wide reference"
+    )
+SKIP_BLASTN = as_bool(config.get("skip_blastn", False))
+ALIGNMENT_MODE = str(config.get("alignment_mode", "fast")).strip().lower()
+if as_bool(config.get("max_rigorous", False)):
+    if as_bool(config.get("slow_rigorous", False)):
+        raise ValueError("slow_rigorous and max_rigorous are mutually exclusive")
+    ALIGNMENT_MODE = "max-rigorous"
+elif as_bool(config.get("slow_rigorous", False)):
+    ALIGNMENT_MODE = "slow-rigorous"
+if ALIGNMENT_MODE not in {"fast", "slow-rigorous", "max-rigorous"}:
+    raise ValueError(
+        "alignment_mode must be fast, slow-rigorous, or max-rigorous"
+    )
+FAST_MODE = ALIGNMENT_MODE == "fast"
+SLOW_RIGOROUS = ALIGNMENT_MODE == "slow-rigorous"
+MAX_RIGOROUS = ALIGNMENT_MODE == "max-rigorous"
+LINEAR_OUTPUT = as_bool(config.get("linear", not FAST_MODE))
+ALIGNMENT_PAYLOAD = as_bool(config.get("alignment_payload", True))
+ALIGNMENT_TIMEOUT = int(config.get("alignment_timeout", 21600))
+if FAST_MODE and not LINEAR_OUTPUT:
+    PARTITION_RUN_PROTOCOL = "integrated_partition_fast_v1"
+elif FAST_MODE:
+    PARTITION_RUN_PROTOCOL = "integrated_partition_fast_linear_v2_gap50"
+elif SLOW_RIGOROUS and LINEAR_OUTPUT:
+    PARTITION_RUN_PROTOCOL = "integrated_partition_slow_rigorous_v1"
+elif SLOW_RIGOROUS:
+    PARTITION_RUN_PROTOCOL = "integrated_partition_slow_rigorous_nolinear_v1"
+elif MAX_RIGOROUS and LINEAR_OUTPUT:
+    PARTITION_RUN_PROTOCOL = "integrated_partition_max_rigorous_v1"
+else:
+    PARTITION_RUN_PROTOCOL = "integrated_partition_max_rigorous_nolinear_v1"
+PARTITION_RUN_PROTOCOL += "_blast17_names_v2"
+if STATIC_BLOCK:
+    PARTITION_RUN_PROTOCOL += "_static_block_v1"
+if TEMPLATE_DEFINED:
+    PARTITION_RUN_PROTOCOL += "_template_defined_v1"
+if ALTERNATIVE_FASTA:
+    PARTITION_RUN_PROTOCOL += "_alternative_templates_v2_fixed"
+TOTAL_THREADS = int(config.get("threads", 64))
+PARTITION_BATCHES = int(config.get("partition_batches", 100))
+SLURM_ENABLED = as_bool(config.get("slurm", False))
+SLURM_ACCOUNT = str(config.get("slurm_account", "")).strip()
+SLURM_TIME = str(config.get("slurm_time", "24:00:00")).strip()
+SLURM_PARTITION = str(config.get("slurm_partition", "")).strip()
+SLURM_ARGS_TEXT = str(config.get("slurm_args", "")).strip()
+try:
+    SLURM_ARGS = shlex.split(SLURM_ARGS_TEXT)
+except ValueError as error:
+    raise ValueError("invalid slurm_args quoting: {}".format(error))
+NOVEL_SLURM_CPUS = int(config.get("novel_slurm_cpus", 32))
+NOVEL_SLURM_MEMORY = str(config.get("novel_slurm_memory", "128G"))
+KMERSEARCH_SLURM_CPUS = int(config.get("kmersearch_slurm_cpus", 16))
+KMERSEARCH_SLURM_MEMORY = str(config.get("kmersearch_slurm_memory", "32G"))
+MINSET_SLURM_CPUS = int(config.get("minset_slurm_cpus", 32))
+MINSET_SLURM_MEMORY = str(config.get("minset_slurm_memory", "64G"))
+MINSET_PARTITION_JOBS = int(config.get(
+    "minset_partition_jobs", 1 if FAST_MODE else 4
+))
+
+
+def slurm_integer_option(arguments, long_name, short_name, default):
+    """Read an integer sbatch option in --x=N, --x N, -cN, or -c N form."""
+    for index, value in enumerate(arguments):
+        if value.startswith(long_name + "="):
+            return int(value.split("=", 1)[1])
+        if value == long_name or value == short_name:
+            if index + 1 >= len(arguments):
+                raise ValueError("{} requires an integer value".format(value))
+            return int(arguments[index + 1])
+        if value.startswith(short_name) and value != short_name:
+            return int(value[len(short_name):])
+    return default
+
+
+MINSET_AVAILABLE_CPUS = (
+    slurm_integer_option(
+        SLURM_ARGS, "--cpus-per-task", "-c", MINSET_SLURM_CPUS
+    )
+    if SLURM_ENABLED else TOTAL_THREADS
+)
+if MINSET_AVAILABLE_CPUS < 1:
+    raise ValueError("available minset job CPUs must be positive")
+if MINSET_PARTITION_JOBS < 1:
+    raise ValueError("minset partition jobs must be positive")
+if MINSET_PARTITION_JOBS > MINSET_AVAILABLE_CPUS:
+    raise ValueError("minset partition jobs exceeds available job CPUs")
+if MINSET_AVAILABLE_CPUS % MINSET_PARTITION_JOBS:
+    raise ValueError(
+        "available minset job CPUs ({}) must divide evenly among {} partition "
+        "jobs".format(MINSET_AVAILABLE_CPUS, MINSET_PARTITION_JOBS)
+    )
+MINSET_PARTITION_THREADS = MINSET_AVAILABLE_CPUS // MINSET_PARTITION_JOBS
+if TOTAL_THREADS < 4:
+    raise ValueError("threads must be at least 4 for the partition-novelty stages")
+if PARTITION_BATCHES < 1:
+    raise ValueError("partition_batches must be positive")
+if ALIGNMENT_TIMEOUT < 1:
+    raise ValueError("alignment_timeout must be positive")
+if NOVEL_LOCUS_JOBS < 1:
+    raise ValueError("novel_locus_jobs must be positive")
+if (NOVEL_SLURM_CPUS < 1 or KMERSEARCH_SLURM_CPUS < 1 or
+        MINSET_SLURM_CPUS < 1):
+    raise ValueError("Slurm CPU requests must be positive")
+if SLURM_ENABLED and not SLURM_ARGS and not SLURM_ACCOUNT:
+    raise ValueError("slurm_account must be set when Slurm submission is enabled")
+if SLURM_ENABLED and not SLURM_ARGS and not SLURM_PARTITION:
+    raise ValueError("slurm_partition must be set when Slurm submission is enabled")
+if SLURM_ENABLED and not SLURM_TIME:
+    raise ValueError("slurm_time must be set when Slurm submission is enabled")
+
+EXECUTABLES = config.get("executables", {}) or {}
+
+
+def executable(name, same_script_folder=False):
+    if name in EXECUTABLES:
+        value = str(EXECUTABLES[name])
+        return resolve_path(value, SCRIPT_DIR) if os.path.sep in value else value
+    return str(SCRIPT_DIR / name) if same_script_folder else name
+
+
+PYTHON = executable("python", False) if "python" in EXECUTABLES else sys.executable
+SAMTOOLS = executable("samtools")
+KMERINDEX = executable("kmerindex", True)
+KMERBLOCKING = executable("kmerblocking", True)
+KMERPARTITIONMERGER = executable("kmerpartitionmerger", True)
+KMERREFCLEANER = executable("KmerRefCleaner", True)
+KMER_SEARCHER = executable("kmer_searcher", True)
+HOTSPOT_FASTA_BUILDER = executable("build_local_graphs_parallel_hotspots", True)
+HOTSPOT_HEADER_GENERATOR = str(SCRIPT_DIR / "generate_hotspot_headers.py")
+SBATCH = executable("sbatch")
+HELPER = str(HELPER_DIR / "pipeline_inputs.py")
+
+
+def slurm_prefix(job_name, cpus, memory):
+    if not SLURM_ENABLED:
+        return ""
+    command = [
+        PYTHON, HELPER, "run-slurm",
+        "--sbatch", SBATCH,
+        "--cpus", str(cpus),
+        "--memory", str(memory),
+    ]
+    if SLURM_ACCOUNT:
+        command.extend(["--account", SLURM_ACCOUNT])
+    if SLURM_TIME:
+        command.extend(["--time", SLURM_TIME])
+    if SLURM_PARTITION:
+        command.extend(["--partition", SLURM_PARTITION])
+    command.extend(
+        "--sbatch-arg=" + argument for argument in SLURM_ARGS
+    )
+    command.extend([
+        "--job-name", job_name,
+        "--log-dir", str(GRAPH / "slurm_logs"),
+        "--",
+    ])
+    return shlex.join(command)
+
+NORMALIZED_QUERY = GRAPH / "inputs" / "query_paths.normalized.txt"
+INPUT_METADATA = GRAPH / "inputs" / "assemblies.json"
+PREFLIGHT = GRAPH / "inputs" / "preflight.ok"
+FIXED_FASTA = GRAPH / "inputs" / "reference_alternatives.fa"
+FIXED_FASTA_FAI = Path(str(FIXED_FASTA) + ".fai")
+NOVEL_WORKDIR = GRAPH / "novelloci"
+DISCOVERED_NOVELS = GRAPH / "novel_loci.fa"
+DISCOVERED_NOVELS_FAI = Path(str(DISCOVERED_NOVELS) + ".fai")
+DISCOVERED_NOVELS_COVERED_BED = GRAPH / "novel_loci.reference_kmer_covered.bed"
+SEQUENCE_CATALOG = GRAPH / "inputs" / "reference_alternatives_novels.fa"
+SEQUENCE_CATALOG_FAI = Path(str(SEQUENCE_CATALOG) + ".fai")
+REFERENCE_INDEX = SEQUENCE_CATALOG_FAI
+
+BLOCK_CATALOG_LABEL = "template_defined" if TEMPLATE_DEFINED else REFERENCE_NAME
+REF_BIN = GRAPH / f"{BLOCK_CATALOG_LABEL}.bin"
+FIXED_BIN = GRAPH / "fixed_reference_alternatives.bin"
+RAW_BLOCK_BED = GRAPH / "main_chroms_withnovel_blocks.bed"
+FIXED_RAW_BLOCK_BED = GRAPH / "fixed_reference_alternatives.raw.bed"
+FIXED_INPUT_BLOCK_BED = GRAPH / "fixed_reference_alternatives.input.bed"
+NOVEL_BLOCK_BED = GRAPH / "novelloci.blocks.bed"
+NAMED_BLOCK_BED = GRAPH / "main_chroms_withnovel_blocks.named.bed"
+BLOCK_METADATA = GRAPH / "main_chroms_withnovel_blocks.named.json"
+BLOCK_FASTA = GRAPH / f"{BLOCK_CATALOG_LABEL}_withnovel_blocks.fasta"
+BLOCK_FASTA_FAI = Path(str(BLOCK_FASTA) + ".fai")
+ALIGNED_BED = GRAPH / f"{BLOCK_CATALOG_LABEL}_withnovel_blocks.fasta_aligned.raw.bed"
+FILTERED_BED = GRAPH / f"{BLOCK_CATALOG_LABEL}_withnovel_blocks.fasta_aligned.filtered.bed"
+MERGED_BED = GRAPH / f"{BLOCK_CATALOG_LABEL}_withnovel_blocks.merged.bed"
+MERGED_GROUPS = Path(str(MERGED_BED) + ".groups.tsv")
+
+# Keep every per-partition artifact in one canonical folder.  This directory
+# is intentionally not declared as a Snakemake directory() output: both the
+# initial block builder and downstream graph builders add files beneath it,
+# and Snakemake may remove directory outputs before rerunning their owner.
+LOCALBLOCKS = GRAPH_OUTPUTS
+PARTITION_TARGETS = Path(str(GRAPH_OUTPUTS) + ".list")
+PARTITION_INDEX = Path(str(PARTITION_TARGETS) + ".bin")
+TEMPLATE_PARTITION_TARGETS = Path(str(GRAPH_OUTPUTS) + ".template.list")
+TEMPLATE_PARTITION_INDEX = Path(str(TEMPLATE_PARTITION_TARGETS) + ".bin")
+DUMMY_FASTA = GRAPH / "kmersearcher_index_dummy.fa"
+DUMMY_LIST = GRAPH / "kmersearcher_index_dummy.list"
+KMERMAPS = GRAPH / "kmermaps"
+HOTSPOT_READY = GRAPH / "checkpoints" / "hotspot_fastas.ready"
+ACTIVE_TARGETS = GRAPH / "checkpoints" / "Graphs.active.list"
+BATCH_DIR = GRAPH / "partition_batches"
+BATCH_IDS = GRAPH / "partition_batch_ids.txt"
+MINSET_COMPLETE = GRAPH / "checkpoints" / "minset_batches.complete"
+BREAKPOINT_PROTOCOL = "breakpoint_consistency_cohort_control_v2"
+BREAKPOINT_SUCCESS = (
+    GRAPH / "checkpoints" / f"{BREAKPOINT_PROTOCOL}.success.json"
+)
+BREAKPOINT_MANIFEST = (
+    GRAPH / "checkpoints" / f"{BREAKPOINT_PROTOCOL}.tsv"
+)
+FINAL_TARGETS_COMPLETE = GRAPH / "checkpoints" / "Graphs.list.finalized"
+EXCLUDED_PARTITIONS = GRAPH / "checkpoints" / "Graphs.excluded.tsv"
+GRAPH_COMPLETE = GRAPH_OUTPUTS / "graphs.complete"
+COORDINATE_ANALYSIS = GRAPH / "partition_coordinate_analysis"
+COORDINATE_SUCCESS = COORDINATE_ANALYSIS / "_COORDINATE_ANALYSIS_SUCCESS.json"
+LOCAL_REFINEMENT = GRAPH / "unified_novel_refinement"
+LOCAL_REFINEMENT_SUCCESS = LOCAL_REFINEMENT / "_UNIFIED_TEMPLATE_REFINEMENT_SUCCESS.json"
+PARTITION_LOCAL_ADJUSTED = GRAPH / "partition_local_adjusted_paths"
+LOCAL_ADJUSTED = GRAPH / "local_adjusted_partition_paths"
+LOCAL_ADJUSTED_SUCCESS = LOCAL_ADJUSTED / "_ADJUSTED_PATHS_SUCCESS.json"
+COHORT_ANNOTATIONS = GRAPH / "cohort_annotations"
+ANNOTATION_SUCCESS = COHORT_ANNOTATIONS / "_ANNOTATIONS_SUCCESS.json"
+
+LARGE_NOVEL_CONFIG = str(config.get("large_novel_fasta", "")).strip()
+LARGE_NOVELS = (
+    DISCOVERED_NOVELS
+    if FIND_NOVEL_LOCI else (
+        Path(resolve_path(LARGE_NOVEL_CONFIG))
+        if LARGE_NOVEL_CONFIG else GRAPH / "novel_loci.fa"
+    )
+)
+ADJUSTED_SUCCESS = LOCAL_ADJUSTED_SUCCESS
+PACKAGE_DIR = GRAPH / "summary"
+PACKAGE_SUMMARY = PACKAGE_DIR / "local_graphs.tsv"
+PACKAGE_ALTERNATIVE_INTERVALS = PACKAGE_DIR / "alternative_intervals.bed"
+PACKAGE_ALTERNATIVES = PACKAGE_DIR / "alternatives.fasta"
+PACKAGE_ALTERNATIVES_FAI = Path(str(PACKAGE_ALTERNATIVES) + ".fai")
+PACKAGE_CACHES = PACKAGE_DIR / "partition_caches.jsonl"
+PACKAGE_TARGETS = PACKAGE_DIR / "Graphs.list"
+PACKAGE_SUCCESS = PACKAGE_DIR / "summary.complete"
+
+
+def sample_fasta(wildcards):
+    return ASSEMBLY_BY_NAME[wildcards.sample]
+
+
+def checkpoint_batch_ids():
+    ckpt = checkpoints.make_partition_batches.get()
+    with open(ckpt.output.ids, "rt") as handle:
+        return [line.strip() for line in handle if line.strip()]
+
+
+def minset_done_files(wildcards):
+    return expand(
+        str(GRAPH / "batch_status" / PARTITION_RUN_PROTOCOL / "{batch}.done"),
+        batch=checkpoint_batch_ids(),
+    )
+
+
+def graph_done_files(wildcards):
+    return expand(
+        str(GRAPH / "batch_status" / PARTITION_RUN_PROTOCOL / "{batch}.done"),
+        batch=checkpoint_batch_ids(),
+    )
+
+
+def batch_manifest(wildcards):
+    ckpt = checkpoints.make_partition_batches.get()
+    return str(Path(ckpt.output.batches) / f"{wildcards.batch}.list")
+
+
+def existing_breakpoint_dependencies(wildcards):
+    """Expose restored graph inputs so stale cache success markers rerun."""
+    ckpt = checkpoints.finalize_hotspot_fastas.get()
+    dependencies = []
+    with open(ckpt.output.active, "rt") as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            partition = Path(raw.strip().split()[0]).parent.name
+            directory = GRAPH_OUTPUTS / partition
+            for path in (
+                directory / f"{partition}.FA",
+                directory / f"{partition}.bed",
+                directory / f"{partition}_align.txt",
+            ):
+                if path.is_file():
+                    dependencies.append(str(path))
+    return dependencies
+
+
+FINAL_TARGETS = [str(GRAPH_COMPLETE)]
+if ANNOTATE_NOVELS:
+    FINAL_TARGETS.append(str(ANNOTATION_SUCCESS))
+
+
+wildcard_constraints:
+    sample="[^/]+",
+    batch="batch[0-9]+"
+
+
+rule all:
+    input:
+        FINAL_TARGETS
+
+
+VALIDATION_FASTAS = [row.fasta for row in ASSEMBLIES]
+VALIDATION_INDEXES = [row.fai for row in ASSEMBLIES]
+if ALTERNATIVE_FASTA:
+    VALIDATION_FASTAS.append(ALTERNATIVE_FASTA)
+    VALIDATION_INDEXES.append(ALTERNATIVE_FAI)
+if FIND_NOVEL_LOCI:
+    VALIDATION_FASTAS.extend(row.fasta for row in NOVEL_ASSEMBLIES)
+    VALIDATION_INDEXES.extend(row.fai for row in NOVEL_ASSEMBLIES)
+
+
+rule validate_and_order_inputs:
+    input:
+        fastas=VALIDATION_FASTAS,
+        indexes=VALIDATION_INDEXES,
+        query=QUERY_INPUT,
+        contract=HELPER
+    output:
+        query=str(NORMALIZED_QUERY),
+        metadata=str(INPUT_METADATA)
+    params:
+        helper=HELPER,
+        query_input=QUERY_INPUT,
+        working_directory=INPUT_WORKING_DIRECTORY,
+        reference=REFERENCE_ARGUMENT,
+        preparation=PREPARATION_DIR,
+        template="--template-defined" if TEMPLATE_DEFINED else ""
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} prepare-inputs \
+          --query-paths {params.query_input:q} \
+          --working-directory {params.working_directory:q} \
+          --reference {params.reference:q} \
+          --output {output.query:q} \
+          --metadata {output.metadata:q} \
+          --preparation-folder {params.preparation:q} \
+          {params.template}
+        """
+
+
+PREFLIGHT_EXECUTABLES = [
+    SAMTOOLS, KMERINDEX, KMER_SEARCHER,
+    HOTSPOT_FASTA_BUILDER,
+    "minimap2", "winnowmap",
+]
+if not STATIC_BLOCK:
+    PREFLIGHT_EXECUTABLES.append(KMERREFCLEANER)
+if SLURM_ENABLED:
+    PREFLIGHT_EXECUTABLES.append(SBATCH)
+if not BED or FIND_NOVEL_LOCI:
+    PREFLIGHT_EXECUTABLES.append(KMERBLOCKING)
+if not BED_GROUPED:
+    PREFLIGHT_EXECUTABLES.append(KMERPARTITIONMERGER)
+if not SKIP_BLASTN:
+    PREFLIGHT_EXECUTABLES.extend(("makeblastdb", "blastn"))
+PREFLIGHT_FILES = [
+    str(SCRIPT_DIR / name) for name in (
+        "extract_named_blocks.py",
+        "build_localblocks_from_filtered_bed.py",
+        "fixed_alternatives.py",
+        "generate_hotspot_headers.py",
+        "minsetref_light.py",
+        "analyze_partition_coordinates.py",
+        "map_all_novels_to_local_templates.py",
+        "apply_unified_novel_refinement.py",
+        "minsetgraphmake.py",
+        "build_breakpoint_consistency.py",
+        "gfixbreaks.py",
+        "build_local_graphs.py",
+    )
+]
+if ANNOTATE_NOVELS:
+    PREFLIGHT_FILES.extend(
+        str(SCRIPT_DIR / name) for name in (
+            "run_partition_novelty_pipeline.sh",
+            "map_partition_local_novel.py",
+            "map_global_novel.py",
+            "map_small_novel_minset.py",
+        )
+    )
+if not BED_GROUPED:
+    PREFLIGHT_FILES.extend((
+        str(SCRIPT_DIR / "map_assemblies_to_block_reference.py"),
+        str(SCRIPT_DIR / "filter_block_mapping_bed.py"),
+    ))
+if FIND_NOVEL_LOCI:
+    PREFLIGHT_FILES.extend((
+        str(SCRIPT_DIR / "minsetref.py"),
+        str(HELPER_DIR / "discover_novel_loci.py"),
+        str(HELPER_DIR / "build_novel_blocks.py"),
+    ))
+if TEMPLATE_DEFINED:
+    PREFLIGHT_FILES.append(
+        str(SCRIPT_DIR / "extract_grouped_template_blocks.py")
+    )
+if STATIC_BLOCK:
+    PREFLIGHT_FILES = [path for path in PREFLIGHT_FILES if Path(path).name not in {
+        "minsetref_light.py", "analyze_partition_coordinates.py",
+        "map_all_novels_to_local_templates.py", "apply_unified_novel_refinement.py",
+    }]
+    PREFLIGHT_FILES.append(str(SCRIPT_DIR / "static_blocks.py"))
+PREFLIGHT_ARGUMENTS = " ".join(
+    ["--executable " + shlex.quote(value) for value in PREFLIGHT_EXECUTABLES]
+    + ["--file " + shlex.quote(value) for value in PREFLIGHT_FILES]
+)
+
+
+rule preflight:
+    input:
+        rules.validate_and_order_inputs.output
+    output:
+        str(PREFLIGHT)
+    params:
+        helper=HELPER,
+        arguments=PREFLIGHT_ARGUMENTS,
+        preparation=PREPARATION_DIR
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} preflight \
+          {params.arguments} \
+          --output {output:q} \
+          --preparation-folder {params.preparation:q}
+        """
+
+
+FIXED_FASTA_ARGUMENTS = [
+    "--input " + shlex.quote(f"{REFERENCE_NAME}={REFERENCE_FASTA}")
+]
+if ALTERNATIVE_FASTA:
+    FIXED_FASTA_ARGUMENTS.append(
+        "--input " + shlex.quote(f"alternative={ALTERNATIVE_FASTA}")
+    )
+FIXED_FASTA_ARGUMENTS = " ".join(FIXED_FASTA_ARGUMENTS)
+
+
+rule combine_fixed_reference:
+    input:
+        fastas=([REFERENCE_FASTA] + ([ALTERNATIVE_FASTA] if ALTERNATIVE_FASTA else [])),
+        indexes=([ASSEMBLIES[0].fai] + ([ALTERNATIVE_FAI] if ALTERNATIVE_FAI else [])),
+        # Existing catalogs must acquire the explicit imported-template policy.
+        policy=str(SCRIPT_DIR / "fixed_alternatives.py"),
+        helper=HELPER,
+        ready=rules.preflight.output
+    output:
+        str(FIXED_FASTA)
+    params:
+        helper=HELPER,
+        arguments=FIXED_FASTA_ARGUMENTS
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} combine-fastas \
+          {params.arguments} \
+          --output {output:q}
+        """
+
+
+rule faidx_fixed_reference:
+    input:
+        rules.combine_fixed_reference.output
+    output:
+        str(FIXED_FASTA_FAI)
+    params:
+        helper=HELPER,
+        samtools=SAMTOOLS
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} faidx \
+          --samtools {params.samtools:q} \
+          --fasta {input:q} \
+          --output {output:q}
+        """
+
+
+if FIND_NOVEL_LOCI:
+    NOVEL_EXCLUDE_ARGUMENTS = " ".join(
+        ["--exclude-name " + shlex.quote(REFERENCE_NAME)]
+        + ["--exclude-fasta " + shlex.quote(REFERENCE_FASTA)]
+        + (["--exclude-fasta " + shlex.quote(ALTERNATIVE_FASTA)] if ALTERNATIVE_FASTA else [])
+    )
+    NOVEL_KEEP_ARGUMENT = "--keep-work" if KEEP_NOVEL_WORK else ""
+    NOVEL_BLAST_ARGUMENT = "--skip-blastn" if SKIP_BLASTN else ""
+
+    rule discover_novel_loci:
+        input:
+            fixed=rules.combine_fixed_reference.output,
+            fixed_fai=rules.faidx_fixed_reference.output,
+            query=NOVEL_QUERY_INPUT,
+            fastas=[row.fasta for row in NOVEL_ASSEMBLIES],
+            indexes=[row.fai for row in NOVEL_ASSEMBLIES]
+        output:
+            fasta=str(DISCOVERED_NOVELS),
+            fai=str(DISCOVERED_NOVELS_FAI),
+            covered_bed=str(DISCOVERED_NOVELS_COVERED_BED)
+        threads:
+            min(TOTAL_THREADS, NOVEL_SLURM_CPUS) if SLURM_ENABLED else TOTAL_THREADS
+        resources:
+            slurm_jobs=1 if SLURM_ENABLED else 0
+        params:
+            script=str(HELPER_DIR / "discover_novel_loci.py"),
+            minsetref=str(SCRIPT_DIR / "minsetref.py"),
+            workdir=str(NOVEL_WORKDIR),
+            excludes=NOVEL_EXCLUDE_ARGUMENTS,
+            keep=NOVEL_KEEP_ARGUMENT,
+            blast=NOVEL_BLAST_ARGUMENT,
+            jobs=NOVEL_LOCUS_JOBS,
+            working_directory=INPUT_WORKING_DIRECTORY,
+            slurm=lambda wildcards: slurm_prefix(
+                "discover-novel-loci", NOVEL_SLURM_CPUS,
+                NOVEL_SLURM_MEMORY)
+        shell:
+            """
+            {params.slurm} {PYTHON:q} {params.script:q} \
+              --fixed-reference {input.fixed:q} \
+              --assemblies {input.query:q} \
+              --working-directory {params.working_directory:q} \
+              --output {output.fasta:q} \
+              --covered-bed {output.covered_bed:q} \
+              --workdir {params.workdir:q} \
+              --kmer-ref-cleaner {KMERREFCLEANER:q} \
+              --minsetref {params.minsetref:q} \
+              --python {PYTHON:q} \
+              --samtools {SAMTOOLS:q} \
+              --threads {threads} \
+              --jobs {params.jobs} \
+              --context-flank 30000 \
+              {params.excludes} {params.keep} {params.blast}
+            test -f {output.fasta:q}
+            test -f {output.fai:q}
+            test -f {output.covered_bed:q}
+            """
+
+
+CATALOG_FASTA_INPUTS = [str(FIXED_FASTA)]
+CATALOG_FAI_INPUTS = [str(FIXED_FASTA_FAI)]
+CATALOG_FASTA_ARGUMENTS = ["--input " + shlex.quote(f".={FIXED_FASTA}")]
+if FIND_NOVEL_LOCI:
+    CATALOG_FASTA_INPUTS.append(str(DISCOVERED_NOVELS))
+    CATALOG_FAI_INPUTS.append(str(DISCOVERED_NOVELS_FAI))
+    CATALOG_FASTA_ARGUMENTS.append(
+        "--input " + shlex.quote(f".={DISCOVERED_NOVELS}")
+    )
+CATALOG_FASTA_ARGUMENTS = " ".join(CATALOG_FASTA_ARGUMENTS)
+
+
+rule build_sequence_catalog:
+    input:
+        fastas=CATALOG_FASTA_INPUTS,
+        indexes=CATALOG_FAI_INPUTS
+    output:
+        str(SEQUENCE_CATALOG)
+    params:
+        helper=HELPER,
+        arguments=CATALOG_FASTA_ARGUMENTS
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} combine-fastas \
+          {params.arguments} \
+          --output {output:q}
+        """
+
+
+rule faidx_sequence_catalog:
+    input:
+        rules.build_sequence_catalog.output
+    output:
+        str(SEQUENCE_CATALOG_FAI)
+    params:
+        helper=HELPER,
+        samtools=SAMTOOLS
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} faidx \
+          --samtools {params.samtools:q} \
+          --fasta {input:q} \
+          --output {output:q}
+        """
+
+
+rule kmerindex_reference:
+    input:
+        reference=rules.build_sequence_catalog.output,
+        fai=rules.faidx_sequence_catalog.output
+    output:
+        str(REF_BIN)
+    threads:
+        TOTAL_THREADS
+    params:
+        executable=KMERINDEX,
+        outdir=str(GRAPH)
+    shell:
+        """
+        mkdir -p {params.outdir:q}
+        {params.executable:q} -f {input.reference:q} -o {output:q} -t {threads}
+        test -s {output:q}
+        """
+
+
+if not BED:
+    rule kmerindex_fixed_for_blocking:
+        input:
+            fasta=rules.combine_fixed_reference.output,
+            fai=rules.faidx_fixed_reference.output
+        output:
+            str(FIXED_BIN)
+        threads:
+            TOTAL_THREADS
+        params:
+            executable=KMERINDEX
+        shell:
+            """
+            {params.executable:q} \
+              -f {input.fasta:q} \
+              -o {output:q} \
+              -t {threads}
+            test -s {output:q}
+            """
+
+
+    rule automatic_fixed_blocking:
+        input:
+            index=rules.kmerindex_fixed_for_blocking.output,
+            reference_fai=rules.faidx_fixed_reference.output
+        output:
+            str(FIXED_RAW_BLOCK_BED)
+        threads:
+            TOTAL_THREADS
+        params:
+            executable=KMERBLOCKING
+        shell:
+            """
+            {params.executable:q} \
+              -i {input.index:q} \
+              -f {input.reference_fai:q} \
+              -o {output:q} \
+              -t {threads}
+            test -s {output:q}
+            """
+else:
+    ALTERNATIVE_FAI_ARGUMENT = (
+        "--alternative-fai " + shlex.quote(ALTERNATIVE_FAI)
+        if ALTERNATIVE_FAI else ""
+    )
+
+    rule augment_fixed_input_bed:
+        input:
+            bed=BED,
+            alternative=([ALTERNATIVE_FAI] if ALTERNATIVE_FAI else [])
+        output:
+            str(FIXED_INPUT_BLOCK_BED)
+        params:
+            helper=HELPER,
+            alternative=ALTERNATIVE_FAI_ARGUMENT
+        shell:
+            """
+            {PYTHON:q} {params.helper:q} augment-bed \
+              --input {input.bed:q} \
+              {params.alternative} \
+              --output {output:q}
+            """
+
+
+if FIND_NOVEL_LOCI:
+    rule build_discovered_novel_blocks:
+        input:
+            fasta=rules.discover_novel_loci.output.fasta,
+            fai=rules.discover_novel_loci.output.fai
+        output:
+            str(NOVEL_BLOCK_BED)
+        threads:
+            TOTAL_THREADS
+        params:
+            script=str(HELPER_DIR / "build_novel_blocks.py"),
+            workdir=str(NOVEL_WORKDIR / "blocking")
+        shell:
+            """
+            {PYTHON:q} {params.script:q} \
+              --fasta {input.fasta:q} \
+              --fai {input.fai:q} \
+              --output {output:q} \
+              --workdir {params.workdir:q} \
+              --samtools {SAMTOOLS:q} \
+              --kmerindex {KMERINDEX:q} \
+              --kmerblocking {KMERBLOCKING:q} \
+              --threads {threads} \
+              --large-threshold 1000000
+            test -f {output:q}
+            """
+
+
+RAW_BLOCK_INPUTS = [
+    str(FIXED_INPUT_BLOCK_BED if BED else FIXED_RAW_BLOCK_BED)
+]
+if FIND_NOVEL_LOCI:
+    RAW_BLOCK_INPUTS.append(str(NOVEL_BLOCK_BED))
+
+
+rule assemble_raw_blocks:
+    input:
+        RAW_BLOCK_INPUTS
+    output:
+        str(RAW_BLOCK_BED)
+    params:
+        helper=HELPER,
+        arguments=" ".join(
+            "--input " + shlex.quote(path) for path in RAW_BLOCK_INPUTS
+        )
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} combine-beds \
+          {params.arguments} \
+          --output {output:q}
+        """
+
+
+NORMALIZE_AUTOMATIC_ARGUMENT = "--automatic" if not BED else ""
+
+
+if TEMPLATE_DEFINED:
+    rule normalize_blocks:
+        input:
+            bed=BED,
+            query=rules.validate_and_order_inputs.output.query
+        output:
+            bed=str(NAMED_BLOCK_BED),
+            metadata=str(BLOCK_METADATA)
+        params:
+            helper=HELPER
+        shell:
+            """
+            {PYTHON:q} {params.helper:q} normalize-template-bed \
+              --input {input.bed:q} \
+              --query-paths {input.query:q} \
+              --output {output.bed:q} \
+              --metadata {output.metadata:q}
+            """
+else:
+    rule normalize_blocks:
+        input:
+            bed=rules.assemble_raw_blocks.output,
+            reference_fai=rules.faidx_sequence_catalog.output,
+            index=rules.kmerindex_reference.output
+        output:
+            bed=str(NAMED_BLOCK_BED),
+            metadata=str(BLOCK_METADATA)
+        params:
+            helper=HELPER,
+            automatic=NORMALIZE_AUTOMATIC_ARGUMENT
+        shell:
+            """
+            {PYTHON:q} {params.helper:q} normalize-bed \
+              --input {input.bed:q} \
+              --reference-fai {input.reference_fai:q} \
+              --output {output.bed:q} \
+              --metadata {output.metadata:q} \
+              {params.automatic}
+            """
+
+
+if TEMPLATE_DEFINED:
+    rule extract_block_reference:
+        input:
+            query=rules.validate_and_order_inputs.output.query,
+            bed=rules.normalize_blocks.output.bed,
+            ready=rules.preflight.output
+        output:
+            fasta=str(BLOCK_FASTA),
+            mapping=str(FILTERED_BED)
+        params:
+            script=str(SCRIPT_DIR / "extract_grouped_template_blocks.py")
+        shell:
+            """
+            {PYTHON:q} {params.script:q} \
+              --query-paths {input.query:q} \
+              --bed {input.bed:q} \
+              --output {output.fasta:q} \
+              --mapping-bed {output.mapping:q}
+            """
+elif BED_GROUPED:
+    rule extract_block_reference:
+        input:
+            reference=rules.build_sequence_catalog.output,
+            bed=rules.normalize_blocks.output.bed
+        output:
+            fasta=str(BLOCK_FASTA),
+            mapping=str(FILTERED_BED)
+        params:
+            script=str(SCRIPT_DIR / "extract_named_blocks.py"),
+            sample=REFERENCE_NAME
+        shell:
+            """
+            {PYTHON:q} {params.script:q} \
+              -f {input.reference:q} \
+              -b {input.bed:q} \
+              -o {output.fasta:q} \
+              --mapping-bed {output.mapping:q} \
+              --sample {params.sample:q}
+            """
+else:
+    rule extract_block_reference:
+        input:
+            reference=rules.build_sequence_catalog.output,
+            bed=rules.normalize_blocks.output.bed
+        output:
+            fasta=str(BLOCK_FASTA)
+        params:
+            script=str(SCRIPT_DIR / "extract_named_blocks.py"),
+            sample=REFERENCE_NAME
+        shell:
+            """
+            {PYTHON:q} {params.script:q} \
+              -f {input.reference:q} \
+              -b {input.bed:q} \
+              -o {output.fasta:q} \
+              --sample {params.sample:q}
+            """
+
+
+rule faidx_block_reference:
+    input:
+        rules.extract_block_reference.output.fasta
+    output:
+        str(BLOCK_FASTA_FAI)
+    params:
+        samtools=SAMTOOLS,
+        helper=HELPER
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} faidx \
+          --samtools {params.samtools:q} \
+          --fasta {input:q} \
+          --output {output:q}
+        """
+
+
+if not BED_GROUPED:
+    rule map_reference_to_blocks:
+        input:
+            reference=rules.build_sequence_catalog.output,
+            target=rules.extract_block_reference.output.fasta,
+            target_fai=rules.faidx_block_reference.output
+        output:
+            str(ALIGNED_BED)
+        threads:
+            min(TOTAL_THREADS, 50)
+        params:
+            script=str(SCRIPT_DIR / "map_assemblies_to_block_reference.py")
+        shell:
+            """
+            {PYTHON:q} {params.script:q} \
+              -q {input.reference:q} \
+              -t {input.target:q} \
+              -o {output:q}
+            """
+
+
+    rule filter_reference_block_mapping:
+        input:
+            rules.map_reference_to_blocks.output
+        output:
+            str(FILTERED_BED)
+        params:
+            script=str(SCRIPT_DIR / "filter_block_mapping_bed.py"),
+            minimum=int(config.get("minimum_block_size", 20000))
+        shell:
+            """
+            {PYTHON:q} {params.script:q} {input:q} \
+              -o {output:q} \
+              --minimum-block-size {params.minimum}
+            """
+
+
+if BED and BED_GROUPED:
+    rule merge_partitions:
+        input:
+            bed=rules.normalize_blocks.output.bed,
+            target_fai=rules.faidx_block_reference.output
+        output:
+            bed=str(MERGED_BED),
+            groups=str(MERGED_GROUPS)
+        params:
+            helper=HELPER
+        shell:
+            """
+            {PYTHON:q} {params.helper:q} grouped-merge \
+              --bed {input.bed:q} \
+              --target-fai {input.target_fai:q} \
+              --output {output.bed:q} \
+              --groups {output.groups:q}
+            """
+else:
+    rule merge_partitions:
+        input:
+            reference=rules.build_sequence_catalog.output,
+            target=rules.extract_block_reference.output.fasta,
+            filtered=rules.filter_reference_block_mapping.output
+        output:
+            bed=str(MERGED_BED),
+            groups=str(MERGED_GROUPS)
+        threads:
+            TOTAL_THREADS
+        params:
+            executable=KMERPARTITIONMERGER
+        shell:
+            """
+            {params.executable:q} \
+              -f {input.reference:q} \
+              -T {input.target:q} \
+              -b {input.filtered:q} \
+              -o {output.bed:q} \
+              -m 10 \
+              -t {threads} \
+              --only-kmer
+            test -s {output.bed:q}
+            test -s {output.groups:q}
+            """
+
+
+checkpoint build_localblocks:
+    input:
+        bed=str(FILTERED_BED),
+        merged=rules.merge_partitions.output.bed,
+        groups=rules.merge_partitions.output.groups,
+        query=rules.validate_and_order_inputs.output.query,
+        target=rules.extract_block_reference.output.fasta,
+        target_fai=rules.faidx_block_reference.output
+    output:
+        target_list=str(TEMPLATE_PARTITION_TARGETS)
+    params:
+        script=str(SCRIPT_DIR / "build_localblocks_from_filtered_bed.py"),
+        helper=HELPER,
+        localblocks=str(LOCALBLOCKS),
+        unmask=int(config.get("block_unmask", 1000)),
+        target_origins=("--target-origins-only" if BED_GROUPED else "")
+    shell:
+        """
+        {PYTHON:q} {params.script:q} \
+          -b {input.bed:q} \
+          --merged-bed {input.merged:q} \
+          -q {input.query:q} \
+          -t {input.target:q} \
+          -o {params.localblocks:q} \
+          --unmask {params.unmask} {params.target_origins}
+        {PYTHON:q} {params.helper:q} list-partitions \
+          --localblocks {params.localblocks:q} \
+          --output {output.target_list:q}
+        """
+
+
+rule kmersearcher_dummy:
+    output:
+        fasta=str(DUMMY_FASTA),
+        list=str(DUMMY_LIST)
+    params:
+        helper=HELPER
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} write-dummy \
+          --fasta {output.fasta:q} \
+          --list {output.list:q}
+        """
+
+
+rule index_template_partition_targets:
+    input:
+        source_targets=str(TEMPLATE_PARTITION_TARGETS),
+        dummy=rules.kmersearcher_dummy.output.list
+    output:
+        index=str(TEMPLATE_PARTITION_INDEX)
+    threads:
+        TOTAL_THREADS
+    params:
+        executable=KMER_SEARCHER,
+        outdir=str(TEMPLATE_PARTITION_TARGETS.parent)
+    shell:
+        """
+        mkdir -p {params.outdir:q}
+        # KmerSearcher loads TARGET_LIST.bin whenever it already exists.
+        # Remove this rule's exact output so a stale or zero-byte file cannot
+        # be mistaken for a serialized k-mer hash during a requested rebuild.
+        rm -f {output.index:q}
+        {params.executable:q} \
+          -T {input.source_targets:q} \
+          -I {input.dummy:q} \
+          -o {params.outdir:q}/ \
+          -c 1000 \
+          -w 2000 \
+          -n {threads}
+        test -s {output.index:q}
+        """
+
+
+rule search_assembly_blocks:
+    input:
+        targets=str(TEMPLATE_PARTITION_TARGETS),
+        index=rules.index_template_partition_targets.output.index,
+        fasta=sample_fasta,
+        query=rules.validate_and_order_inputs.output.query
+    output:
+        str(KMERMAPS / "{sample}_hotspot.txt")
+    threads:
+        1 if SLURM_ENABLED else TOTAL_THREADS
+    resources:
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        executable=KMER_SEARCHER,
+        outdir=str(KMERMAPS),
+        workers=KMERSEARCH_SLURM_CPUS if SLURM_ENABLED else TOTAL_THREADS,
+        slurm=lambda wildcards: slurm_prefix(
+            f"kmersearch-{wildcards.sample}",
+            KMERSEARCH_SLURM_CPUS,
+            KMERSEARCH_SLURM_MEMORY,
+        )
+    shell:
+        """
+        mkdir -p {params.outdir:q}
+        {params.slurm} {params.executable:q} \
+          -T {input.targets:q} \
+          -i {input.fasta:q} \
+          -p {wildcards.sample:q} \
+          -o {params.outdir:q}/ \
+          -c 1000 \
+          -w 2000 \
+          -N {params.workers}
+        # A sample with no qualifying partition hits has a valid empty map.
+        test -f {output:q}
+        """
+
+
+checkpoint finalize_hotspot_fastas:
+    input:
+        targets=str(TEMPLATE_PARTITION_TARGETS),
+        hotspots=expand(str(KMERMAPS / "{sample}_hotspot.txt"), sample=SAMPLES)
+    output:
+        active=str(ACTIVE_TARGETS),
+        ready=str(HOTSPOT_READY)
+    threads:
+        TOTAL_THREADS
+    params:
+        generator=HOTSPOT_HEADER_GENERATOR,
+        query=str(NORMALIZED_QUERY),
+        localblocks=str(LOCALBLOCKS),
+        kmers=str(KMERMAPS),
+        anchor=int(config.get("hotspot_anchor", 30000))
+    shell:
+        """
+        {PYTHON:q} {params.generator:q} \
+          --hotspot-dir {params.kmers:q} \
+          -q {params.query:q} \
+          -T {input.targets:q} \
+          -o {params.localblocks:q} \
+          --active-list {output.active:q} \
+          -j {threads} \
+          --hotspot-anchor {params.anchor} \
+          --resume
+        mkdir -p $(dirname {output.ready:q})
+        touch {output.ready:q}
+        """
+
+
+checkpoint make_partition_batches:
+    input:
+        active=lambda wildcards: checkpoints.finalize_hotspot_fastas.get().output.active,
+        ready=lambda wildcards: checkpoints.finalize_hotspot_fastas.get().output.ready
+    output:
+        batches=directory(str(BATCH_DIR)),
+        ids=str(BATCH_IDS)
+    params:
+        helper=HELPER,
+        batch_count=PARTITION_BATCHES
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} make-batches \
+          --input {input.active:q} \
+          --output {output.batches:q} \
+          --ids {output.ids:q} \
+          --count {params.batch_count}
+        """
+
+
+rule minset_partition_batch:
+    input:
+        block_policy=BLOCK_POLICY_INPUTS,
+        manifest=batch_manifest,
+        ready=lambda wildcards: checkpoints.finalize_hotspot_fastas.get().output.ready,
+        query=rules.validate_and_order_inputs.output.query,
+        reference=([] if TEMPLATE_DEFINED else [str(FIXED_FASTA)]),
+        reference_fai=([] if TEMPLATE_DEFINED else [str(FIXED_FASTA_FAI)])
+    output:
+        str(GRAPH / "batch_status" / PARTITION_RUN_PROTOCOL / "{batch}.done")
+    threads:
+        1 if SLURM_ENABLED else TOTAL_THREADS
+    resources:
+        slurm_jobs=1 if SLURM_ENABLED else 0
+    params:
+        helper=HELPER,
+        script=str(SCRIPT_DIR / "minsetref_light.py"),
+        graph_script=str(SCRIPT_DIR / "minsetgraphmake.py"),
+        coordinate_script=str(SCRIPT_DIR / "analyze_partition_coordinates.py"),
+        refinement_script=str(SCRIPT_DIR / "map_all_novels_to_local_templates.py"),
+        apply_script=str(SCRIPT_DIR / "apply_unified_novel_refinement.py"),
+        reference=(
+            "" if TEMPLATE_DEFINED else
+            "--reference-name " + shlex.quote(REFERENCE_NAME)
+        ),
+        outdir=str(GRAPH_OUTPUTS),
+        adjusted=str(PARTITION_LOCAL_ADJUSTED),
+        builder=HOTSPOT_FASTA_BUILDER,
+        kmer_ref_cleaner=KMERREFCLEANER,
+        payload=(
+            "--alignment-payload" if ALIGNMENT_PAYLOAD
+            else "--no-alignment-payload"
+        ),
+        alignment_mode=(
+            "--fast-mode" if FAST_MODE else
+            "--slow-rigorous" if SLOW_RIGOROUS else
+            "--max-rigorous"
+        ),
+        linear="--linear" if LINEAR_OUTPUT else "",
+        static="--static-block" if STATIC_BLOCK else "",
+        skip="--skip-blastn" if SKIP_BLASTN else "",
+        template_reference=(
+            "--template-defined-reference" if TEMPLATE_DEFINED else ""
+        ),
+        alternative_templates=(
+            "--allow-missing-bed-haplotypes" if ALTERNATIVE_FASTA else ""
+        ),
+        main_reference=(
+            "" if TEMPLATE_DEFINED
+            else "--main-reference " + shlex.quote(str(FIXED_FASTA))
+        ),
+        partition_jobs=MINSET_PARTITION_JOBS,
+        partition_threads=MINSET_PARTITION_THREADS,
+        alignment_timeout=ALIGNMENT_TIMEOUT,
+        slurm=lambda wildcards: slurm_prefix(
+            f"minset-{wildcards.batch}",
+            MINSET_SLURM_CPUS,
+            MINSET_SLURM_MEMORY,
+        )
+    shell:
+        """
+        {params.slurm} {PYTHON:q} {params.helper:q} run-batch \
+          --mode integrated \
+          --manifest {input.manifest:q} \
+          --script {params.script:q} \
+          --graph-script {params.graph_script:q} \
+          --coordinate-script {params.coordinate_script:q} \
+          --refinement-script {params.refinement_script:q} \
+          --apply-script {params.apply_script:q} \
+          --python {PYTHON:q} \
+          {params.reference} \
+          {params.main_reference} \
+          --query-paths {input.query:q} \
+          --sample-fasta-builder {params.builder:q} \
+          --kmer-ref-cleaner {params.kmer_ref_cleaner:q} \
+          --adjusted-dir {params.adjusted:q} \
+          --output-dir {params.outdir:q} \
+          --threads {params.partition_threads} \
+          --jobs {params.partition_jobs} \
+          --alignment-timeout {params.alignment_timeout} \
+          --done {output:q} \
+          {params.template_reference} \
+          {params.alternative_templates} \
+          {params.payload} \
+          {params.alignment_mode} \
+          {params.linear} \
+          {params.static} \
+          {params.skip}
+        """
+
+
+rule minset_batches_complete:
+    input:
+        minset_done_files
+    output:
+        str(MINSET_COMPLETE)
+    shell:
+        """
+        mkdir -p $(dirname {output:q})
+        touch {output:q}
+        """
+
+
+rule build_breakpoint_consistency:
+    input:
+        minsets=str(MINSET_COMPLETE),
+        partitions=lambda wildcards: checkpoints.finalize_hotspot_fastas.get().output.active,
+        dependencies=existing_breakpoint_dependencies
+    output:
+        success=str(BREAKPOINT_SUCCESS),
+        manifest=str(BREAKPOINT_MANIFEST)
+    threads:
+        TOTAL_THREADS
+    params:
+        script=str(SCRIPT_DIR / "build_breakpoint_consistency.py"),
+        graphfixbreaks=str(SCRIPT_DIR / "gfixbreaks.py"),
+        localblocks=str(LOCALBLOCKS),
+        reference=(
+            "" if TEMPLATE_DEFINED else
+            "--reference-haplotype " + shlex.quote(REFERENCE_NAME)
+        )
+    shell:
+        """
+        {PYTHON:q} {params.script:q} \
+          --partition-list {input.partitions:q} \
+          --graph-folder {params.localblocks:q} \
+          --manifest {output.manifest:q} \
+          --success {output.success:q} \
+          --graphfixbreaks {params.graphfixbreaks:q} \
+          {params.reference} \
+          --jobs {threads} \
+          --resume
+        test -s {output.success:q}
+        test -s {output.manifest:q}
+        """
+
+
+rule finalize_partition_targets:
+    input:
+        success=rules.build_breakpoint_consistency.output.success,
+        manifest=rules.build_breakpoint_consistency.output.manifest
+    output:
+        marker=str(FINAL_TARGETS_COMPLETE),
+        excluded=str(EXCLUDED_PARTITIONS),
+        targets=str(PARTITION_TARGETS)
+    params:
+        helper=HELPER,
+        localblocks=str(LOCALBLOCKS)
+    shell:
+        """
+        {PYTHON:q} {params.helper:q} list-partitions \
+          --localblocks {params.localblocks:q} \
+          --output {output.targets:q} \
+          --breakpoint-consistent \
+          --breakpoint-manifest {input.manifest:q} \
+          --excluded {output.excluded:q}
+        test -s {output.targets:q}
+        test -s {output.excluded:q}
+        rm -f {PARTITION_INDEX:q}
+        mkdir -p $(dirname {output.marker:q})
+        touch {output.marker:q}
+        """
+
+
+rule analyze_partition_coordinates:
+    input:
+        minsets=rules.finalize_partition_targets.output.marker,
+        ready=lambda wildcards: checkpoints.finalize_hotspot_fastas.get().output.ready,
+        query=rules.validate_and_order_inputs.output.query
+    output:
+        str(COORDINATE_SUCCESS)
+    threads:
+        TOTAL_THREADS
+    params:
+        script=str(SCRIPT_DIR / "analyze_partition_coordinates.py"),
+        localblocks=str(LOCALBLOCKS),
+        output=str(COORDINATE_ANALYSIS),
+        reference=REFERENCE_NAME,
+        # Imported alternative templates label PARTITION.bed rows with the
+        # `alternative` haplotype, which no cohort FASTA header carries; the
+        # per-batch run-batch path passes the same flag for that case.
+        alternative_templates=(
+            "--allow-missing-bed-haplotypes" if ALTERNATIVE_FASTA else ""
+        ),
+        jobs=max(1, TOTAL_THREADS // 4)
+    shell:
+        """
+        {PYTHON:q} {params.script:q} \
+          -i {params.localblocks:q} \
+          -o {params.output:q} \
+          -j {params.jobs} \
+          --sweep-jobs {params.jobs} \
+          --input-anchor 50 \
+          --reference-haplotypes {params.reference:q} \
+          --ignore-contigs chrM \
+          {params.alternative_templates} \
+          --resume
+        test -s {output:q}
+        """
+
+
+rule refine_local_templates:
+    input:
+        analysis=rules.analyze_partition_coordinates.output,
+        query=rules.validate_and_order_inputs.output.query,
+        reference=rules.combine_fixed_reference.output
+    output:
+        str(LOCAL_REFINEMENT_SUCCESS)
+    threads:
+        TOTAL_THREADS
+    params:
+        script=str(SCRIPT_DIR / "map_all_novels_to_local_templates.py"),
+        analysis=str(COORDINATE_ANALYSIS),
+        output=str(LOCAL_REFINEMENT),
+        jobs=max(1, TOTAL_THREADS // 4)
+    shell:
+        """
+        {PYTHON:q} {params.script:q} \
+          -a {params.analysis:q} \
+          -q {input.query:q} \
+          -r {input.reference:q} \
+          -o {params.output:q} \
+          -j {params.jobs} \
+          -c 4 \
+          --minimum-flank 5000 \
+          --maximum-template-gap 100 \
+          --minimum-unmasked 100 \
+          --resume
+        test -s {output:q}
+        """
+
+
+rule apply_local_template_refinement:
+    input:
+        refinement=rules.refine_local_templates.output,
+        query=rules.validate_and_order_inputs.output.query,
+        reference=rules.combine_fixed_reference.output
+    output:
+        str(LOCAL_ADJUSTED_SUCCESS)
+    threads:
+        TOTAL_THREADS
+    params:
+        script=str(SCRIPT_DIR / "apply_unified_novel_refinement.py"),
+        analysis=str(COORDINATE_ANALYSIS),
+        refinement=str(LOCAL_REFINEMENT),
+        output=str(LOCAL_ADJUSTED)
+    shell:
+        """
+        {PYTHON:q} {params.script:q} \
+          -a {params.analysis:q} \
+          -u {params.refinement:q} \
+          -q {input.query:q} \
+          -r {input.reference:q} \
+          -o {params.output:q} \
+          --min-score 100 \
+          -j {threads} \
+          --resume
+        test -s {output:q}
+        """
+
+
+rule graph_batches_complete:
+    input:
+        summary=str(PACKAGE_SUCCESS)
+    output:
+        str(GRAPH_COMPLETE)
+    shell:
+        """
+        mkdir -p $(dirname {output:q})
+        touch {output:q}
+        """
+
+
+if not LARGE_NOVEL_CONFIG and not FIND_NOVEL_LOCI:
+    rule empty_large_novel_catalog:
+        output:
+            str(LARGE_NOVELS)
+        shell:
+            "> {output:q}"
+
+
+rule refine_and_annotate_novel_sequences:
+    input:
+        graphs=rules.graph_batches_complete.output,
+        local=rules.apply_local_template_refinement.output,
+        query=rules.validate_and_order_inputs.output.query,
+        reference=rules.combine_fixed_reference.output,
+        large=str(LARGE_NOVELS),
+        code=[str(SCRIPT_DIR / name) for name in (
+            "fixed_alternatives.py", "map_global_novel.py",
+            "map_small_novel_minset.py", "apply_unified_novel_refinement.py",
+            "run_partition_novelty_pipeline.sh",
+        )]
+    output:
+        success=str(ANNOTATION_SUCCESS),
+        annotations=str(COHORT_ANNOTATIONS / "residual_novel_annotations.tsv")
+    threads:
+        TOTAL_THREADS
+    params:
+        driver=str(SCRIPT_DIR / "run_partition_novelty_pipeline.sh"),
+        graph=str(GRAPH),
+        reference_name=REFERENCE_NAME,
+        skip="--skip-blastn" if SKIP_BLASTN else ""
+    shell:
+        """
+        bash {params.driver:q} \
+          --folder {params.graph:q} \
+          --query {input.query:q} \
+          --large-novels {input.large:q} \
+          --reference {input.reference:q} \
+          --reference-haplotype {params.reference_name:q} \
+          --local-cores {threads} \
+          --annotations-only \
+          {params.skip}
+        test -s {output.success:q}
+        test -s {output.annotations:q}
+        """
+
+
+rule build_graph_summary:
+    input:
+        batches=graph_done_files,
+        breakpoints=rules.build_breakpoint_consistency.output.success,
+        targets=rules.finalize_partition_targets.output.marker,
+        partition_targets=ancient(str(PARTITION_TARGETS)),
+        query=rules.validate_and_order_inputs.output.query
+    output:
+        summary=str(PACKAGE_SUMMARY),
+        alternative_intervals=str(PACKAGE_ALTERNATIVE_INTERVALS),
+        alternatives=str(PACKAGE_ALTERNATIVES),
+        alternatives_fai=str(PACKAGE_ALTERNATIVES_FAI),
+        caches=str(PACKAGE_CACHES),
+        targets=str(PACKAGE_TARGETS),
+        success=str(PACKAGE_SUCCESS)
+    threads:
+        TOTAL_THREADS
+    params:
+        script=str(SCRIPT_DIR / "build_local_graphs.py"),
+        adjusted=str(PARTITION_LOCAL_ADJUSTED),
+        reference=REFERENCE_NAME,
+        outdir=str(PACKAGE_DIR),
+        graph_folder=str(GRAPH_OUTPUTS),
+        reference_argument=(
+            "--embed-all-templates" if TEMPLATE_DEFINED else
+            "--reference-haplotype " + shlex.quote(REFERENCE_NAME)
+        )
+    shell:
+        """
+        {PYTHON:q} {params.script:q} \
+          -i {params.adjusted:q} \
+          -q {input.query:q} \
+          --graph-folder {params.graph_folder:q} \
+          {params.reference_argument} \
+          -o {params.outdir:q} \
+          -j {threads} \
+          --resume
+        test -s {output.summary:q}
+        test -f {output.alternative_intervals:q}
+        test -f {output.alternatives:q}
+        if test -s {output.alternatives:q}; then
+          {SAMTOOLS:q} faidx {output.alternatives:q}
+        else
+          : > {output.alternatives_fai:q}
+        fi
+        test -f {output.alternatives_fai:q}
+        test -f {output.caches:q}
+        cp {input.partition_targets:q} {output.targets:q}
+        test -s {output.targets:q}
+        touch {output.success:q}
+        """

@@ -1,0 +1,3 @@
+# The launcher writes an immutable, validated run JSON beneath the calling
+# output and overrides this value with --config run_config=/absolute/path.
+run_config: ""

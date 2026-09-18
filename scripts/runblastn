@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Run BLASTN and restore v4 database ordinal IDs from DB_PREFIX.seq.
+
+set -euo pipefail
+
+arguments=("$@")
+output=""
+database=""
+
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+    case "${arguments[$index]}" in
+        -out)
+            if ((index + 1 >= ${#arguments[@]})); then
+                echo "runblastn: -out requires a value" >&2
+                exit 2
+            fi
+            output="${arguments[$((index + 1))]}"
+            ;;
+        -db)
+            if ((index + 1 >= ${#arguments[@]})); then
+                echo "runblastn: -db requires a value" >&2
+                exit 2
+            fi
+            database="${arguments[$((index + 1))]}"
+            ;;
+    esac
+done
+
+if [[ -z "$output" || -z "$database" ]]; then
+    echo "Usage: runblastn <blastn options...> -db <database> -out <file or ->" >&2
+    exit 2
+fi
+
+sequence_names="${database}.seq"
+if [[ ! -s "$sequence_names" ]]; then
+    echo "runblastn: missing or empty sequence-name map: $sequence_names" >&2
+    exit 1
+fi
+
+replacement_program='
+BEGIN {
+    line_number = 0
+    while ((getline line < sequence_names) > 0) {
+        line_number++
+        names[line_number] = line
+    }
+    close(sequence_names)
+}
+{
+    while (match($0, /BL_ORD_ID:[0-9]+/)) {
+        token = substr($0, RSTART, RLENGTH)
+        ordinal = substr(token, 11) + 1
+        if (!(ordinal in names)) {
+            print "runblastn: no name for " token > "/dev/stderr"
+            exit 3
+        }
+        $0 = substr($0, 1, RSTART - 1) names[ordinal] \
+             substr($0, RSTART + RLENGTH)
+    }
+    print
+}
+'
+
+if [[ "$output" == "-" ]]; then
+    blastn "${arguments[@]}" |
+        awk -v sequence_names="$sequence_names" "$replacement_program"
+else
+    temporary="${output}.tmp.$$"
+    cleanup() {
+        rm -f -- "$temporary"
+    }
+    trap cleanup EXIT
+    for ((index = 0; index < ${#arguments[@]}; index++)); do
+        if [[ "${arguments[$index]}" == "-out" ]]; then
+            arguments[$((index + 1))]="$temporary"
+            break
+        fi
+    done
+    blastn "${arguments[@]}"
+    awk -v sequence_names="$sequence_names" "$replacement_program" \
+        "$temporary" > "$output"
+fi

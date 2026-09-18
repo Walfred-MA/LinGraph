@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Build the v4 nucleotide database layout required by minsetref.
+
+input=""
+out=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -in)
+            input="$2"
+            shift 2
+            ;;
+        -out)
+            out="$2"
+            shift 2
+            ;;
+        -blastdb_version)
+            # The pipeline requires v4 regardless of a caller-provided value.
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+status=0
+seq_tmp=""
+if [[ -z "$input" || -z "$out" ]]; then
+    echo "Usage: runmakeblastdb -in <input.fa> -out <output_db>" >&2
+    status=2
+elif [[ ! -s "$input" ]]; then
+    echo "runmakeblastdb: input FASTA is missing or empty: $input" >&2
+    status=2
+else
+    makeblastdb \
+        -in "$input" \
+        -dbtype nucl \
+        -blastdb_version 4 \
+        -out "$out"
+    status=$?
+
+    if [[ $status -eq 0 ]]; then
+        missing=""
+        for suffix in .nhr .nin .nsq; do
+            if [[ ! -s "$out$suffix" ]]; then
+                missing="$missing $out$suffix"
+            fi
+        done
+        if [[ -n "$missing" ]]; then
+            echo "runmakeblastdb: incomplete v4 database; missing/empty:$missing" >&2
+            status=1
+        elif [[ -e "$out.ndb" ]]; then
+            echo "runmakeblastdb: unexpected v5/LMDB component: $out.ndb" >&2
+            status=1
+        fi
+    fi
+
+    if [[ $status -eq 0 ]]; then
+        seq_tmp="$out.seq.tmp.$$"
+        awk '/^>/{name=substr($0,2); sub(/[[:space:]].*$/, "", name); print name}' \
+            "$input" > "$seq_tmp"
+        status=$?
+        if [[ $status -eq 0 && ! -s "$seq_tmp" ]]; then
+            echo "runmakeblastdb: input FASTA contains no sequence names: $input" >&2
+            status=1
+        fi
+        if [[ $status -eq 0 ]]; then
+            mv -f -- "$seq_tmp" "$out.seq"
+            status=$?
+        fi
+    fi
+fi
+
+if [[ -n "$seq_tmp" && -e "$seq_tmp" ]]; then
+    rm -f -- "$seq_tmp"
+fi
+
+[[ $status -eq 0 ]]
