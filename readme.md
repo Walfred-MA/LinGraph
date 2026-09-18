@@ -17,6 +17,7 @@ pangenome graph.
 7. [Call variants in a cohort](#call-variants-in-a-cohort)
 8. [grVCF format and standard VCF conversion](#grvcf-format-and-standard-vcf-conversion)
 9. [Build a pangenome GFA from grVCF](#build-a-pangenome-gfa-from-grvcf)
+10. [Benchmark trio consistency](#benchmark-trio-consistency)
 
 ## Workflow overview
 
@@ -601,6 +602,20 @@ BED and mapping sidecars accompany the GFA for tracing coordinates. Use
 See [the GFA export guide](scripts/merged_vcf_to_gfa.md) for coordinate conventions,
 additional filters, and graph validation.
 
+## Benchmark trio consistency
+
+The [benchmark directory](benchmark/README.md) provides two tools for checking
+whether child variants have a match in either parent:
+
+- **[QuickTriocheck.py](benchmark/QuickTriocheck.README.md):** compare separate
+  haplotype VCFs or one multi-sample VCF using position, variant type, and size.
+  Requires only Python's standard library.
+- **[truvari_trio.sh](benchmark/truvari_trio.README.md):** run eight pairwise
+  Truvari benchmarks for two child and four parental haplotypes.
+
+Each guide explains requirements, coverage filtering, commands, and outputs.
+Use calls made against the same reference and retain their coverage headers.
+
 ## Repository layout
 
 ```text
@@ -612,6 +627,7 @@ scripts/                 Main pipeline scripts and installation helper
   docs/figures/          Workflow figure (PNG and PDF)
 tools/                   Preparation and VCF conversion utilities
 windowprofs/             Gene and balanced block-interval BED files
+benchmark/               Trio benchmarks and a README for each script
 tests/                   Reserved for tests
 ```
 

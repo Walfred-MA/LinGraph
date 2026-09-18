@@ -1,5 +1,8 @@
 # LinGraph utilities
 
+Trio benchmarking scripts are in [`benchmark/`](../benchmark/README.md), with
+separate guides for QuickTriocheck and the Truvari wrapper.
+
 ## Rerun every saved SNP chromosome on Slurm
 
 `rerun_snp_chroms.py` reads the existing compact SNP manifest and submits one

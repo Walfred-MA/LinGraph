@@ -23,7 +23,7 @@ set -euo pipefail
 usage() {
     cat >&2 <<'USAGE'
 Usage:
-  bash tools/truvari_trio.sh \
+  bash benchmark/truvari_trio.sh \
     --child  child_h1.vcf child_h2.vcf \
     --mother mother_h1.vcf mother_h2.vcf \
     --father father_h1.vcf father_h2.vcf \
@@ -33,7 +33,7 @@ Usage:
     [--keep-temp]
 
 Example:
-  bash tools/truvari_trio.sh \
+  bash benchmark/truvari_trio.sh \
     --child \
       cohort_calls/samples/NA19240_h1/NA19240_h1.vcf \
       cohort_calls/samples/NA19240_h2/NA19240_h2.vcf \
