@@ -628,11 +628,17 @@ scripts/                 Main pipeline scripts and installation helper
 tools/                   Preparation and VCF conversion utilities
 windowprofs/             Gene and balanced block-interval BED files
 benchmark/               Trio benchmarks and a README for each script
-tests/                   Reserved for tests
+tests/                   Regression tests
 ```
 
-`tests/` contains only a `.gitkeep` placeholder. Compile the native tools during
-installation; platform-specific binaries are not included.
+Run the trio-reporting regression tests with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Compile the native tools during installation; platform-specific binaries are
+not included.
 
 ## More help
 

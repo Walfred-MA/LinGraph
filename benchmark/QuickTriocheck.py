@@ -2,9 +2,11 @@
 
 """
 
-Triocheck_hsv.py
+QuickTriocheck.py
 
 Check trio consistency in a multi-sample VCF or separate haplotype VCFs.
+
+Multiple child VCFs produce combined and per-haplotype summaries, in input order.
 
 This version supports two sample encodings:
 
@@ -76,7 +78,7 @@ import sys
 
 from bisect import bisect_right
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from dataclasses import dataclass, replace
 
@@ -89,7 +91,7 @@ DEFAULT_MIN_SIZE = 50
 
 SIZE_RATIO_MIN = 0.7
 
-SCRIPT_VERSION = "decomposed-format-v6.1-edge-trim-default10k-2026-09-07"
+SCRIPT_VERSION = "decomposed-format-v6.2-haplotype-summaries-2026-09-18"
 
 
 @dataclass(frozen=True)
@@ -3086,6 +3088,8 @@ def exclude_child_parent_missing_separate(
 
     coverage_by_source: Dict[str, Dict[str, List[Tuple[int, int]]]],
 
+    stats_by_source: Optional[Dict[str, Dict[str, int]]] = None,
+
 ) -> Tuple[List[VariantRecord], Dict[str, int], Dict[str, int]]:
 
     """Exclude child alleles when a parental haplotype lacks reference coverage.
@@ -3157,6 +3161,16 @@ def exclude_child_parent_missing_separate(
         mother_missing = (not mother_covered) or (not all(mother_covered))
 
         father_missing = (not father_covered) or (not all(father_covered))
+
+        if stats_by_source is not None:
+            source_stats = stats_by_source.setdefault(rec.source, {})
+            for key, excluded in (
+                ('records_excluded_parent_missing', mother_missing or father_missing),
+                ('records_excluded_mother_missing', mother_missing),
+                ('records_excluded_father_missing', father_missing),
+                ('records_excluded_both_parents_missing', mother_missing and father_missing),
+            ):
+                source_stats[key] = source_stats.get(key, 0) + int(excluded)
 
         if mother_missing:
 
@@ -3294,6 +3308,69 @@ def write_split_child_outputs(
     return out_stats
 
 
+def summarize_child_haplotypes(
+    child_paths: Sequence[str],
+    child_records: Sequence[VariantRecord],
+    mom_hits: Sequence[bool],
+    dad_hits: Sequence[bool],
+    include_all: bool,
+    stats_by_source: Optional[Dict[str, Dict[str, int]]] = None,
+) -> str:
+    """Report retained calls by source without repeating parental matching."""
+    counts = defaultdict(Counter)
+    types = defaultdict(lambda: defaultdict(Counter))
+    for rec, mother, father in zip(child_records, mom_hits, dad_hits):
+        found = mother or father
+        counts[rec.source].update({
+            'total': 1,
+            'found_in_mother': int(mother),
+            'found_in_father': int(father),
+            'found_in_either_parent': int(found),
+            'found_in_both_parents': int(mother and father),
+            'not_found_in_parents': int(not found),
+        })
+        kind = rec.variant_class if include_all else rec.svtype
+        types[rec.source][kind].update(total=1, found=int(found))
+
+    lines = []
+    stats_by_source = stats_by_source or {}
+    for number, path in enumerate(child_paths, 1):
+        prefix = f'child_h{number}'
+        values = counts[path]
+        total = values['total']
+        lines.append(f'{prefix}_vcf\t{path}')
+        for key in (
+            'vcf_records_scanned',
+            'records_excluded_edge_trim',
+            'records_excluded_parent_missing',
+            'records_excluded_mother_missing',
+            'records_excluded_father_missing',
+            'records_excluded_both_parents_missing',
+            'records_excluded_missing_original_coordinates',
+        ):
+            lines.append(f'{prefix}_{key}\t{stats_by_source.get(path, {}).get(key, 0)}')
+        lines.append(f'{prefix}_records_loaded\t{total}')
+        total_key = 'total_variants' if include_all else 'total_sv'
+        lines.append(f'{prefix}_{total_key}\t{total}')
+        for key in ('found_in_mother', 'found_in_father', 'found_in_either_parent',
+                    'found_in_both_parents', 'not_found_in_parents'):
+            lines.append(f'{prefix}_{key}\t{values[key]}')
+        for key in ('found_in_either_parent', 'not_found_in_parents'):
+            fraction = f'{values[key] / total:.6f}' if total else 'NA'
+            lines.append(f'{prefix}_{key}_fraction\t{fraction}')
+        lines.append('')
+
+    kind_label = 'type' if include_all else 'svtype'
+    lines.append(f'child_haplotype\t{kind_label}\ttotal\tfound_in_either_parent\tfraction_found')
+    sort_order = {'SNP': 0, 'INDEL': 1, 'SV': 2, 'OTHER': 3}
+    for number, path in enumerate(child_paths, 1):
+        for kind in sorted(types[path], key=lambda value: (sort_order.get(value, 99), value)):
+            values = types[path][kind]
+            total, found = values['total'], values['found']
+            lines.append(f'h{number}\t{kind}\t{total}\t{found}\t{found / total:.6f}')
+    return '\n'.join(lines)
+
+
 def summarize_separate_files(
 
     child_paths: Sequence[str],
@@ -3335,6 +3412,8 @@ def summarize_separate_files(
     mom_hits: Sequence[bool],
 
     dad_hits: Sequence[bool],
+
+    child_stats_by_source: Optional[Dict[str, Dict[str, int]]] = None,
 
 ) -> str:
 
@@ -3491,6 +3570,13 @@ def summarize_separate_files(
 
         lines.append(f'{key}\t{total_t}\t{found_t}\t{frac:.6f}')
 
+    if len(child_paths) > 1:
+        lines.append('')
+        lines.append(summarize_child_haplotypes(
+            child_paths, child_records, mom_hits, dad_hits, include_all,
+            child_stats_by_source,
+        ))
+
     return '\n'.join(lines)
 
 def main() -> int:
@@ -3501,7 +3587,9 @@ def main() -> int:
 
             "Check trio consistency in either one multi-sample VCF or independent "
 
-            "child/mother/father haplotype VCFs with GT or HSV fields."
+            "child/mother/father haplotype VCFs with GT or HSV fields. "
+
+            "Multiple child VCFs are reported both together and separately."
 
         )
 
@@ -3813,6 +3901,8 @@ def main() -> int:
 
     child_raw: Dict[str, Dict[int, str]] = {}
 
+    child_stats_by_source: Dict[str, Dict[str, int]] = {}
+
     coverage_by_source: Dict[str, Dict[str, List[Tuple[int, int]]]] = {}
 
     coverage_header_count_by_source: Dict[str, int] = {}
@@ -3853,9 +3943,16 @@ def main() -> int:
 
                 child_raw[path] = raw_rows
 
+                child_stats_by_source[path] = {
+                    'vcf_records_scanned': scanned,
+                    'records_excluded_missing_original_coordinates': missing_original,
+                }
+
             print(f"loaded_{role}_vcf\t{path}\tsamples={','.join(sample_names)}\tcarried_records={len(recs)}\treferenceCoverage_intervals={reference_coverage_count}", file=sys.stderr)
 
     edge_trim_excluded_by_role = {"child": 0, "mother": 0, "father": 0}
+
+    child_before_edges = Counter(rec.source for rec in role_records['child'])
 
     if args.edge_trim > 0:
 
@@ -3868,6 +3965,12 @@ def main() -> int:
             )
 
     child_records_all = role_records["child"]
+
+    child_after_edges = Counter(rec.source for rec in child_records_all)
+    for path in args.child:
+        child_stats_by_source[path]['records_excluded_edge_trim'] = (
+            child_before_edges[path] - child_after_edges[path]
+        )
 
     mother_records = role_records["mother"]
 
@@ -3932,6 +4035,8 @@ def main() -> int:
         father_paths=args.father,
 
         coverage_by_source=coverage_by_source,
+
+        stats_by_source=child_stats_by_source,
 
     )
 
@@ -3998,6 +4103,8 @@ def main() -> int:
         mom_hits=mom_hits,
 
         dad_hits=dad_hits,
+
+        child_stats_by_source=child_stats_by_source,
 
     ))
 

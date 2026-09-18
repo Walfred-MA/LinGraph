@@ -82,7 +82,9 @@ are excluded and counted in the report.
 ## Outputs
 
 - **Standard output:** tab-separated settings, coverage exclusions, parent-match
-  counts, fractions, and a breakdown by variant type. Redirect it to a file.
+  counts, fractions, and a breakdown by variant type. With multiple child VCFs,
+  it includes both the combined summary and separate haplotype summaries.
+  Redirect it to a file.
 - **Standard error:** script version and input-loading information.
 - **`--fp FILE`:** child calls without a match in either parent, annotated with
   `TRIOCHECK_FP` fields.
@@ -100,6 +102,40 @@ output paths are overwritten.
 The main fraction is `child_found_in_either_parent_fraction`; its complement
 is `child_not_found_in_parents_fraction`. Both use the retained child calls
 after filtering. See [interpretation notes](README.md#inputs-and-interpretation).
+
+### Separate child haplotype summaries
+
+When `--child` lists two or more VCFs, the report automatically adds
+`child_h1_*`, `child_h2_*`, and so on, in **the order the files were supplied**.
+The `child_h1_vcf` and `child_h2_vcf` entries identify the corresponding paths;
+labels are not inferred from filenames. No additional option is needed.
+
+For example, a report might contain:
+
+```text
+child_h1_vcf	child_h1.vcf
+child_h1_total_sv	3
+child_h1_found_in_either_parent	2
+child_h1_not_found_in_parents	1
+child_h1_found_in_either_parent_fraction	0.666667
+child_h2_vcf	child_h2.vcf
+child_h2_total_sv	1
+child_h2_found_in_either_parent	1
+child_h2_not_found_in_parents	0
+child_h2_found_in_either_parent_fraction	1.000000
+```
+
+Each haplotype also reports matches in the mother, father, and both parents;
+the child-only fraction; rows scanned; and exclusions for edge trimming,
+missing parental coverage, and missing original coordinates. A final table
+breaks down the retained variants by haplotype and variant type. With `--all`,
+the total key is `child_hN_total_variants`, and the table uses variant classes.
+
+Fractions use each haplotype's own retained calls as the denominator. An empty
+or fully filtered haplotype has zero counts and `NA` fractions. The combined
+summary keeps its existing `child_*` keys: counts are summed across haplotypes,
+and fractions are calculated from those sums, not averaged between haplotypes.
+Single-child-file and multi-sample `-i` reports keep their existing layout.
 
 ```bash
 python3 benchmark/QuickTriocheck.py --help

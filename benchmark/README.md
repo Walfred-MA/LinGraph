@@ -5,7 +5,7 @@ least one parent. Run the examples from the LinGraph repository root.
 
 | Script | Method | Usage guide |
 | --- | --- | --- |
-| [QuickTriocheck.py](QuickTriocheck.py) | Match variants by type, position, and size; supports separate haplotype VCFs or one multi-sample VCF. Uses Python's standard library. | [QuickTriocheck README](QuickTriocheck.README.md) |
+| [QuickTriocheck.py](QuickTriocheck.py) | Match variants by type, position, and size; report combined and per-child-haplotype results for separate VCFs, or check one multi-sample VCF. Uses Python's standard library. | [QuickTriocheck README](QuickTriocheck.README.md) |
 | [truvari_trio.sh](truvari_trio.sh) | Run eight Truvari comparisons between two child and four parental haplotypes. | [Truvari trio README](truvari_trio.README.md) |
 
 ## Inputs and interpretation
