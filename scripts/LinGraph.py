@@ -84,14 +84,15 @@ Examples:
         q = modes.add_parser(mode, formatter_class=argparse.RawDescriptionHelpFormatter,
             help=("build/resume a graph, call cohort samples, and merge VCFs (default: --fast)"
                   if mode == "graph" else
-                  "call new samples against an existing graph (rigorous alignment only)"),
+                  "call one or many samples independently against an existing graph (rigorous alignment only)"),
             description=("Build/resume a graph, call every cohort sample, and merge VCFs." if mode == "graph"
-                         else "Call new assemblies against an existing graph; report coverage per sample."),
+                         else "Call one or many sample/haplotype assemblies independently against an existing graph; write one VCF and coverage report per input."),
             epilog=("Examples:\n  python LinGraph.py graph -I cohort.list -G savegraph -O calls\n"
                     "  python LinGraph.py graph -I cohort.list -r CHM13_h1 -G savegraph -O calls --MC-graph"
                     if mode == "graph" else
                     "Examples:\n  python LinGraph.py singular -i query.fa --sample HG002_h1 -G graph -O calls\n"
-                    "  python LinGraph.py singular -I samples.list -G graph -r reference.fa -O calls --merge")
+                    "  python LinGraph.py singular -I samples.list -G graph -r reference.fa -O calls\n"
+                    "\nEach input is called independently. Add --merge to also merge the resulting VCFs.")
                     + "\n\nLists: NAME FASTA, one sample/haplotype per row; index: FASTA.fai.\n"
                     "Prepare assemblies separately with LinGraph.py prepare.\n"
                     "LinGraph checks the first sequence and adjacent index; it never prepares inputs.\n"
@@ -102,14 +103,16 @@ Examples:
                             "existing compact summary/graph directory")
         q.add_argument("-O", "--output", "--output-folder", required=True, help="output directory for VCFs, logs, and run metadata")
         inputs = q.add_mutually_exclusive_group()
-        inputs.add_argument("-I", "--input-list", help="NAME FASTA list; graph defaults to its saved cohort list")
+        inputs.add_argument("-I", "--input-list", help=(
+            "NAME FASTA list for one or many samples; each input is called independently"
+            if mode == "singular" else "NAME FASTA list; graph defaults to its saved cohort list"))
         if mode == "singular":
             q.set_defaults(mc_graph=False, gfa_only=False, insertion_only=None, alternative=[])
             inputs.add_argument("-i", "--input", help="one query FASTA (requires --sample)")
             q.add_argument("--sample", help="query name, e.g. HG002_h1, for -i")
             q.add_argument("--reference-caches", metavar="DIR",
                            help="use supplied reference alignment and blocks without cache validation; default: GRAPH/references/NAME_rig")
-            q.add_argument("--merge", action="store_true", help="also write cohort SNP/indel/SV VCFs when calling multiple samples (off by default)")
+            q.add_argument("--merge", action="store_true", help="also merge independent calls from multiple inputs; explicit variant-selection options also enable merging")
         q.add_argument("-r", "--reference", help="reference NAME or FASTA; default: first saved cohort assembly")
         q.add_argument("-L", "--graph-list", help="partition names or paths, one per row; default: all")
         q.add_argument("-t", "-j", "--threads", "--cores", type=int,

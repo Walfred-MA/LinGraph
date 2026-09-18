@@ -13,7 +13,7 @@ in grVCF and can export cohort calls as a pangenome graph.
 3. [Modes and input preparation](#modes-and-input-preparation)
 4. [Choose windows for graph construction](#choose-windows-for-graph-construction)
 5. [Download and reconstruct Win50KGraph](#download-and-reconstruct-win50kgraph)
-6. [Call variants in an individual sample](#call-variants-in-an-individual-sample)
+6. [Call one or many samples independently](#call-one-or-many-samples-independently)
 7. [Call variants in a cohort](#call-variants-in-a-cohort)
 8. [grVCF format and standard VCF conversion](#grvcf-format-and-standard-vcf-conversion)
 9. [Build a pangenome GFA from grVCF](#build-a-pangenome-gfa-from-grvcf)
@@ -84,8 +84,13 @@ LinGraph has two calling modes:
 
 | Mode | Use it for | Graph input | Default alignment |
 | --- | --- | --- | --- |
-| `singular` | Individual sample SV calling and annotation | An existing LinGraph graph or compact summary | `--rigorous` only |
+| `singular` | **Independent SV calling for one or many samples**; one VCF per input haplotype | An existing LinGraph graph or compact summary | `--rigorous` only |
 | `graph` | Joint cohort SV calling and pangenome graph construction | Builds, resumes, or reuses a cohort graph | `--fast` |
+
+**`singular` means independent sample calling. It supports multiple samples in
+one command.** Each input haplotype is called separately using the same existing
+graph and reference alignments. Use `graph` for the cohort graph-building and
+calling workflow.
 
 Both modes write **grVCF**, LinGraph's graph-aware variant format, using `.vcf`
 filenames. In `graph` mode, add `--mc-graph` to export a pangenome graph as
@@ -229,9 +234,10 @@ directory. Reconstruction still uses the package's CHM13 source reference.
 For another calling reference, omit `--reference-caches` so LinGraph prepares
 that reference's alignments.
 
-## Call variants in an individual sample
+## Call one or many samples independently
 
-Use `singular` to annotate a new assembly against an **existing LinGraph graph**.
+Use `singular` to call and annotate **one sample or a batch of samples
+independently** against an **existing LinGraph graph**.
 Pass the graph root or its `summary/` directory with `-G`. To obtain a graph,
 [download and reconstruct Win50KGraph](#download-and-reconstruct-win50kgraph)
 or build one with [graph mode](#call-variants-in-a-cohort).
@@ -239,6 +245,29 @@ or build one with [graph mode](#call-variants-in-a-cohort).
 The examples below use `cohort_graph` as that existing graph. Reference names
 such as `CHM13_h1` must occur in its saved cohort list; otherwise, supply the
 reference FASTA explicitly.
+
+### Call multiple samples in one command
+
+List the prepared haplotype assemblies in `samples.list`. For example, two
+diploid samples have four entries:
+
+```text
+HG002_h1 /data/prepared/HG002.h1.fa
+HG002_h2 /data/prepared/HG002.h2.fa
+HG003_h1 /data/prepared/HG003.h1.fa
+HG003_h2 /data/prepared/HG003.h2.fa
+```
+
+```bash
+python3 scripts/LinGraph.py singular \
+  -I samples.list -G cohort_graph -r CHM13_h1 \
+  -O sample_calls_chm13 -t 16
+```
+
+This independently calls all four haplotypes and writes a VCF and coverage
+reports for each under `sample_calls_chm13/samples/NAME/`. The existing graph
+and reference alignments are reused across inputs. By default, this command
+produces separate calls; add `--merge` to also merge them after calling.
 
 ### Use CHM13, GRCh38, or another assembly as the reference
 
@@ -338,9 +367,11 @@ The coverage files report represented and uncovered assembly bases.
 | `--satellite-bed satellites.bed` | Add satellite annotations to coverage reports. |
 | `--dry-run` | Check inputs and show planned commands without running or writing files. |
 
-The default selects SV calling. Explicit variant-selection options also trigger
-merging when singular mode receives multiple haplotypes. A single input produces
-its individual VCF. The cutoff applies to **merged representatives**;
+The default selects independent SV calling with one VCF per input haplotype.
+With multiple inputs, `--merge` or an explicit variant-selection option
+(`--all`, `--svonly`, `--svindel`, or `--snp`) also merges the resulting VCFs.
+The calling step remains independent for each input. A single input produces
+only its individual VCF. The cutoff applies to **merged representatives**;
 individual `.vcf` files can retain smaller candidate events for merging.
 
 A compact summary contains `local_graphs.tsv` and `alternatives.fasta`.

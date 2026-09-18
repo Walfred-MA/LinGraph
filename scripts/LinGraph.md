@@ -286,6 +286,11 @@ FASTA files.
 
 ## Singular mode
 
+**Singular mode calls samples independently and accepts one or many samples
+in one run.** Each haplotype assembly gets its own VCF and coverage report,
+using the same existing graph and reference alignments. `-i` supplies one
+haplotype FASTA; `-I` supplies a list of haplotypes from one or multiple samples.
+
 One assembly:
 
 ```bash
@@ -294,19 +299,21 @@ python3 scripts/LinGraph.py singular \
   -G cohort_graph -O query_calls
 ```
 
-Several assemblies:
+Several assemblies, called independently:
 
 ```bash
 python3 scripts/LinGraph.py singular -I prepared_queries.list \
-  -G cohort_graph -O query_calls --merge
+  -G cohort_graph -O query_calls
 ```
 
 Singular mode requires an existing graph. It aligns the reference once and
 reuses that alignment for the queries. It produces one VCF and coverage report
 per input assembly. With only one sample (from `-i` or a one-entry `-I` list),
 calling skips cohort merging, including when `--all` or `--merge` is supplied;
-the result is `OUTPUT/samples/NAME/NAME.vcf`. With multiple samples, `--merge`
-additionally produces the VCFs for the selected mode. Singular mode does not
+the result is `OUTPUT/samples/NAME/NAME.vcf`. With multiple samples, add `--merge`
+to also merge the independent calls. Explicit variant-selection options
+(`--all`, `--svonly`, `--svindel`, or `--snp`) also enable merging with multiple
+inputs. Without those options, only separate calls are produced. Singular mode does not
 export GFA, regardless of the number of samples; `--mc-graph`/`--MC-graph`,
 `--gfa-only`, and GFA export settings are available only in graph mode.
 Explicit `--merge-only` runs still merge existing VCFs.
