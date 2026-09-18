@@ -1,10 +1,10 @@
 # LinGraph
 
 **LinGraph is an assembly-based structural variant (SV) caller for challenging
-repetitive regions of the genome and a pangenome graph builder designed to scale
-to thousands of haplotypes.** It calls variants from genome assemblies, records
-their sequence and assembly coordinates, and can turn cohort calls into a
-pangenome graph.
+repetitive regions of the genome and a pangenome graph builder. It supports
+both cohort SV calling and graph construction for cohorts containing thousands
+of haplotypes.** LinGraph records variant sequences and assembly coordinates
+in grVCF and can export cohort calls as a pangenome graph.
 
 ## Contents
 
@@ -75,7 +75,7 @@ be located. Use `--no-install-deps` to build with an environment you manage your
 
 Graph mode requires at least **4 CPUs**; examples below use `-t 16`. Memory and
 temporary storage needs depend on assembly count and repeat complexity. For
-large cohorts, use shared storage and the SLURM options described in
+cohorts with thousands of haplotypes, use shared storage and the SLURM options described in
 [the full command guide](scripts/LinGraph.md#slurm-and-dependencies).
 
 ## Modes and input preparation
@@ -348,6 +348,9 @@ Reconstruct it with the package's source reference before selecting a different
 calling reference. See the [Win50KGraph instructions](#download-and-reconstruct-win50kgraph).
 
 ## Call variants in a cohort
+
+**Graph mode supports thousand-scale cohorts**, enabling joint SV calling and
+pangenome graph construction across thousands of haplotypes.
 
 Use `graph` to build or reuse local graphs, call the cohort, and merge its
 variants. Cohort calling can be slightly faster than separate singular runs
