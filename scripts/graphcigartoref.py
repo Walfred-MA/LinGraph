@@ -7,6 +7,7 @@ Behavior is intended to match graphcigartoref_lessbuggy_formatfix_realign_ssw_or
 from __future__ import annotations
 import argparse
 import bisect
+import heapq
 import multiprocessing as mp
 import os
 import re
@@ -16,8 +17,9 @@ import sys
 import tempfile
 import time
 import traceback
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass, replace
+from itertools import islice
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 try:
     import numpy as _np
 except ImportError:  # pure-python fallback keeps the pipeline runnable
@@ -32,6 +34,12 @@ try:
     import mappy as _mappy
 except ImportError:  # subprocess minimap2 fallback remains available
     _mappy = None
+from alignment_scoring import (alignment_score, scoring_runs, run_score,
+                               MATCH_SCORE, MISMATCH_SCORE, GAP_OPEN,
+                               whole_pair_score, MaskedSVScorer,
+                               di_repair_score, DI_MATCH_SCORE,
+                               DI_MISMATCH_SCORE, DI_GAP_OPEN, DI_GAP_EXTEND)
+from reference_hardness import quantify_sequence_hardness
 from local_reference_templates import read_templates
 from graph_cigar_payloads import query_only_graph_cigar
 from local_graph_whole_cigar import add_graph_cigar_payloads
@@ -40,6 +48,18 @@ from alternative_intervals import AlternativeIntervals, append_tag
 _SEG_RE = re.compile('([<>])([^:<>]+):')
 _COORD_RE = re.compile('^(.+):(\\d+)-(\\d+)([+-])$')
 _CIGAR_RE = re.compile('(\\d+)([A-Z=])([A-Za-z]*)')
+
+
+def _parasail_scoring_matrix(alphabet: str, match: int, mismatch: int):
+    # The linear and SV aligners use different substitution scores.  Sharing
+    # by alphabet alone can also invalidate the linear aligner's traceback,
+    # which recomputes its own recurrence from the native score table.
+    key = (alphabet, match, mismatch)
+    matrix = _PARASAIL_MATRIX_CACHE.get(key)
+    if matrix is None:
+        matrix = _parasail.matrix_create(alphabet, match, mismatch)
+        _PARASAIL_MATRIX_CACHE[key] = matrix
+    return matrix
 
 
 def set_sv_realignment_enabled(enabled: bool) -> None:
@@ -319,6 +339,11 @@ class GraphicSegment:
     end: int
     cigar: str
     ops: List[CigarOp]
+
+@dataclass
+class ReferenceCigarSegment(GraphicSegment):
+    is_main: bool
+    main_anchor: Tuple[str, str, int, int]
 
 @dataclass
 class EndpointRef:
@@ -687,8 +712,8 @@ def slice_graphic_mapping_by_query(mapping_gcigar: str, qstart: int, qend: int, 
             nonlocal ref_start, ref_end
             if b < a:
                 a, b = b, a
-            if b <= a:
-                return
+            # An insertion-only slice still has a reference anchor.  Keep its
+            # current traversal position, including on reverse segments.
             ref_start = a if ref_start is None else min(ref_start, a)
             ref_end = b if ref_end is None else max(ref_end, b)
 
@@ -916,6 +941,130 @@ def parse_graphic_segments(gcigar: str, row_name: str) -> List[GraphicSegment]:
 def graphic_segment_to_gcigar(segment: GraphicSegment) -> str:
     return f"{segment.direction}{segment.path}:{''.join((_op_to_cigar(tok) for tok in segment.ops))}"
 
+def parse_reference_cigar_segments(text: str, row_name: str) -> List[ReferenceCigarSegment]:
+    """Parse output CIGARs, where pathless chunks resume the first declaration.
+
+    Input graph traversals use a name on every chunk. The output grammar also
+    permits ``>body``/``<body`` to resume the main path after an encoded
+    insertion. Such a body must never inherit that insertion's coordinates.
+    Keep the two parsers separate so repeated named input paths stay distinct.
+    """
+    chunks = list(re.finditer(r'([<>])([^<>]*)', text))
+    if not chunks:
+        return []
+    first = chunks[0].group(2)
+    if ':' not in first:
+        raise ValueError(f'{row_name}: reference CIGAR requires a main declaration')
+    direction = chunks[0].group(1)
+    path = first.split(':', 1)[0]
+    parsed = []
+    main_ops = []
+    for index, chunk in enumerate(chunks):
+        value = chunk.group(2)
+        is_main = index == 0 or ':' not in value
+        name, body = value.split(':', 1) if ':' in value else (path, value)
+        ops = parse_cigar_ops(body)
+        if is_main and chunk.group(1) != direction:
+            raise ValueError(f'{row_name}: main continuation changes direction')
+        parsed.append((chunk.group(1), name, ops, is_main))
+        if is_main:
+            main_ops.extend(ops)
+    main_length = sum(ref_consume(op.op, op.n) for op in main_ops)
+    head = main_ops[0].n if main_ops and main_ops[0].op == 'H' else 0
+    cursor = head if direction == '>' else main_length - head
+    output = []
+    for index, (local_direction, name, ops, is_main) in enumerate(parsed):
+        anchor = (direction, path, main_length, cursor)
+        body = [op for op in ops if op.op != 'H' and op.n > 0]
+        span = sum(ref_consume(op.op, op.n) for op in body)
+        if is_main:
+            local_direction, name, length = direction, path, main_length
+            start, end = (cursor, cursor + span) if direction == '>' else (cursor - span, cursor)
+            cursor = end if direction == '>' else start
+        else:
+            length = sum(ref_consume(op.op, op.n) for op in ops)
+            head = ops[0].n if ops and ops[0].op == 'H' else 0
+            start, end = (head, head + span) if local_direction == '>' else (length - head - span, length - head)
+        if not body:
+            continue
+        cigar = _format_interval_gcigar(local_direction, name, length, start, end, body).split(':', 1)[1]
+        output.append(ReferenceCigarSegment(
+            row_name, index, local_direction, name, length, start, end,
+            cigar, parse_cigar_ops(cigar), is_main, anchor,
+        ))
+    return output
+
+def format_reference_cigar_segments(segments: Sequence[ReferenceCigarSegment]) -> str:
+    """Write main continuations and independently anchored insertion segments."""
+    if not segments:
+        return ''
+    main = [segment for segment in segments if segment.is_main]
+    if main:
+        first = main[0]
+        direction, path, length = first.direction, first.path, first.path_len
+        reference = [segment for segment in main if segment.end > segment.start]
+        left, right = (reference[0], reference[-1]) if reference else (first, first)
+        head = left.start if direction == '>' else length - left.end
+        tail = length - right.end if direction == '>' else right.start
+    else:
+        direction, path, length, cursor = segments[0].main_anchor
+        head = cursor if direction == '>' else length - cursor
+        tail = length - cursor if direction == '>' else cursor
+    output = []
+    last_main = None
+    leading_insertion = segments[0].is_main and segments[0].start == segments[0].end and len(segments) > 1
+    if not segments[0].is_main or leading_insertion:
+        output.append(f'{direction}{path}:{head}H')
+    for index, segment in enumerate(segments):
+        if not segment.is_main:
+            output.append(graphic_segment_to_gcigar(segment))
+            continue
+        body = ''.join(_op_to_cigar(op) for op in segment.ops if op.op != 'H' and op.n > 0)
+        prefix = f'{direction}{path}:' + (f'{head}H' if head else '') if index == 0 and not leading_insertion else direction
+        output.append(prefix + body)
+        last_main = len(output) - 1
+    if tail:
+        if last_main is None:
+            output.append(f'{direction}{tail}H')
+        else:
+            output[last_main] += f'{tail}H'
+    return ''.join(output)
+
+def slice_reference_cigar_by_query(
+    text: str, qstart: int, qend: int, row_name: str='reference CIGAR', *,
+    include_left_boundary_deletions: bool=True,
+    include_right_boundary_deletions: bool=False,
+) -> str:
+    """Slice output in query order without losing its main-path identity."""
+    qstart, qend = int(qstart), int(qend)
+    output = []
+    cursor = 0
+    for segment in parse_reference_cigar_segments(text, row_name):
+        size = sum(query_consume(op.op, op.n) for op in segment.ops)
+        lo, hi = max(qstart, cursor), min(qend, cursor + size)
+        if hi > lo:
+            sliced = slice_query_segment_by_query(
+                segment, lo - cursor, hi - cursor,
+                include_left_boundary_deletions=include_left_boundary_deletions or lo > qstart,
+                include_right_boundary_deletions=include_right_boundary_deletions or hi < qend,
+            )
+            part = parse_graphic_segments(sliced, row_name)[0]
+            output.append(replace(segment, start=part.start, end=part.end,
+                                  cigar=part.cigar, ops=part.ops))
+        elif not size and (
+            qstart < cursor < qend
+            or (include_left_boundary_deletions and cursor == qstart < qend)
+            or (include_right_boundary_deletions and qstart < cursor == qend)
+        ):
+            output.append(segment)
+        cursor += size
+    if qstart < 0 or qend > cursor or qend <= qstart:
+        raise ValueError(f'{row_name}: invalid reference query slice {qstart}-{qend}/{cursor}')
+    result = format_reference_cigar_segments(output)
+    if graph_cigar_query_span(result, row_name) != qend - qstart:
+        raise ValueError(f'{row_name}: reference query slice changed the query span')
+    return result
+
 def query_consume(op: str, n: int) -> int:
     return n if op in {'=', 'X', 'I'} else 0
 
@@ -1004,7 +1153,7 @@ def _reverse_mapping_payload(tok: CigarOp) -> str:
     payload = tok.payload
     if not payload:
         return payload
-    if tok.op == 'I':
+    if tok.op in {'I', 'D'}:
         return revcomp(payload)
     if tok.op == 'X':
         if len(payload) == tok.n:
@@ -1587,7 +1736,7 @@ def reference_coord_from_graph_cigar(
     wanted = path_key(reference_chrom)
     matches = [
         segment
-        for segment in parse_graphic_segments(graph_cigar, row_name)
+        for segment in parse_reference_cigar_segments(graph_cigar, row_name)
         if path_key(segment.path) == wanted
     ]
     if not matches:
@@ -1664,7 +1813,7 @@ def _reverse_template_cigar(cigar: str) -> str:
     ops: List[CigarOp] = []
     for tok in reversed(parse_cigar_ops(cigar)):
         payload = tok.payload
-        if payload and tok.op in {'I', 'X'}:
+        if payload and tok.op in {'I', 'X', 'D'}:
             payload = _reverse_mapping_payload(tok)
         ops.append(CigarOp(tok.n, tok.op, payload))
     return ''.join((_op_to_cigar(tok) for tok in ops))
@@ -2223,12 +2372,7 @@ def _tm_global_insert_align_dp(ref_seq: str, qry_seq: str) -> Tuple[List[Tuple[i
         ref_upper_text = ref_seq.upper()
         qry_upper_text = qry_seq.upper()
         alphabet = ''.join(sorted(set(ref_upper_text) | set(qry_upper_text)))
-        matrix = _PARASAIL_MATRIX_CACHE.get(alphabet)
-        if matrix is None:
-            matrix = _parasail.matrix_create(
-                alphabet, match_score, mismatch_score,
-            )
-            _PARASAIL_MATRIX_CACHE[alphabet] = matrix
+        matrix = _parasail_scoring_matrix(alphabet, match_score, mismatch_score)
         # The score_table is a view into the result's C buffer; the result
         # object must stay referenced for as long as the table is read.
         parasail_result = _parasail.nw_table(
@@ -2589,20 +2733,51 @@ def _payload_ops_from_hit(
     return ops
 
 
-def _mappy_payload_ops(ref_seq: str, qry_seq: str) -> List[Tuple[int, str, str]]:
+def _best_payload_hit_alignment(ref_seq, qry_seq, hits, score):
+    """Compare complete single-hit and combined-hit candidates under one policy.
+
+    Every candidate consumes both complete sequences, including uncovered
+    gaps. The sweep assembler covers each query interval exactly once.
+    """
+    if not hits:
+        raise RuntimeError('minimap2 produced no usable forward payload alignment')
+    candidates = [
+        _payload_ops_from_hit(ref_seq, qry_seq,
+                              ''.join(f'{n}{op}' for n, op, _ in hit.ops),
+                              hit.reference_start, hit.query_start)
+        for hit in hits
+    ]
+    combined = _assemble_tandem_hit_intervals(ref_seq, qry_seq, hits)
+    if combined is not None:
+        candidates.append(combined)
+    return max(candidates, key=lambda ops: (
+        score(ops), sum(n for n, op, _ in ops if op in '=M'),
+    ))
+
+
+# minimap.h MM_F_FOR_ONLY (also used by CLI --for-only). Filtering reverse
+# hits AFTER mapping allows a reverse primary to suppress the forward hit.
+_MINIMAP_FOR_ONLY = 0x100000
+
+
+def _mappy_payload_ops(
+    ref_seq: str, qry_seq: str, *, preset: Optional[str] = None,
+    score=alignment_score,
+) -> List[Tuple[int, str, str]]:
     """In-process minimap2 payload alignment via mappy.
 
-    Mirrors the subprocess contract: asm5 preset, forward-only primary hits,
-    best hit by (matches, block length), and the same no-usable-hit error so
-    caller fallbacks behave identically.
+    Mirrors the subprocess contract: requested preset, forward-only primary
+    hits ranked by the supplied score of the complete padded pairwise CIGAR.
+    preset=None selects default minimap2 mapping (map-ont in mappy).
     """
     try:
-        aligner = _mappy.Aligner(seq=ref_seq, preset='asm5', n_threads=1)
+        aligner = _mappy.Aligner(seq=ref_seq, preset=preset or 'map-ont',
+                                n_threads=1, extra_flags=_MINIMAP_FOR_ONLY)
     except Exception as error:
         raise RuntimeError(
             f'minimap2 payload alignment failed: {error}'
         ) from error
-    best: Optional[Tuple[int, int, str, int, int]] = None
+    hits = []
     for hit in aligner.map(qry_seq):
         if hit.strand != 1 or not hit.is_primary:
             continue
@@ -2611,16 +2786,17 @@ def _mappy_payload_ops(ref_seq: str, qry_seq: str) -> List[Tuple[int, str, str]]
         cigar = hit.cigar_str
         if not cigar:
             continue
-        candidate = (hit.mlen, hit.blen, cigar, hit.r_st, hit.q_st)
-        if best is None or candidate[:2] > best[:2]:
-            best = candidate
-    if best is None:
-        raise RuntimeError('minimap2 produced no usable forward payload alignment')
-    _matches, _block_len, cigar, ref_start, qry_start = best
-    return _payload_ops_from_hit(ref_seq, qry_seq, cigar, ref_start, qry_start)
+        parsed = _tandem_hit_from_cigar(ref_seq, qry_seq, hit.q_st, hit.q_en,
+                                        hit.r_st, hit.r_en, cigar, score=score)
+        if parsed is not None:
+            hits.append(parsed)
+    return _best_payload_hit_alignment(ref_seq, qry_seq, hits, score)
 
 
-def minimap2_payload_ops(ref_seq: str, qry_seq: str) -> List[Tuple[int, str, str]]:
+def minimap2_payload_ops(
+    ref_seq: str, qry_seq: str, *, preset: Optional[str] = None,
+    score=alignment_score,
+) -> List[Tuple[int, str, str]]:
     """Align one long insertion payload pair with minimap2.
 
     The graph-CIGAR merge requires a *global* payload CIGAR, while minimap2
@@ -2629,7 +2805,10 @@ def minimap2_payload_ops(ref_seq: str, qry_seq: str) -> List[Tuple[int, str, str
     so unaligned prefixes and suffixes remain explicit D/I operations.  The
     forward-only mode matches the graph-template merge orientation contract.
     Callers conservatively retain the original D/I representation when
-    minimap2 cannot produce a usable forward hit.
+    minimap2 cannot produce a usable forward hit. All payload callers use
+    default minimap2 mapping unless they explicitly supply another preset.
+    The score function ranks returned hits; it does not change minimap2's
+    native search parameters. D/I repair supplies its separate affine score.
     """
     if not ref_seq and not qry_seq:
         return []
@@ -2643,7 +2822,7 @@ def minimap2_payload_ops(ref_seq: str, qry_seq: str) -> List[Tuple[int, str, str
         # In-process minimap2 (same library the CLI wraps): no fork/exec, no
         # temp FASTA files, ~6 ms of fixed cost removed per call.  Set
         # GRAPH_CIGARTOREF_NO_MAPPY=1 to force the subprocess path.
-        return _mappy_payload_ops(ref_seq, qry_seq)
+        return _mappy_payload_ops(ref_seq, qry_seq, preset=preset, score=score)
     executable = _minimap2_executable()
     if executable is None:
         raise FileNotFoundError(
@@ -2671,7 +2850,7 @@ def minimap2_payload_ops(ref_seq: str, qry_seq: str) -> List[Tuple[int, str, str
             handle.write('\n')
         command = [
             executable,
-            '-x', 'asm5',
+            *(['-x', preset] if preset else []),
             '-t', str(_minimap2_threads()),
             '-c',
             '--eqx',
@@ -2697,7 +2876,7 @@ def minimap2_payload_ops(ref_seq: str, qry_seq: str) -> List[Tuple[int, str, str
         detail = message[-1] if message else f'exit code {completed.returncode}'
         raise RuntimeError(f'minimap2 payload alignment failed: {detail}')
 
-    best: Optional[Tuple[int, int, str, int, int]] = None
+    hits = []
     for raw in completed.stdout.splitlines():
         fields = raw.split('\t')
         if len(fields) < 12 or fields[0] != 'graph_query' or fields[5] != 'graph_ref':
@@ -2724,24 +2903,11 @@ def minimap2_payload_ops(ref_seq: str, qry_seq: str) -> List[Tuple[int, str, str
         cigar = tags.get('cg')
         if not cigar or qend <= qstart or tend <= tstart:
             continue
-        candidate = (matches, block_len, cigar, tstart, qstart)
-        if best is None or candidate[:2] > best[:2]:
-            best = candidate
-    if best is None:
-        raise RuntimeError('minimap2 produced no usable forward payload alignment')
-
-    _matches, _block_len, cigar, ref_start, qry_start = best
-    ops = _tm_ops_from_cigar_on_sequences(
-        ref_seq, qry_seq, cigar, ref_start, qry_start,
-    )
-    ref_span = sum((ref_consume_pair(op, n) for n, op, _payload in ops))
-    qry_span = sum((query_consume(op, n) for n, op, _payload in ops))
-    if ref_span != len(ref_seq) or qry_span != len(qry_seq):
-        raise RuntimeError(
-            'minimap2 payload CIGAR did not cover complete sequences '
-            f'(reference {ref_span}/{len(ref_seq)}, query {qry_span}/{len(qry_seq)})'
-        )
-    return ops
+        parsed = _tandem_hit_from_cigar(ref_seq, qry_seq, qstart, qend,
+                                        tstart, tend, cigar, score=score)
+        if parsed is not None:
+            hits.append(parsed)
+    return _best_payload_hit_alignment(ref_seq, qry_seq, hits, score)
 
 def _tm_realign_insertion_payloads(ref_seq: str, qry_seq: str, out: List[Tuple[int, str, str]]) -> None:
     """Realign insertion payloads and append pairwise ops to ``out``.
@@ -2751,7 +2917,7 @@ def _tm_realign_insertion_payloads(ref_seq: str, qry_seq: str, out: List[Tuple[i
     template insertion anchor, align those complete payloads before graph-path
     assembly can fragment them into a later D/.../I pattern.
 
-    Payloads shorter than 1000 bp use the in-process global DP implementation.
+    Payloads shorter than 1000 bp use global affine alignment.
     Payloads of at least 1000 bp use minimap2.  Minimap2's local PAF alignment is
     expanded to a global pairwise CIGAR by retaining unaligned prefixes and
     suffixes as D/I.  If minimap2 is unavailable or produces no usable forward
@@ -2768,7 +2934,7 @@ def _tm_realign_insertion_payloads(ref_seq: str, qry_seq: str, out: List[Tuple[i
     max_payload = max(len(ref_seq), len(qry_seq))
     try:
         if max_payload < _PAYLOAD_MINIMAP2_THRESHOLD:
-            ops, _ref_start, _qry_start, _ref_end, _qry_end = _tm_global_insert_align_dp(ref_seq, qry_seq)
+            ops = _global_affine_payload_align(ref_seq, qry_seq)
         else:
             ops = minimap2_payload_ops(ref_seq, qry_seq)
     except (FileNotFoundError, ImportError, RuntimeError):
@@ -2778,6 +2944,9 @@ def _tm_realign_insertion_payloads(ref_seq: str, qry_seq: str, out: List[Tuple[i
         _tm_add_op(out, len(ref_seq), 'D', '')
         _tm_add_op(out, len(qry_seq), 'I', qry_seq)
         return
+    original = [CigarOp(len(ref_seq), 'D', ''), CigarOp(len(qry_seq), 'I', qry_seq)]
+    if not _sequence_replacement_is_valid(original, ops, ref_seq, qry_seq):
+        ops = [(tok.n, tok.op, tok.payload) for tok in original if tok.n]
     for n0, op, payload in ops:
         if op == 'D':
             payload = ''
@@ -2817,7 +2986,11 @@ _SV_CONSOLIDATE_FLANK = 50
 _SV_CONSOLIDATE_MAX_WINDOW = 5000
 
 
-_SV_WINDOW_GAP_OPEN = 12
+# Native affine candidate generation (parasail cannot use logarithmic gaps).
+# All ranking/replacement decisions rescore with alignment_scoring.py.
+_SV_ALIGNMENT_MATCH_SCORE = MATCH_SCORE
+_SV_ALIGNMENT_MISMATCH_SCORE = MISMATCH_SCORE
+_SV_WINDOW_GAP_OPEN = GAP_OPEN
 _SV_WINDOW_GAP_EXTEND = 1
 
 # The second consolidation pass has no biological window-size cutoff.  This
@@ -2828,14 +3001,22 @@ _SV_SECONDARY_AFFINE_MAX_AXIS = 50_000
 
 
 def _sv_window_affine_align(ref_win: str, qry_win: str) -> List[Tuple[int, str, str]]:
-    """Affine-gap global alignment for SV-consolidation windows.
+    """Affine SV candidate; acceptance uses the separate masked SV score."""
+    if _parasail is None and len(ref_win) * len(qry_win) > 4_000_000:
+        try:
+            ops = minimap2_payload_ops(ref_win, qry_win, score=MaskedSVScorer(ref_win, qry_win))
+        except (FileNotFoundError, RuntimeError, subprocess.SubprocessError):
+            return []
+        return [(n, 'M' if op == '=' else op, payload) for n, op, payload in ops]
+    return [(n, 'M' if op == '=' else op, payload)
+            for n, op, payload in _global_affine_payload_align(ref_win, qry_win)]
 
-    A linear gap model is indifferent between one long gap and many
-    fragments of the same total length, which is exactly the tandem-
-    repeat shattering this pass exists to undo; a high open / cheap
-    extend cost makes the single consolidated indel decisively optimal.
-    Falls back to the linear DP when parasail is unavailable.
-    """
+
+def _global_affine_payload_align(
+    ref_win: str, qry_win: str, *, match_score=MATCH_SCORE,
+    mismatch_score=MISMATCH_SCORE, gap_open=GAP_OPEN, gap_extend=1,
+) -> List[Tuple[int, str, str]]:
+    """Generate a global affine candidate with the same native/fallback costs."""
     if not ref_win:
         out: List[Tuple[int, str, str]] = []
         if qry_win:
@@ -2846,23 +3027,22 @@ def _sv_window_affine_align(ref_win: str, qry_win: str) -> List[Tuple[int, str, 
         _tm_add_op(out, len(ref_win), 'D', ref_win)
         return out
     if _parasail is None:
-        ops, _r0, _q0, _r1, _q1 = _tm_global_insert_align_dp(ref_win, qry_win)
-        return [(n, 'M' if op == '=' else op, p) for n, op, p in ops]
+        return _affine_global_fallback(ref_win, qry_win, match_score,
+                                       mismatch_score, gap_open, gap_extend)
     ref_upper = ref_win.upper()
     qry_upper = qry_win.upper()
     alphabet = ''.join(sorted(set(ref_upper) | set(qry_upper)))
-    matrix = _PARASAIL_MATRIX_CACHE.get(alphabet)
-    if matrix is None:
-        matrix = _parasail.matrix_create(alphabet, 2, -3)
-        _PARASAIL_MATRIX_CACHE[alphabet] = matrix
+    matrix = _parasail_scoring_matrix(
+        alphabet, match_score, mismatch_score,
+    )
     result = _parasail.nw_trace_striped_16(
-        qry_upper, ref_upper, _SV_WINDOW_GAP_OPEN, _SV_WINDOW_GAP_EXTEND,
+        qry_upper, ref_upper, gap_open, gap_extend,
         matrix,
     )
     if result.saturated:
         result = _parasail.nw_trace_striped_32(
-            qry_upper, ref_upper, _SV_WINDOW_GAP_OPEN,
-            _SV_WINDOW_GAP_EXTEND, matrix,
+            qry_upper, ref_upper, gap_open,
+            gap_extend, matrix,
         )
     body = result.cigar.decode
     if isinstance(body, bytes):
@@ -2874,7 +3054,7 @@ def _sv_window_affine_align(ref_win: str, qry_win: str) -> List[Tuple[int, str, 
         n = int(m.group(1))
         op = m.group(2)
         if op in '=M':
-            _tm_add_op(out, n, 'M')
+            _tm_add_op(out, n, '=')
             ref_pos += n
             qry_pos += n
         elif op == 'X':
@@ -2892,8 +3072,8 @@ def _sv_window_affine_align(ref_win: str, qry_win: str) -> List[Tuple[int, str, 
             _tm_add_op(out, n, 'D', ref_win[ref_pos:ref_pos + n])
             ref_pos += n
     if ref_pos != len(ref_win) or qry_pos != len(qry_win):
-        ops, _r0, _q0, _r1, _q1 = _tm_global_insert_align_dp(ref_win, qry_win)
-        return [(n, 'M' if op == '=' else op, p) for n, op, p in ops]
+        return _affine_global_fallback(ref_win, qry_win, match_score,
+                                       mismatch_score, gap_open, gap_extend)
     return out
 
 
@@ -3117,31 +3297,314 @@ def _tm_project_realigned_core(
 
 def _tm_realignment_score(
     ops: Sequence[Tuple[int, str, str]],
-) -> int:
-    """Score one candidate core before deciding whether to splice it.
+) -> float:
+    """Legacy log score retained for non-realignment callers and diagnostics."""
+    return alignment_score(ops)
 
-    Score = matched bases - mismatched bases - inserted/deleted bases
-    - 4 * gap openings.  Consecutive operations on the same gap axis count as
-    one opening; switching directly between I and D starts a new gap.
+
+def _realignment_hardness_allows(query_sequence: str) -> bool:
+    """Only generate early whole-pair candidates for query hardness below 10.
+
+    SV-window realignment and D/I correction do not use this gate. Unscorable
+    whole queries retain their original alignment at the early swap stage.
     """
-    score = 0
-    open_gap = ""
-    for n, op, _payload in ops:
-        n = int(n)
-        if op in 'M=':
-            score += n
-            open_gap = ""
-        elif op == 'X':
-            score -= n
-            open_gap = ""
-        elif op in 'ID':
-            score -= n
-            if open_gap != op:
-                score -= 4
-            open_gap = op
+    if not query_sequence:
+        return False
+    score = quantify_sequence_hardness(query_sequence)['summary']['hardness_score']
+    return score is not None and score < 10.0
+
+
+@dataclass(frozen=True)
+class TandemAlignmentHit:
+    query_start: int
+    query_end: int
+    reference_start: int
+    reference_end: int
+    ops: Tuple[Tuple[int, str, str], ...]
+    score: float
+
+
+def _tandem_hit_from_cigar(ref_seq, qry_seq, q0, q1, r0, r1, cigar, *, score=alignment_score):
+    """Validate a local hit before hydrating its CIGAR from actual bases."""
+    if not (0 <= q0 < q1 <= len(qry_seq) and 0 <= r0 < r1 <= len(ref_seq)):
+        return None
+    tokens = re.findall(r'(\d+)([MID=X])', cigar)
+    if ''.join(n + op for n, op in tokens) != cigar:
+        return None
+    if (sum(int(n) for n, op in tokens if op in 'M=XI') != q1 - q0
+            or sum(int(n) for n, op in tokens if op in 'M=XD') != r1 - r0):
+        return None
+    ops = _tm_ops_from_cigar_on_sequences(
+        ref_seq[r0:r1], qry_seq[q0:q1], cigar,
+    )
+    # Mask counts belong to the hit's position in the scoring sequences,
+    # not to position zero. Other scoring models have no sequence context.
+    hit_score = score(ops, r0, q0) if isinstance(score, MaskedSVScorer) else score(ops)
+    return TandemAlignmentHit(q0, q1, r0, r1, tuple(ops),
+                              hit_score)
+
+
+def _minimap2_tandem_hits(ref_seq: str, qry_seq: str) -> List[TandemAlignmentHit]:
+    """Use default minimap2 mapping, retaining forward primary/secondary hits.
+
+    Default mapping can retain a supported continuous alignment across
+    diverged tandem repeats in the whole allele.
+    The caller still requires a strict score gain over the graph alignment.
+    """
+    raw_hits = []
+    if _mappy is not None and os.environ.get('GRAPH_CIGARTOREF_NO_MAPPY', '') in {'', '0'}:
+        aligner = _mappy.Aligner(seq=ref_seq, preset='map-ont', best_n=50,
+                                n_threads=1, extra_flags=_MINIMAP_FOR_ONLY)
+        if not aligner:
+            return []
+        for hit in aligner.map(qry_seq):
+            if hit.strand == 1 and hit.cigar_str:
+                raw_hits.append((hit.q_st, hit.q_en, hit.r_st, hit.r_en, hit.cigar_str))
+    else:
+        executable = _minimap2_executable()
+        if executable is None:
+            return []
+        timeout_text = os.environ.get('GRAPH_CIGARTOREF_MINIMAP2_TIMEOUT', '300')
+        try:
+            timeout = float(timeout_text)
+        except ValueError:
+            timeout = 300.0
+        with tempfile.TemporaryDirectory(prefix='graphcigartoref-tandem-') as directory:
+            ref_path = os.path.join(directory, 'reference.fa')
+            qry_path = os.path.join(directory, 'query.fa')
+            with open(ref_path, 'w') as handle:
+                handle.write('>reference\n' + ref_seq + '\n')
+            with open(qry_path, 'w') as handle:
+                handle.write('>query\n' + qry_seq + '\n')
+            result = subprocess.run(
+                [executable, '-t', str(_minimap2_threads()),
+                 '-c', '--eqx', '--secondary=yes', '-N', '50', '--for-only',
+                 ref_path, qry_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                check=False, timeout=timeout if timeout > 0 else None,
+            )
+        if result.returncode:
+            return []
+        for line in result.stdout.splitlines():
+            fields = line.split('\t')
+            if (len(fields) < 12 or fields[0] != 'query'
+                    or fields[5] != 'reference' or fields[4] != '+'):
+                continue
+            cigar = next((tag[5:] for tag in fields[12:] if tag.startswith('cg:Z:')), '')
+            try:
+                raw_hits.append((int(fields[2]), int(fields[3]),
+                                 int(fields[7]), int(fields[8]), cigar))
+            except ValueError:
+                continue
+    hits = []
+    for args in sorted(set(raw_hits)):
+        hit = _tandem_hit_from_cigar(ref_seq, qry_seq, *args, score=whole_pair_score)
+        if hit is not None:
+            hits.append(hit)
+    return hits
+
+
+def _select_tandem_hit_intervals(hits: Sequence[TandemAlignmentHit]):
+    """Sweep query endpoints; retain the highest-scoring active hit per interval.
+
+    Rank complete local alignments with the existing CIGAR score, rather than
+    minimap2's AS tag. Equal-score ties prefer longer query coverage and then
+    the leftmost target placement, independently of minimap2 output order.
+    """
+    events = {}
+    for index, hit in enumerate(hits):
+        events.setdefault(hit.query_start, []).append((True, index))
+        events.setdefault(hit.query_end, []).append((False, index))
+    active = set()
+    heap = []
+    selected = []
+    coordinates = sorted(events)
+    for start, end in zip(coordinates, coordinates[1:]):
+        for entering, index in events[start]:
+            if entering:
+                hit = hits[index]
+                active.add(index)
+                heapq.heappush(heap, (-hit.score, hit.query_start - hit.query_end,
+                                     hit.reference_start, hit.reference_end,
+                                     hit.query_start, hit.ops, index))
+            else:
+                active.discard(index)
+        while heap and heap[0][-1] not in active:
+            heapq.heappop(heap)
+        if not heap:
+            continue
+        index = heap[0][-1]
+        if selected and selected[-1][2] == index and selected[-1][1] == start:
+            selected[-1] = (selected[-1][0], end, index)
         else:
-            open_gap = ""
-    return score
+            selected.append((start, end, index))
+    return selected
+
+
+def _slice_tandem_hit(hit: TandemAlignmentHit, start: int, end: int):
+    """Clip a hit on its query axis; internal D belongs to its right interval."""
+    q = hit.query_start
+    r = hit.reference_start
+    first_ref = None
+    result = []
+    for n, op, payload in hit.ops:
+        if op == 'D':
+            if start <= q < end:
+                if first_ref is None:
+                    first_ref = r
+                _tm_add_op(result, n, op, '')
+            r += n
+            continue
+        lo, hi = max(start, q), min(end, q + n)
+        if lo < hi:
+            delta = lo - q
+            if first_ref is None:
+                first_ref = r + (delta if op in 'M=X' else 0)
+            piece_payload = ''
+            if op == 'I':
+                piece_payload = payload[delta:delta + hi - lo]
+            elif op == 'X':
+                piece_payload = (payload[delta:delta + hi - lo]
+                                 + payload[n + delta:n + delta + hi - lo])
+            _tm_add_op(result, hi - lo, op, piece_payload)
+        q += n
+        if op in 'M=X':
+            r += n
+    return first_ref, result
+
+
+def _assemble_tandem_hit_intervals(ref_seq, qry_seq, hits):
+    """Build one global, monotone reference alignment with each query base once.
+
+    At a target overlap, bases already traversed on the reference become an
+    insertion. Reference gaps become D; uncovered query intervals become I.
+    These operations participate in the final score, including terminal gaps.
+    """
+    output = []
+    r_cursor = q_cursor = 0
+    for start, end, index in _select_tandem_hit_intervals(hits):
+        if q_cursor < start:
+            _tm_add_op(output, start - q_cursor, 'I', qry_seq[q_cursor:start])
+        q_cursor = start
+        r, ops = _slice_tandem_hit(hits[index], start, end)
+        if r is None:
+            return None
+        for n, op, _payload in ops:
+            if op == 'I':
+                _tm_add_op(output, n, 'I', qry_seq[q_cursor:q_cursor + n])
+                q_cursor += n
+                continue
+            if r > r_cursor:
+                _tm_add_op(output, r - r_cursor, 'D', '')
+                r_cursor = r
+            skipped = min(n, max(0, r_cursor - r))
+            if op in 'M=X' and skipped:
+                _tm_add_op(output, skipped, 'I', qry_seq[q_cursor:q_cursor + skipped])
+                q_cursor += skipped
+            take = n - skipped
+            if take:
+                if op == 'D':
+                    _tm_add_op(output, take, 'D', '')
+                else:
+                    fragment = _tm_ops_from_cigar_on_sequences(
+                        ref_seq[r + skipped:r + n],
+                        qry_seq[q_cursor:q_cursor + take], str(take) + 'M',
+                    )
+                    for token in fragment:
+                        _tm_add_op(output, *token)
+                    q_cursor += take
+                r_cursor = r + n
+            r += n
+        if q_cursor != end:
+            return None
+    if q_cursor < len(qry_seq):
+        _tm_add_op(output, len(qry_seq) - q_cursor, 'I', qry_seq[q_cursor:])
+    if r_cursor < len(ref_seq):
+        _tm_add_op(output, len(ref_seq) - r_cursor, 'D', '')
+    if (sum(ref_consume_pair(op, n) for n, op, _ in output) != len(ref_seq)
+            or sum(query_consume(op, n) for n, op, _ in output) != len(qry_seq)):
+        return None
+    return output
+
+
+def _has_tandem_realign_candidate(stage1: Stage1Result) -> bool:
+    # Repeated visits to overlapping portions of one oriented graph node are
+    # tandem-copy candidates, on either side of the graph comparison.
+    for segments in (stage1.ref_segments, stage1.qry_segments):
+        intervals = {}
+        for segment in segments:
+            key = (path_key(segment.path), segment.direction)
+            intervals.setdefault(key, []).append((segment.start, segment.end))
+        for spans in intervals.values():
+            previous_end = -1
+            for start, end in sorted(spans):
+                if min(previous_end, end) - start > 50:
+                    return True
+                previous_end = max(previous_end, end)
+    # A plain D/I is insufficient evidence of a repeated graph traversal.
+    # Leave ordinary single-traversal variants on their existing code path.
+    return False
+
+
+def _tm_count_large_indels(ops: Sequence[Tuple[int, str, str]]) -> int:
+    """Count contiguous I/D runs strictly longer than 50 bp, not CIGAR tokens."""
+    count = 0
+    gap_op = ''
+    gap_length = 0
+    for n, op, _payload in ops:
+        if n <= 0:
+            continue
+        if op != gap_op:
+            count += gap_length > 50
+            gap_length = 0
+            gap_op = op if op in {'I', 'D'} else ''
+        if op in {'I', 'D'}:
+            gap_length += n
+    return count + (gap_length > 50)
+
+
+def _realign_tandem_stage2(stage1, stage2, backbone, query_sequence, ref_reader):
+    """For tandem queries below hardness 10, require a better linear score."""
+    if (not _SV_REALIGNMENT_ENABLED or stage2 is None or backbone is None
+            or not query_sequence or ref_reader is None
+            or not _has_tandem_realign_candidate(stage1)):
+        return stage2
+    if not (0 <= backbone.start < backbone.end
+            <= ref_reader.index.get(backbone.chrom, (0,))[0]):
+        return stage2
+    ref_sequence = ref_reader.fetch(backbone.chrom, backbone.start, backbone.end,
+                                    backbone.strand)
+    if (len(ref_sequence) != backbone.end - backbone.start
+            or pairwise_ref_span(stage2.pairwise_cigar) != len(ref_sequence)
+            or pairwise_query_span(stage2.pairwise_cigar) != len(query_sequence)):
+        return stage2
+    if not _realignment_hardness_allows(query_sequence):
+        return stage2
+    try:
+        hits = _minimap2_tandem_hits(ref_sequence, query_sequence)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+        return stage2
+    if not hits:
+        return stage2
+    replacement = _assemble_tandem_hit_intervals(ref_sequence, query_sequence, hits)
+    if replacement is None:
+        return stage2
+    # Recompute =/X from both FASTAs, including the existing alignment, so
+    # graph M annotations cannot artificially improve the comparison score.
+    original = _tm_ops_from_cigar_on_sequences(
+        ref_sequence, query_sequence, stage2.pairwise_cigar,
+    )
+    if whole_pair_score(replacement) <= whole_pair_score(original):
+        return stage2
+    cigar = _tm_format_pairwise_ops(replacement)
+    piece = PairwisePiece(
+        kind='main', path=stage1.ref_segments[0].path if stage1.ref_segments else '',
+        ref_original_index=0 if stage1.ref_segments else None,
+        qry_original_index=0 if stage1.qry_segments else None,
+        coord_start=0, coord_end=len(ref_sequence),
+        ref_path_start=0, ref_path_end=len(ref_sequence), cigar=cigar,
+    )
+    return Stage2Result(stage2.matched_runs, [piece], cigar)
 
 
 def _tm_expand_indel_group_window(
@@ -3201,7 +3664,7 @@ def _tm_expand_indel_group_window(
 
 
 def _tm_realign_secondary_sv_window(
-    ref_win: str, qry_win: str,
+    ref_win: str, qry_win: str, *, score=None,
 ) -> Optional[List[Tuple[int, str, str]]]:
     """Realign a score-linked window with a scalable global backend."""
     def normalize(
@@ -3216,6 +3679,8 @@ def _tm_realign_secondary_sv_window(
         return [(len(qry_win), 'I', qry_win)] if qry_win else []
     if not qry_win:
         return [(len(ref_win), 'D', '')] if ref_win else []
+    if score is None:
+        score = MaskedSVScorer(ref_win, qry_win)
     use_affine = (
         max(len(ref_win), len(qry_win)) <= _SV_SECONDARY_AFFINE_MAX_AXIS
         and len(ref_win) * len(qry_win) <= _SV_SECONDARY_AFFINE_MAX_CELLS
@@ -3223,7 +3688,7 @@ def _tm_realign_secondary_sv_window(
     if use_affine and _parasail is not None:
         return normalize(_sv_window_affine_align(ref_win, qry_win))
     try:
-        return normalize(minimap2_payload_ops(ref_win, qry_win))
+        return normalize(minimap2_payload_ops(ref_win, qry_win, score=score))
     except (FileNotFoundError, RuntimeError, subprocess.SubprocessError):
         # A tiny window can still be handled safely by the legacy in-process
         # fallback.  For a large repetitive window, preserving the original
@@ -3231,6 +3696,88 @@ def _tm_realign_secondary_sv_window(
         if use_affine and max(len(ref_win), len(qry_win)) <= 1000:
             return normalize(_sv_window_affine_align(ref_win, qry_win))
         return None
+
+
+def _normalize_repeat_indels(ops, reference, query, *, reverse=False, min_size=50):
+    """Place sequence-equivalent SV gaps at the leftmost available position.
+
+    Shift only through verified exact matches, rotating I payloads from the
+    authoritative query. Never cross a mismatch, another kind of gap, or the
+    supplied segment boundary. On reverse reference pieces, normalize in
+    forward genomic orientation and then restore traversal orientation.
+    This is an equivalence operation, independent of strict realignment gates.
+    """
+    if (not any(op in 'ID' and n >= min_size for n, op, _ in ops)
+            or any(n <= 0 or op not in 'M=XID' for n, op, _ in ops)
+            or sum(n for n, op, _ in ops if op in 'M=XD') != len(reference)
+            or sum(n for n, op, _ in ops if op in 'M=XI') != len(query)):
+        return ops
+    verified = _tm_ops_from_cigar_on_sequences(
+        reference, query, _tm_format_pairwise_ops(ops))
+    work = list(reversed(verified)) if reverse else verified
+    ref = (revcomp(reference) if reverse else reference).upper()
+    qry = (revcomp(query) if reverse else query).upper()
+    out = []
+    rpos = qpos = 0
+    changed = False
+    for size, op, _payload in work:
+        if op not in 'ID' or size < min_size:
+            _tm_add_op(out, size, op)
+        else:
+            rstart, qstart, length, moved = rpos, qpos, size, 0
+            while out and out[-1][1] == '=':
+                available = out[-1][0]
+                shift = 0
+                while shift < available:
+                    rb = ref[rstart - shift - 1 + (length if op == 'D' else 0)]
+                    qb = qry[qstart - shift - 1 + (length if op == 'I' else 0)]
+                    if rb not in 'ACGT' or rb != qb:
+                        break
+                    shift += 1
+                if not shift:
+                    break
+                changed = True
+                rstart -= shift
+                qstart -= shift
+                moved += shift
+                out.pop()
+                if shift < available:
+                    _tm_add_op(out, available - shift, '=')
+                    break
+                if not out or out[-1][1] != op:
+                    break
+                # Shifting through the entire match joins two equivalent
+                # same-kind gaps. Normalize the joined run as well.
+                previous = out.pop()[0]
+                length += previous
+                if op == 'I':
+                    qstart -= previous
+                else:
+                    rstart -= previous
+            _tm_add_op(out, length, op)
+            _tm_add_op(out, moved, '=')
+        rpos += size if op in '=XD' else 0
+        qpos += size if op in '=XI' else 0
+    if not changed:
+        return ops
+    if reverse:
+        out.reverse()
+    candidate = _tm_ops_from_cigar_on_sequences(
+        reference, query, ''.join(f'{n}{op}' for n, op, _ in out))
+    # A shift must preserve substitution counts as well as both complete
+    # spans. Joining adjacent gaps may improve either scoring policy.
+    for axis in ('=X', '=XD', '=XI'):
+        if sum(n for n, op, _ in candidate if op in axis) != sum(
+                n for n, op, _ in verified if op in axis):
+            return ops
+    if (sum(n for n, op, _ in candidate if op == 'X') != sum(
+            n for n, op, _ in verified if op == 'X')
+            or alignment_score(candidate) < alignment_score(verified)
+            or di_repair_score(candidate) < di_repair_score(verified)):
+        return ops
+    match_op = 'M' if any(op == 'M' for _n, op, _p in ops) else '='
+    return [(n, match_op if op == '=' else op, payload)
+            for n, op, payload in candidate]
 
 
 def _tm_realign_score_linked_indel_windows(
@@ -3242,18 +3789,23 @@ def _tm_realign_score_linked_indel_windows(
     Its groups select realignment regions only.  Each core is expanded on both
     the reference and query by ``min(1000, 10% * max(core axis sizes))``;
     overlapping expanded regions are unioned and aligned exactly once.  The
-    anchors remain original; only a strictly better-scoring projected core is
-    spliced back.
+    entire expanded window is replaced only on a strict score improvement.
+    This permits repeat gaps to move across the old core boundary.
     """
     variants = [i for i, (_n, op, _payload) in enumerate(ops) if op in 'IDX']
     groups = _tm_score_linked_indel_groups(ops)
     if not groups:
-        return ops
+        return _normalize_repeat_indels(ops, ref_full, qry_full)
     columns, reference, query = _tm_alignment_offsets(ops)
+    scorer = MaskedSVScorer(ref_full, qry_full)
     windows: List[Tuple[int, int, int, int]] = []
     for start, end in groups:
         first_op = variants[start]
         last_op = variants[end]
+        if not any(n > 0 and op in 'M=X' for n, op, _ in ops[first_op:last_op + 1]):
+            # An adjacent D/I pair belongs exclusively to D/I correction.
+            # Do not retry a support-rejected pair with the SV score.
+            continue
         core_left = columns[first_op]
         core_right = columns[last_op + 1]
         core_ref = reference[last_op + 1] - reference[first_op]
@@ -3267,8 +3819,7 @@ def _tm_realign_score_linked_indel_windows(
         windows.append((left, right, core_left, core_right))
 
     # Dynamic anchors from neighboring groups can overlap.  Union them before
-    # alignment so no sequence is aligned twice.  Keep each original core
-    # separately: the anchors and sequence between cores are never replaced.
+    # alignment so no sequence is replaced twice.
     windows.sort()
     unioned: List[List[object]] = []
     for left, right, core_left, core_right in windows:
@@ -3291,6 +3842,7 @@ def _tm_realign_score_linked_indel_windows(
         )
         replacement = _tm_realign_secondary_sv_window(
             ref_full[r0:r1], qry_full[q0:q1],
+            score=MaskedSVScorer(ref_full[r0:r1], qry_full[q0:q1]),
         )
         replacement_ref = sum(
             n for n, op, _payload in (replacement or ()) if op in 'MXD'
@@ -3303,38 +3855,21 @@ def _tm_realign_score_linked_indel_windows(
             or replacement_ref != r1 - r0
             or replacement_qry != q1 - q0
         )
-        for core_left, core_right in sorted(cores):
-            original_core = _tm_slice_ops_by_columns(
-                ops, columns, core_left, core_right,
-            )
-            for piece in _tm_slice_ops_by_columns(
-                ops, columns, cursor, core_left,
-            ):
-                _tm_add_op(rebuilt, *piece)
-            projected = None
-            if replacement_valid:
-                core_r0, core_q0 = _tm_axis_offset_at_column(
-                    ops, columns, reference, query, core_left,
-                )
-                core_r1, core_q1 = _tm_axis_offset_at_column(
-                    ops, columns, reference, query, core_right,
-                )
-                projected = _tm_project_realigned_core(
-                    replacement,
-                    core_r0 - r0,
-                    core_q0 - q0,
-                    core_r1 - r0,
-                    core_q1 - q0,
-                )
-            if (
-                projected is None
-                or _tm_realignment_score(projected)
-                <= _tm_realignment_score(original_core)
-            ):
-                projected = original_core
-            for piece in projected:
-                _tm_add_op(rebuilt, *piece)
-            cursor = core_right
+        original_window = _tm_slice_ops_by_columns(ops, columns, left, right)
+        for piece in _tm_slice_ops_by_columns(ops, columns, cursor, left):
+            _tm_add_op(rebuilt, *piece)
+        if not replacement_valid or not _sv_replacement_is_valid(
+            [CigarOp(*op) for op in original_window], replacement,
+            ref_full[r0:r1], qry_full[q0:q1],
+            left_context=[CigarOp(*op) for op in rebuilt],
+            right_context=(CigarOp(*op) for op in _tm_slice_ops_by_columns(
+                ops, columns, right, columns[-1])),
+            scorer=scorer, reference_offset=r0, query_offset=q0,
+        ):
+            replacement = original_window
+        for piece in replacement:
+            _tm_add_op(rebuilt, *piece)
+        cursor = right
     for piece in _tm_slice_ops_by_columns(
         ops, columns, cursor, columns[-1],
     ):
@@ -3346,7 +3881,7 @@ def _tm_realign_score_linked_indel_windows(
     out_qry = sum(n for n, op, _payload in rebuilt if op in 'MXI')
     if (in_ref, in_qry) != (out_ref, out_qry):
         return ops
-    return rebuilt
+    return _normalize_repeat_indels(rebuilt, ref_full, qry_full)
 
 
 def _tm_consolidate_sv_ops(ops: List[Tuple[int, str, str]], ref_full: str, qry_full: str) -> List[Tuple[int, str, str]]:
@@ -3359,8 +3894,8 @@ def _tm_consolidate_sv_ops(ops: List[Tuple[int, str, str]], ref_full: str, qry_f
     group's region - extended exactly 50 columns into the flanking
     anchors, splitting anchor ops at the cut - is realigned with affine
     gaps so micro-anchored tandem-repeat indels collapse into one
-    canonical decomposition.  Anchors remain unchanged and the core is
-    replaced only on a strict alignment-score improvement.  A second pass uses
+    canonical decomposition.  Each entire window is replaced only on a strict
+    alignment-score improvement with identical endpoint coordinates. A second pass uses
     unit gap penalty without a hard distance cutoff solely to select broader
     sequence-realignment regions.
     """
@@ -3378,7 +3913,7 @@ def _tm_consolidate_sv_ops(ops: List[Tuple[int, str, str]], ref_full: str, qry_f
         len(variants) < 2
         or not any(ops[index][1] in 'ID' for index in variants)
     ):
-        return ops
+        return _normalize_repeat_indels(ops, ref_full, qry_full)
     # The realignment slices ref_full/qry_full by op-derived offsets, so
     # the captured sequences must consume exactly as the ops do.  If a
     # rare walk desync makes them disagree, skip consolidation rather
@@ -3424,6 +3959,8 @@ def _tm_consolidate_sv_ops(ops: List[Tuple[int, str, str]], ref_full: str, qry_f
         (s, e) for s, e in groups
         if e > s
         and any(ops[variants[k]][1] in 'ID' for k in range(s, e + 1))
+        and any(n > 0 and op in 'M=X'
+                for n, op, _ in ops[variants[s]:variants[e] + 1])
     ]
     if not groups:
         return _tm_realign_score_linked_indel_windows(
@@ -3510,6 +4047,7 @@ def _tm_consolidate_sv_ops(ops: List[Tuple[int, str, str]], ref_full: str, qry_f
         ref_off[i + 1] = ref_off[i] + (n if op in 'MXD' else 0)
         qry_off[i + 1] = qry_off[i] + (n if op in 'MXI' else 0)
     new_ops: List[Tuple[int, str, str]] = []
+    scorer = MaskedSVScorer(ref_full, qry_full)
     cursor = 0
     for (
         left_boundary, right_boundary, core_left_boundary,
@@ -3523,26 +4061,24 @@ def _tm_consolidate_sv_ops(ops: List[Tuple[int, str, str]], ref_full: str, qry_f
         qry_win = qry_full[qry_off[left]:qry_off[right]]
         if max(len(ref_win), len(qry_win)) > _SV_CONSOLIDATE_MAX_WINDOW:
             continue
-        for i in range(cursor, core_left):
+        for i in range(cursor, left):
             _tm_add_op(new_ops, *split_ops[i])
         replacement = _sv_window_affine_align(ref_win, qry_win)
-        original_core = split_ops[core_left:core_right]
-        projected = _tm_project_realigned_core(
-            replacement,
-            ref_off[core_left] - ref_off[left],
-            qry_off[core_left] - qry_off[left],
-            ref_off[core_right] - ref_off[left],
-            qry_off[core_right] - qry_off[left],
-        )
-        if (
-            projected is None
-            or _tm_realignment_score(projected)
-            <= _tm_realignment_score(original_core)
+        original_window = split_ops[left:right]
+        # A repeat gap may move into either flank.  Replace the complete
+        # bounded window, whose endpoints (unlike the old core's) are shared
+        # by both paths.  Include neighboring gap runs in the score gate.
+        if not _sv_replacement_is_valid(
+            [CigarOp(*op) for op in original_window], replacement,
+            ref_win, qry_win,
+            left_context=[CigarOp(*op) for op in new_ops],
+            right_context=(CigarOp(*op) for op in split_ops[right:]),
+            scorer=scorer, reference_offset=ref_off[left], query_offset=qry_off[left],
         ):
-            projected = original_core
-        for piece in projected:
+            replacement = original_window
+        for piece in replacement:
             _tm_add_op(new_ops, *piece)
-        cursor = core_right
+        cursor = right
     for i in range(cursor, len(split_ops)):
         _tm_add_op(new_ops, *split_ops[i])
     # Safety net: consolidation must be alignment-preserving; if the
@@ -4476,6 +5012,41 @@ def _anchor_annealed_linear_piece(template: AnnealTemplate, cigar: str) -> Optio
         return None
     return LinearPiece(piece=piece, chrom=template.chrom, strand=template.strand, genome_start=genome_start, genome_end=genome_end, cigar=cigar)
 
+def _consolidate_linear_piece(piece, linear, query_offset, query_sequence, ref_reader):
+    """Consolidate either indel direction before large-insertion encoding."""
+    if not _SV_REALIGNMENT_ENABLED or query_sequence is None or ref_reader is None:
+        return piece, linear
+    tokens = parse_cigar_ops(piece.cigar)
+    if (sum(tok.op in 'ID' for tok in tokens) < 2
+            and not any(tok.op in 'ID' and tok.n >= 50 for tok in tokens)):
+        return piece, linear
+    try:
+        reference = ref_reader.fetch(linear.chrom, linear.genome_start,
+                                     linear.genome_end, linear.strand)
+    except (KeyError, ValueError, OSError):
+        return piece, linear
+    query = query_sequence[query_offset:query_offset + pairwise_query_span(piece.cigar)]
+    if len(reference) != pairwise_ref_span(piece.cigar) or len(query) != pairwise_query_span(piece.cigar):
+        return piece, linear
+    original = [(tok.n, tok.op, tok.payload) for tok in tokens]
+    candidate = _tm_consolidate_sv_ops(original, reference, query)
+    if not _sv_replacement_is_valid(tokens, candidate, reference, query):
+        candidate = original
+    # A single already-consolidated gap may still need canonical placement.
+    # Equivalent shifts do not need a strict improvement; actual realignment
+    # still passes the gate above. Reverse pieces use genomic left alignment.
+    candidate = _normalize_repeat_indels(
+        candidate, reference, query, reverse=linear.strand == '-')
+    body = []
+    for n, op, payload in candidate:
+        _append_recanonicalized_op(body, '=' if op == 'M' else op, n, payload)
+    cigar = ''.join(_op_to_cigar(tok) for tok in body)
+    if cigar == piece.cigar:
+        return piece, linear
+    repaired = replace(piece, cigar=cigar)
+    return repaired, replace(linear, piece=repaired, cigar=cigar)
+
+
 def build_stage4_linear(stage1: Stage1Result, stage3: Stage3PolishResult, graph_sequences: Dict[str, str], path_coords: Dict[str, Coord], chrom_lengths: Dict[str, int], graph_mappings: Dict[str, str], ref_reader: Optional[FastaRegionReader], ref_backbone_coord: Optional[Coord]=None, min_encode_query_span: int=50, record_sequences: Optional[Dict[str, str]]=None, query_name: Optional[str]=None) -> Stage3Result:
     query_sequence = _lookup_query_sequence(query_name or (stage1.qry_segments[0].row_name if stage1.qry_segments else None), record_sequences)
     local_duplicate_pieces = build_secondary_duplicate_lcs_pieces(stage1, graph_sequences, ref_backbone_coord)
@@ -4509,6 +5080,8 @@ def build_stage4_linear(stage1: Stage1Result, stage3: Stage3PolishResult, graph_
         main_piece, main_linear = _rescue_internal_di_windows_multiscale(
             main_piece, main_linear, 0, query_sequence, ref_reader)
         main_piece, main_linear = _rescue_long_di_pairs_in_linear_piece(
+            main_piece, main_linear, 0, query_sequence, ref_reader)
+        main_piece, main_linear = _consolidate_linear_piece(
             main_piece, main_linear, 0, query_sequence, ref_reader)
         encoded_linear = encode_large_insertions_in_piece(main_piece, 0, main_linear, query_sequence, stage1, graph_sequences, graph_mappings, ref_reader, min_encode_query_span, local_duplicate_pieces, query_coverages)
         assign_global_piece_metadata(encoded_linear)
@@ -4544,6 +5117,8 @@ def build_stage4_linear(stage1: Stage1Result, stage3: Stage3PolishResult, graph_
         piece, linear = _rescue_internal_di_windows_multiscale(
             piece, linear, piece_q0, query_sequence, ref_reader)
         piece, linear = _rescue_long_di_pairs_in_linear_piece(
+            piece, linear, piece_q0, query_sequence, ref_reader)
+        piece, linear = _consolidate_linear_piece(
             piece, linear, piece_q0, query_sequence, ref_reader)
         linear_pieces.extend(encode_large_insertions_in_piece(piece, piece_q0, linear, query_sequence, stage1, graph_sequences, graph_mappings, ref_reader, min_encode_query_span, local_duplicate_pieces, query_coverages))
     assign_global_piece_metadata(linear_pieces)
@@ -4918,7 +5493,7 @@ def build_stage1_core_first(
 
 
 EDGE_ALIGNMENT_CONFIDENCE_SCORE = 100
-EDGE_ALIGNMENT_GAP_PENALTY = 4
+EDGE_ALIGNMENT_GAP_PENALTY = GAP_OPEN
 
 
 def alignment_quality_operation_bounds(
@@ -4926,72 +5501,51 @@ def alignment_quality_operation_bounds(
     minimum_score: int = EDGE_ALIGNMENT_CONFIDENCE_SCORE,
     gap_penalty: int = EDGE_ALIGNMENT_GAP_PENALTY,
 ) -> Optional[Tuple[int, int]]:
-    """Return the operation range retained by bidirectional edge scoring.
+    """Retain the positive edge range under the standard alignment score.
 
-    Scanning inward from either edge, ``=``/``M`` contributes its length and
-    each mismatch, insertion, or deletion contributes ``-(length + 4)``.  A
-    negative score clips through that operation and resets the score. Once the
-    score is greater than 100, that edge is locked and all remaining internal
-    operations are retained. If a short alignment never reaches 100, the
-    positive range surviving the complete scan is retained. Operations outside
-    the first/last match are never eligible.
+    A negative running score clips through that run and resets to zero. An
+    edge locks once it exceeds minimum_score. H padding is not sequence, and
+    adjacent gap tokens receive one opening and one logarithmic extension.
     """
-    minimum_score = int(minimum_score)
-    gap_penalty = int(gap_penalty)
+    minimum_score = float(minimum_score)
     if minimum_score < 0:
         raise ValueError('minimum alignment confidence score must be >= 0')
-    if gap_penalty < 0:
-        raise ValueError('alignment gap penalty must be >= 0')
-    match_indices = [
-        index for index, operation in enumerate(ops)
-        if operation.op in {'=', 'M'} and operation.n > 0
-    ]
+    if gap_penalty != GAP_OPEN:
+        raise ValueError('edge scoring uses the standard gap-open penalty')
+    runs = list(scoring_runs(ops))
+    match_indices = [i for i, run in enumerate(runs) if run[3] == '=']
     if not match_indices:
         return None
-    first_match = match_indices[0]
-    last_match = match_indices[-1]
-
-    def contribution(operation: CigarOp) -> int:
-        if operation.op in {'=', 'M'}:
-            return operation.n
-        if operation.op in {'X', 'I', 'D'}:
-            return -(operation.n + gap_penalty)
-        return 0
-
-    left = first_match
-    score = 0
-    for index in range(first_match, last_match + 1):
-        score += contribution(ops[index])
+    runs = runs[match_indices[0]:match_indices[-1] + 1]
+    left, right = runs[0][0], runs[-1][1]
+    score = 0.0
+    for first, end, size, op in runs:
+        score += run_score(size, op)
         if score < 0:
-            left = index + 1
-            score = 0
-            continue
-        if score > minimum_score:
+            left = end
+            score = 0.0
+        elif score > minimum_score:
             break
-    right = last_match + 1
-    score = 0
-    for index in range(last_match, first_match - 1, -1):
-        score += contribution(ops[index])
+    score = 0.0
+    for first, end, size, op in reversed(runs):
+        score += run_score(size, op)
         if score < 0:
-            right = index
-            score = 0
-            continue
-        if score > minimum_score:
+            right = first
+            score = 0.0
+        elif score > minimum_score:
             break
-    if right <= left:
-        return None
-    return left, right
+    return (left, right) if right > left else None
 
 
 def _core_pairwise_anchor_window(
     pairwise_cigar: str,
     minimum_score: int = EDGE_ALIGNMENT_CONFIDENCE_SCORE,
-) -> Optional[Tuple[str, int, int]]:
-    """Return a score-clipped core CIGAR and retained reference interval.
+) -> Optional[Tuple[str, int, int, int, int]]:
+    """Return a score-clipped core and its reference AND query intervals.
 
-    Weak query sequence removed from either edge remains represented as an
-    insertion, while weak reference sequence is reassigned to the corresponding
-    reference extension. Coordinates are local to the unpolished core.
+    Both axes of a clipped edge go to the same extension. Converting the query
+    part to a core insertion would turn, for example, 64D20= into 84D20I.
+    Coordinates are local to the unpolished core.
     """
     ops = parse_cigar_ops(pairwise_cigar)
     bounds = alignment_quality_operation_bounds(
@@ -5016,17 +5570,12 @@ def _core_pairwise_anchor_window(
     suffix_query = sum(
         tok.n for tok in suffix if tok.op in {'=', 'X', 'I'}
     )
-    anchored: List[CigarOp] = []
-    if prefix_query:
-        _append_coalesced_op(anchored, CigarOp(prefix_query, 'I', ''))
-    for tok in middle:
-        _append_coalesced_op(anchored, tok)
-    if suffix_query:
-        _append_coalesced_op(anchored, CigarOp(suffix_query, 'I', ''))
     return (
-        ''.join(_op_to_cigar(tok) for tok in anchored),
+        ''.join(_op_to_cigar(tok) for tok in middle),
         ref_start,
         ref_end,
+        prefix_query,
+        pairwise_query_span(pairwise_cigar) - suffix_query,
     )
 
 
@@ -5042,10 +5591,9 @@ def _align_graph_cigar_extension(
 ) -> str:
     """Run graph-path then base alignment for one complete flank.
 
-    Upstream flanks are reversed on both sides before alignment, making the
-    core-facing right edge the first edge considered by weighted LCS and by the
-    following base-alignment stage. The pairwise result is restored to the
-    original left-to-right orientation before it is returned.
+    Upstream graph matching starts from the core-facing right edge. Base
+    alignment always uses the original orientation, so repeat tie-breaking
+    agrees with core and downstream alignment.
     """
     ref_span = graph_cigar_query_span(ref_gcigar, ref_name) if ref_gcigar else 0
     qry_span = graph_cigar_query_span(qry_gcigar, qry_name) if qry_gcigar else 0
@@ -5056,21 +5604,22 @@ def _align_graph_cigar_extension(
     if qry_span == 0:
         return f'{ref_span}D' if ref_span else ''
 
-    aligned_ref = ref_gcigar
-    aligned_qry = qry_gcigar
-    if outward_from_right_edge:
-        aligned_ref = reverse_mapping_gcigar_for_reverse_path(ref_gcigar)
-        aligned_qry = reverse_mapping_gcigar_for_reverse_path(qry_gcigar)
     stage1 = build_stage1(
-        aligned_ref,
-        aligned_qry,
+        ref_gcigar,
+        qry_gcigar,
         ref_name,
         qry_name,
         reverse_ref_view=reverse_ref_view,
     )
-    cigar = build_stage2(stage1, path_sequences).pairwise_cigar
     if outward_from_right_edge:
-        cigar = _reverse_template_cigar(cigar)
+        weights = {seg.token_id: seg.span for seg in stage1.ref_unified}
+        for seg in stage1.qry_unified:
+            weights.setdefault(seg.token_id, seg.span)
+        nr, nq = len(stage1.ref_tokens), len(stage1.qry_tokens)
+        pairs = weighted_lcs(list(reversed(stage1.ref_tokens)),
+                             list(reversed(stage1.qry_tokens)), weights)
+        stage1.lcs_pairs = sorted((nr - 1 - r, nq - 1 - q) for r, q in pairs)
+    cigar = build_stage2(stage1, path_sequences).pairwise_cigar
     observed_ref = pairwise_ref_span(cigar)
     observed_qry = pairwise_query_span(cigar)
     if observed_ref != ref_span or observed_qry != qry_span:
@@ -5150,7 +5699,10 @@ def build_stage2_core_seeded_extensions(
     if anchored_core is None:
         # Extensions are evidence only when they grow from a usable core.
         return full_stage1, None
-    core_cigar, core_ref_local_start, core_ref_local_end = anchored_core
+    (core_cigar, core_ref_local_start, core_ref_local_end,
+     core_qry_local_start, core_qry_local_end) = anchored_core
+    upstream_qry_end = qry_core_start + core_qry_local_start
+    downstream_qry_start = qry_core_start + core_qry_local_end
 
     upstream_ref_end = ref_core_start + core_ref_local_start
     downstream_ref_start = ref_core_start + core_ref_local_end
@@ -5163,10 +5715,10 @@ def build_stage2_core_seeded_extensions(
     )
     upstream_qry_gcigar = (
         slice_graph_cigar_by_query(
-            qry_gcigar, 0, qry_core_start,
+            qry_gcigar, 0, upstream_qry_end,
             f'{qry_name} upstream extension',
         )
-        if qry_core_start > 0 else ''
+        if upstream_qry_end > 0 else ''
     )
     downstream_ref_gcigar = (
         slice_graph_cigar_by_query(
@@ -5177,10 +5729,10 @@ def build_stage2_core_seeded_extensions(
     )
     downstream_qry_gcigar = (
         slice_graph_cigar_by_query(
-            qry_gcigar, qry_core_end, full_qry_span,
+            qry_gcigar, downstream_qry_start, full_qry_span,
             f'{qry_name} downstream extension',
         )
-        if qry_core_end < full_qry_span else ''
+        if downstream_qry_start < full_qry_span else ''
     )
 
     upstream_cigar = _align_graph_cigar_extension(
@@ -5418,32 +5970,35 @@ _LONG_DI_REALIGN_THRESHOLD = 1000
 _LONG_DI_MIN_MATCHES = 1000
 _SHORT_DI_REALIGN_MIN_SPAN = 31
 _SMALL_DI_REALIGN_MAX_SPAN = 30
-_SMALL_DI_MATCH_SCORE = 1
-_SMALL_DI_MISMATCH_SCORE = -1
-_SMALL_DI_GAP_OPEN_SCORE = -4
-_SMALL_DI_GAP_EXTEND_SCORE = -1
+_SMALL_DI_MATCH_SCORE = DI_MATCH_SCORE
+_SMALL_DI_MISMATCH_SCORE = DI_MISMATCH_SCORE
+_SMALL_DI_GAP_OPEN_SCORE = -DI_GAP_OPEN
+_SMALL_DI_GAP_EXTEND_SCORE = -DI_GAP_EXTEND
 _COMPOSITE_DI_BROAD_EXACT_ANCHOR = 1000
 _COMPOSITE_DI_LOCAL_EXACT_ANCHOR = 31
 
 
-def _realign_small_di_sequences(
+def _realign_small_di_sequences(ref_seq, qry_seq):
+    """Align a <=30 bp D/I pair with the D/I affine objective."""
+    if not ref_seq or not qry_seq or max(len(ref_seq), len(qry_seq)) > _SMALL_DI_REALIGN_MAX_SPAN:
+        return None
+    return _affine_global_fallback(ref_seq, qry_seq, DI_MATCH_SCORE,
+                                  DI_MISMATCH_SCORE, DI_GAP_OPEN, DI_GAP_EXTEND)
+
+
+def _affine_global_fallback(
     ref_seq: str,
     qry_seq: str,
+    match_score: int, mismatch_score: int, gap_open: int, gap_extend: int,
 ) -> Optional[List[Tuple[int, str, str]]]:
-    """Globally align one small adjacent D/I pair with affine gap costs.
+    """Global affine DP with rolling score rows and byte-sized traceback.
 
-    Only pairs whose reference and query sides are both at most 30 bp are
-    eligible.  A one-base gap costs -4 and each additional base in that same gap
-    costs -1.  Mismatch and match scores are -1 and +1, respectively.  X and I
-    payloads contain query bases, matching the final graph-CIGAR convention.
+    Missing parasail must not silently switch to a linear-gap objective.
+    Large quadratic jobs require the native backend; return no candidate when
+    the fallback's memory/work bound is exceeded.
     """
-    if (
-        not ref_seq
-        or not qry_seq
-        or max(len(ref_seq), len(qry_seq)) > _SMALL_DI_REALIGN_MAX_SPAN
-    ):
-        return None
-
+    if len(ref_seq) * len(qry_seq) > 4_000_000:
+        return []
     match_state = 0
     delete_state = 1
     insert_state = 2
@@ -5451,28 +6006,16 @@ def _realign_small_di_sequences(
     n = len(ref_seq)
     m = len(qry_seq)
 
-    match = [[unreachable] * (m + 1) for _ in range(n + 1)]
-    delete = [[unreachable] * (m + 1) for _ in range(n + 1)]
-    insert = [[unreachable] * (m + 1) for _ in range(n + 1)]
-    trace_match = [[-1] * (m + 1) for _ in range(n + 1)]
-    trace_delete = [[-1] * (m + 1) for _ in range(n + 1)]
-    trace_insert = [[-1] * (m + 1) for _ in range(n + 1)]
-    match[0][0] = 0
-
-    for i in range(1, n + 1):
-        if i == 1:
-            delete[i][0] = _SMALL_DI_GAP_OPEN_SCORE
-            trace_delete[i][0] = match_state
-        else:
-            delete[i][0] = delete[i - 1][0] + _SMALL_DI_GAP_EXTEND_SCORE
-            trace_delete[i][0] = delete_state
+    match = [unreachable] * (m + 1)
+    delete = [unreachable] * (m + 1)
+    insert = [unreachable] * (m + 1)
+    trace_match = [bytearray(m + 1) for _ in range(n + 1)]
+    trace_delete = [bytearray(m + 1) for _ in range(n + 1)]
+    trace_insert = [bytearray(m + 1) for _ in range(n + 1)]
+    match[0] = 0
     for j in range(1, m + 1):
-        if j == 1:
-            insert[0][j] = _SMALL_DI_GAP_OPEN_SCORE
-            trace_insert[0][j] = match_state
-        else:
-            insert[0][j] = insert[0][j - 1] + _SMALL_DI_GAP_EXTEND_SCORE
-            trace_insert[0][j] = insert_state
+        insert[j] = -gap_open - (j - 1) * gap_extend
+        trace_insert[0][j] = match_state if j == 1 else insert_state
 
     def choose(candidates: Sequence[Tuple[int, int]]) -> Tuple[int, int]:
         # Candidate order is the deterministic tie breaker.
@@ -5484,35 +6027,41 @@ def _realign_small_di_sequences(
 
     for i in range(1, n + 1):
         rb = ref_seq[i - 1]
+        prev_match, prev_delete, prev_insert = match, delete, insert
+        match = [unreachable] * (m + 1)
+        delete = [unreachable] * (m + 1)
+        insert = [unreachable] * (m + 1)
+        delete[0] = -gap_open - (i - 1) * gap_extend
+        trace_delete[i][0] = match_state if i == 1 else delete_state
         for j in range(1, m + 1):
             qb = qry_seq[j - 1]
             substitution = (
-                _SMALL_DI_MATCH_SCORE
+                match_score
                 if rb.upper() == qb.upper()
-                else _SMALL_DI_MISMATCH_SCORE
+                else mismatch_score
             )
             previous, trace_match[i][j] = choose((
-                (match[i - 1][j - 1], match_state),
-                (delete[i - 1][j - 1], delete_state),
-                (insert[i - 1][j - 1], insert_state),
+                (prev_match[j - 1], match_state),
+                (prev_delete[j - 1], delete_state),
+                (prev_insert[j - 1], insert_state),
             ))
-            match[i][j] = previous + substitution
+            match[j] = previous + substitution
 
-            delete[i][j], trace_delete[i][j] = choose((
-                (delete[i - 1][j] + _SMALL_DI_GAP_EXTEND_SCORE, delete_state),
-                (match[i - 1][j] + _SMALL_DI_GAP_OPEN_SCORE, match_state),
-                (insert[i - 1][j] + _SMALL_DI_GAP_OPEN_SCORE, insert_state),
+            delete[j], trace_delete[i][j] = choose((
+                (prev_delete[j] + (-gap_extend), delete_state),
+                (prev_match[j] + (-gap_open), match_state),
+                (prev_insert[j] + (-gap_open), insert_state),
             ))
-            insert[i][j], trace_insert[i][j] = choose((
-                (insert[i][j - 1] + _SMALL_DI_GAP_EXTEND_SCORE, insert_state),
-                (match[i][j - 1] + _SMALL_DI_GAP_OPEN_SCORE, match_state),
-                (delete[i][j - 1] + _SMALL_DI_GAP_OPEN_SCORE, delete_state),
+            insert[j], trace_insert[i][j] = choose((
+                (insert[j - 1] + (-gap_extend), insert_state),
+                (match[j - 1] + (-gap_open), match_state),
+                (delete[j - 1] + (-gap_open), delete_state),
             ))
 
     _score, state = choose((
-        (match[n][m], match_state),
-        (delete[n][m], delete_state),
-        (insert[n][m], insert_state),
+        (match[m], match_state),
+        (delete[m], delete_state),
+        (insert[m], insert_state),
     ))
     reverse_ops: List[Tuple[int, str, str]] = []
     i = n
@@ -5551,6 +6100,46 @@ def _realign_small_di_sequences(
     return out
 
 
+def _di_supported_match_bases(
+    ops: Sequence[Tuple[int, str, str]],
+    width: int = _SHORT_DI_REALIGN_MIN_SPAN,
+) -> int:
+    """Count matches in >=80%-identical alignment windows.
+
+    Small gaps and mismatches count against identity. This prevents isolated
+    chance matches spread across long deletions from establishing homology,
+    while allowing homologous blocks on either side of a genuine large indel.
+    Count each supported match once even when qualifying windows overlap.
+
+    Long uniform runs can be shortened without changing boundary windows.
+    Matches removed from the middle of an exact run are already supported;
+    an error run of at least one window blocks support across that run.
+    Thus work is bounded by CIGAR operations rather than long gap sizes.
+    """
+    columns = bytearray()
+    supported = 0
+    for n, op, _payload in ops:
+        if op == '=':
+            kept = min(n, 2 * width)
+            supported += n - kept
+            columns.extend(b'\x01' * kept)
+        else:
+            columns.extend(b'\x00' * min(n, width))
+    if len(columns) < width:
+        return 0
+
+    matches = sum(columns[:width])
+    covered_end = 0
+    for start in range(len(columns) - width + 1):
+        end = start + width
+        if start:
+            matches += columns[end - 1] - columns[start - 1]
+        if 5 * matches >= 4 * width:
+            supported += columns.count(1, max(start, covered_end), end)
+            covered_end = end
+    return supported
+
+
 def _realign_long_di_sequences(ref_seq: str, qry_seq: str) -> Optional[List[Tuple[int, str, str]]]:
     """Return a supported global alignment for one adjacent D/I sequence pair.
 
@@ -5558,16 +6147,14 @@ def _realign_long_di_sequences(ref_seq: str, qry_seq: str) -> Optional[List[Tupl
     must therefore represent a homologous reference/query pair as ``D`` + ``I``
     temporarily.  Once the piece has been projected to real reference
     coordinates, the two sequences are available and can be compared directly.
-    Short pairs are aligned with the in-process global DP implementation; long
-    pairs continue to use minimap2.  A rescue is accepted only when there is
+    Short pairs are aligned with the affine D/I objective; long
+    pairs use default minimap2 mapping. A rescue is accepted only when there is
     substantial sequence support, so a genuine unrelated deletion/insertion
     remains D/I.
     """
     if not ref_seq or not qry_seq:
         return None
     min_span = min(len(ref_seq), len(qry_seq))
-    if min_span < _SHORT_DI_REALIGN_MIN_SPAN:
-        return None
 
     # Different graph paths frequently carry an identical replacement.  Avoid
     # invoking either aligner for this common and unambiguous case.
@@ -5576,12 +6163,16 @@ def _realign_long_di_sequences(ref_seq: str, qry_seq: str) -> Optional[List[Tupl
 
     max_span = max(len(ref_seq), len(qry_seq))
     if max_span < _LONG_DI_REALIGN_THRESHOLD:
-        ops, _r0, _q0, _r1, _q1 = _tm_global_insert_align_dp(
-            ref_seq, qry_seq,
+        ops = _global_affine_payload_align(
+            ref_seq, qry_seq, match_score=DI_MATCH_SCORE,
+            mismatch_score=DI_MISMATCH_SCORE,
+            gap_open=DI_GAP_OPEN, gap_extend=DI_GAP_EXTEND,
         )
     else:
         try:
-            ops = minimap2_payload_ops(ref_seq, qry_seq)
+            ops = minimap2_payload_ops(
+                ref_seq, qry_seq, preset=None, score=di_repair_score,
+            )
         except (FileNotFoundError, RuntimeError, ValueError):
             # Never send a >=1 kb rescue to quadratic DP/SSW.  The original
             # D/I representation is conservative when minimap2 is unavailable.
@@ -5590,7 +6181,7 @@ def _realign_long_di_sequences(ref_seq: str, qry_seq: str) -> Optional[List[Tupl
     aligned = sum(n for n, op, _payload in ops if op in {'=', 'X'})
     required_matches = min(
         _LONG_DI_MIN_MATCHES,
-        max(_SHORT_DI_REALIGN_MIN_SPAN, (min_span + 1) // 2),
+        min(min_span, max(_SHORT_DI_REALIGN_MIN_SPAN, (min_span + 1) // 2)),
     )
     if matches < required_matches:
         return None
@@ -5598,7 +6189,119 @@ def _realign_long_di_sequences(ref_seq: str, qry_seq: str) -> Optional[List[Tupl
         return None
     if matches < 0.5 * min_span:
         return None
+    if min_span >= _SHORT_DI_REALIGN_MIN_SPAN:
+        # A gapped global alignment of unrelated DNA can recover half of the
+        # shorter sequence as scattered matches. Require that much support in
+        # locally homologous sequence instead. Acceptance still uses only the
+        # separate affine D/I score (plus the existing tiny-junction safeguard).
+        required_support = max(_SHORT_DI_REALIGN_MIN_SPAN, (min_span + 1) // 2)
+        # A short homologous copy can straddle one large indel (e.g. 20=460I20=).
+        # Allow evidence from both flanks without demanding 31 bases on each.
+        width = min(_SHORT_DI_REALIGN_MIN_SPAN, (min_span + 1) // 2)
+        if _di_supported_match_bases(ops, width) < required_support:
+            return None
     return ops
+
+
+def _sequence_replacement_is_valid(
+    original: Sequence[CigarOp],
+    candidate: Sequence[Tuple[int, str, str]],
+    ref_seq: str,
+    qry_seq: str,
+    left_context: Sequence[CigarOp] = (),
+    right_context: Iterable[CigarOp] = (),
+    *, score=alignment_score, guard_score=None,
+) -> bool:
+    """Keep both spans and require a strictly higher sequence-verified score.
+
+    Include complete adjacent gap runs, so the selected scoring policy charges
+    the actual joined lengths and number of openings at replacement boundaries.
+    If supplied, ``guard_score`` must also strictly improve on the same
+    verified operations and boundary gap runs.
+    """
+    original_ops = [(tok.n, tok.op, tok.payload) for tok in original]
+    for ops in (original_ops, candidate):
+        if (any(n <= 0 or op not in {'M', '=', 'X', 'I', 'D'} for n, op, _ in ops)
+                or sum(n for n, op, _ in ops if op in 'M=XD') != len(ref_seq)
+                or sum(n for n, op, _ in ops if op in 'M=XI') != len(qry_seq)):
+            return False
+    def boundary_gap(context):
+        gap = []
+        for tok in context:
+            if tok.op not in {'I', 'D'} or (gap and tok.op != gap[0][1]):
+                break
+            gap.append((tok.n, tok.op, ''))
+        return gap
+
+    left = boundary_gap(reversed(left_context))
+    right = boundary_gap(iter(right_context))
+    verified_alignments = []
+    for ops in (original_ops, candidate):
+        verified = _tm_ops_from_cigar_on_sequences(
+            ref_seq, qry_seq, _tm_format_pairwise_ops(ops),
+        )
+        verified_alignments.append(left + verified + right)
+    before, after = verified_alignments
+    return (score(after) > score(before)
+            and (guard_score is None or guard_score(after) > guard_score(before)))
+
+
+def _sv_replacement_is_valid(
+    original, candidate, ref_seq, qry_seq, left_context=(), right_context=(),
+    *, scorer=None, reference_offset=0, query_offset=0,
+):
+    """Sequence-verified masked SV score, including complete boundary gaps.
+
+    Context offsets locate the window in the original oriented FASTAs. They
+    are never inferred by searching a repetitive substring or from payload
+    case, which may have been normalized by an alignment backend.
+    """
+    if scorer is None:
+        scorer = MaskedSVScorer(ref_seq, qry_seq)
+    # _sequence_replacement_is_valid prepends this entire adjacent gap run.
+    # Move the sequence origin with it before counting masked gap bases.
+    gap_op = None
+    for tok in reversed(left_context):
+        if tok.op not in 'ID' or (gap_op is not None and tok.op != gap_op):
+            break
+        gap_op = tok.op
+        if gap_op == 'D':
+            reference_offset -= tok.n
+        else:
+            query_offset -= tok.n
+    try:
+        return _sequence_replacement_is_valid(
+            original, candidate, ref_seq, qry_seq, left_context, right_context,
+            score=lambda ops: scorer(ops, reference_offset, query_offset),
+        )
+    except ValueError:
+        # Missing boundary sequence cannot be assigned an invented mask state.
+        return False
+
+
+def _di_rescue_is_valid(
+    original: Sequence[CigarOp],
+    candidate: Sequence[Tuple[int, str, str]],
+    ref_seq: str,
+    qry_seq: str,
+    left_context: Sequence[CigarOp] = (),
+    right_context: Iterable[CigarOp] = (),
+) -> bool:
+    """Require affine improvement, guarding SVs supported by tiny junctions.
+
+    With a <31 bp side opposite an SV-sized sequence, a few chance matches can
+    pay for extra affine gap openings and shatter the SV. Require the SV score
+    to improve too for these asymmetric windows. Supported terminal repairs
+    such as 84D20I -> 20=64D still pass. Larger homologous D/I replacements keep
+    their separate affine policy, including repairs with many small indels.
+    """
+    short_junction = (min(len(ref_seq), len(qry_seq)) < _SHORT_DI_REALIGN_MIN_SPAN
+                      and max(len(ref_seq), len(qry_seq)) >= 50)
+    return _sequence_replacement_is_valid(
+        original, candidate, ref_seq, qry_seq, left_context, right_context,
+        score=di_repair_score,
+        guard_score=alignment_score if short_junction else None,
+    )
 
 
 def _rescue_internal_di_windows_in_linear_piece(
@@ -5616,7 +6319,10 @@ def _rescue_internal_di_windows_in_linear_piece(
     The adjacent-D/I rescue cannot see that these operations belong to one
     replacement.  This pass globally realigns the complete internal window
     against the authoritative query and reference FASTAs.  Unanchored leading
-    and trailing windows remain untouched.
+    and trailing windows remain untouched. An aligner-approved candidate must
+    preserve both sequence spans. Consecutive D/I uses its existing affine
+    repair policy. Windows containing aligned bases between gaps are SV
+    realignment: a strictly improved masked SV score, without a hardness gate.
     """
     if ref_reader is None or query_sequence is None:
         return (piece, linear)
@@ -5681,21 +6387,26 @@ def _rescue_internal_di_windows_in_linear_piece(
                 ref_seq = ''
             qry_seq = query_sequence[qpos:qpos + qry_len]
             if len(ref_seq) == ref_len and len(qry_seq) == qry_len:
-                candidate = _realign_long_di_sequences(ref_seq, qry_seq)
-                if candidate is not None:
-                    candidate_ref_span = sum(
-                        n for n, op, _payload in candidate
-                        if op in {'=', 'X', 'D'}
+                adjacent_di = all(item.op in 'ID' for item in window)
+                candidate = None
+                if adjacent_di:
+                    candidate = _realign_long_di_sequences(ref_seq, qry_seq)
+                elif _SV_REALIGNMENT_ENABLED:
+                    candidate = _tm_realign_secondary_sv_window(
+                        ref_seq, qry_seq, score=MaskedSVScorer(ref_seq, qry_seq),
                     )
-                    candidate_qry_span = sum(
-                        n for n, op, _payload in candidate
-                        if op in {'=', 'X', 'I'}
+                accept = _di_rescue_is_valid if adjacent_di else _sv_replacement_is_valid
+                if candidate is not None and accept(
+                    window, candidate, ref_seq, qry_seq,
+                    left_context=out, right_context=islice(ops, right, None),
+                ):
+                    # SV backends use M, while linear pieces and the cursors
+                    # below use sequence-resolved =/X. Store the same verified
+                    # alignment that was scored: leaving M here would not
+                    # advance rpos/qpos and would misplace every later window.
+                    rescued_ops = _tm_ops_from_cigar_on_sequences(
+                        ref_seq, qry_seq, _tm_format_pairwise_ops(candidate),
                     )
-                    if (
-                        candidate_ref_span == ref_len
-                        and candidate_qry_span == qry_len
-                    ):
-                        rescued_ops = candidate
 
         if rescued_ops is None:
             for item in window:
@@ -5779,9 +6490,12 @@ def _rescue_long_di_pairs_in_linear_piece(
     This is deliberately placed after reference projection and before large-I
     encoding.  At that point ``linear`` supplies the exact reference interval,
     while ``query_sequence`` supplies the omitted graph-CIGAR I payload.  The
-    original stage1/stage2 matching is unchanged.  Pairs with both sides at most
-    30 bp use affine global alignment; pairs with both sides at least 31 bp keep
-    the existing sequence-supported long-pair rescue.
+    original stage1/stage2 matching is unchanged. Small and asymmetric pairs
+    use affine global alignment; long pairs use sequence-supported minimap2
+    candidates. Both routes require valid
+    sequence spans and a strictly improved affine D/I score. SV-sized pairs
+    with a <31 bp side also require a strictly improved SV score; matching a
+    few junction bases alone is insufficient evidence for splitting an SV.
     """
     if ref_reader is None or query_sequence is None:
         return (piece, linear)
@@ -5832,6 +6546,7 @@ def _rescue_long_di_pairs_in_linear_piece(
         is_small_pair = max(ref_len, qry_len) <= _SMALL_DI_REALIGN_MAX_SPAN
         is_supported_long_pair = (
             min(ref_len, qry_len) >= _SHORT_DI_REALIGN_MIN_SPAN
+            or max(ref_len, qry_len) < _LONG_DI_REALIGN_THRESHOLD
         )
         if not is_small_pair and not is_supported_long_pair:
             append_and_advance(first)
@@ -5859,6 +6574,14 @@ def _rescue_long_di_pairs_in_linear_piece(
         if rescued is None:
             append_and_advance(first)
             i += 1
+            continue
+        if not _di_rescue_is_valid(
+            ops[i:k], rescued, ref_seq, qry_seq,
+            left_context=out, right_context=islice(ops, k, None),
+        ):
+            for original in ops[i:k]:
+                append_and_advance(original)
+            i = k
             continue
         for n, op, payload in rescued:
             append_and_advance(CigarOp(int(n), op, payload if op in {'I', 'X'} else ''))
@@ -5960,6 +6683,13 @@ def _linear_pieces_can_anneal(left: LinearPiece, right: LinearPiece, max_abs_gap
     if pairwise_ref_span(left.cigar) <= 0 or pairwise_ref_span(right.cigar) <= 0:
         return False
     if left.piece_size <= 0 or right.piece_size <= 0:
+        return False
+    # Near or touching intervals can still be traversed in the wrong order
+    # (for example a tandem duplication). They need separate anchors.
+    if left.strand == '+':
+        if right.genome_start < left.genome_start or right.genome_end < left.genome_end:
+            return False
+    elif right.genome_start > left.genome_start or right.genome_end > left.genome_end:
         return False
     if _interval_contains_or_same(left, right):
         return False
@@ -6251,38 +6981,33 @@ def _segment_op(seg: str) -> str:
 
 def _find_trim_side(segments: Sequence[str], strong_match_min: int=20) -> Tuple[int, int, int]:
     length = len(segments)
-    truncate_qsize = 0
-    truncate_rsize = 0
-    score = 0
+    truncate_qsize = truncate_rsize = 0
+    score = 0.0
     scorestart = 0
-    truncate_qsize_start = 0
-    truncate_rsize_start = 0
-    i = length
-    for i, seg in enumerate(segments):
-        size = _segment_size(seg)
-        op = _segment_op(seg)
+    truncate_qsize_start = truncate_rsize_start = 0
+    operations = [(_segment_size(seg), _segment_op(seg)) for seg in segments]
+    for first, end, size, op in scoring_runs(operations):
         if op == '=' and size > strong_match_min:
-            break
-        if op == '=':
-            score += size
-        else:
-            score -= 4 * size
+            return first, truncate_qsize, truncate_rsize
+        score += run_score(size, op)
         if score > 20:
-            i = scorestart
-            truncate_qsize = truncate_qsize_start
-            truncate_rsize = truncate_rsize_start
-            break
+            return scorestart, truncate_qsize_start, truncate_rsize_start
         if score >= 0:
-            scorestart = i
+            scorestart = first
             truncate_qsize_start = truncate_qsize
             truncate_rsize_start = truncate_rsize
         else:
-            scorestart = length
+            # The next positive excursion starts after this entire run.
+            # Reset its score and save matching operation/axis boundaries.
+            score = 0.0
+            scorestart = end
+            truncate_qsize_start = truncate_qsize + (size if op in {'X', '=', 'I'} else 0)
+            truncate_rsize_start = truncate_rsize + (size if op in {'D', 'X', '='} else 0)
         if op in {'X', '=', 'I'}:
             truncate_qsize += size
         if op in {'D', 'X', '='}:
             truncate_rsize += size
-    return (i, truncate_qsize, truncate_rsize)
+    return length, truncate_qsize, truncate_rsize
 
 def polish_match_piece(piece: PairwisePiece, strong_match_min: int=20) -> PairwisePiece:
     ops = parse_cigar_ops(piece.cigar)
@@ -6325,6 +7050,11 @@ def anchor_linear_piece(piece: LinearPiece, chrom_lengths: Dict[str, int]) -> Tu
     chrom_len = chrom_lengths.get(piece.chrom, 2000000000)
     if chrom_len is None:
         raise KeyError(f'missing chromosome length for {piece.chrom}')
+    if not 0 <= piece.genome_start <= piece.genome_end <= chrom_len:
+        raise ValueError(
+            f'cannot serialize {piece.chrom}:{piece.genome_start}-{piece.genome_end}: '
+            f'outside reference bounds 0-{chrom_len}'
+        )
     ref_span = pairwise_ref_span(piece.cigar)
     if ref_span == 0:
         raise ValueError('cannot anchor a zero-reference-span piece directly')
@@ -6341,14 +7071,11 @@ def anchor_linear_piece(piece: LinearPiece, chrom_lengths: Dict[str, int]) -> Tu
     return (direction, piece.chrom, left_h, piece.cigar, right_h)
 
 def main_anchor_text_from_coord(coord: Coord, chrom_lengths: Dict[str, int]) -> str:
-    """Return the dummy first segment that declares the main/backbone alignment.
+    """Declare the backbone when no retained main piece supplies its anchor.
 
-                The first graphic-CIGAR segment is the main alignment indicator.  If a
-                leading encoded insertion/reference-consuming piece appears before the first
-                real main body, we still need to emit this zero-body anchor first.  It must
-                come from the full reference backbone coordinate, not from an internal
-                LinearPiece selected by LCS/liftover.
-                """
+    With a retained main piece, serialization uses that piece's polished
+    coordinate. Encoded-only or unaligned output falls back to this coordinate.
+    """
     chrom_len = chrom_lengths.get(coord.chrom)
     if chrom_len is None:
         raise KeyError(f'missing chromosome length for {coord.chrom}')
@@ -6376,38 +7103,47 @@ def serialize_stage3_reflalign(stage3: Stage3Result, chrom_lengths: Dict[str, in
             first_ref_piece_index = anchor_piece.piece_index
         if anchor_piece.piece.kind == 'main':
             first_main_piece_index = anchor_piece.piece_index
-            if main_anchor_coord is not None:
-                first_main_anchor_text = main_anchor_text_from_coord(main_anchor_coord, chrom_lengths)
-            else:
-                direction0, chrom0, left_h0, _body0, _right_h0 = anchor_linear_piece(anchor_piece, chrom_lengths)
-                first_main_anchor_text = f'{direction0}{chrom0}:{left_h0}H'
+            # Polishing may have moved the first retained main base. A leading
+            # encoded insertion must resume that base, not the untrimmed origin.
+            direction0, chrom0, left_h0, _body0, _right_h0 = anchor_linear_piece(anchor_piece, chrom_lengths)
+            first_main_anchor_text = f'{direction0}{chrom0}:{left_h0}H'
             break
-    emit_front_main_anchor = first_ref_piece_index is not None and first_main_piece_index is not None and (first_ref_piece_index != first_main_piece_index)
-    pending_prefix = ''
+    main_direction = first_main_anchor_text[:1]
+    if first_main_piece_index is None and main_anchor_coord is not None:
+        first_main_anchor_text = main_anchor_text_from_coord(main_anchor_coord, chrom_lengths)
+        main_direction = first_main_anchor_text[:1]
+    elif first_main_piece_index is None and first_ref_piece_index is not None:
+        # Legacy callers without a backbone declare their first real path main.
+        first_main_piece_index = first_ref_piece_index
+        direction0, chrom0, left_h0, _body0, _right_h0 = anchor_linear_piece(piece_by_index[first_ref_piece_index], chrom_lengths)
+        first_main_anchor_text = f'{direction0}{chrom0}:{left_h0}H'
+        main_direction = direction0
+    standalone_insertions: Dict[int, str] = {}
     last_ref_piece_index: Optional[int] = None
     for piece in pieces:
         if pairwise_ref_span(piece.cigar) == 0:
-            if last_ref_piece_index is None:
-                pending_prefix = _concat_cigar_bodies(pending_prefix, piece.cigar)
-            else:
+            if last_ref_piece_index is not None and piece_by_index[last_ref_piece_index].piece.kind == 'main':
                 plans[last_ref_piece_index].suffix = _concat_cigar_bodies(plans[last_ref_piece_index].suffix, piece.cigar)
+            else:
+                # An unaligned query interval belongs to the main path. Putting
+                # it on an encoded neighbor silently changes its VCF parent.
+                standalone_insertions[piece.piece_index] = piece.cigar
             continue
-        if pending_prefix:
-            plans[piece.piece_index].prefix = _concat_cigar_bodies(pending_prefix, plans[piece.piece_index].prefix)
-            pending_prefix = ''
         last_ref_piece_index = piece.piece_index
-    if pending_prefix:
-        if main_anchor_coord is not None:
-            anchor = main_anchor_text_from_coord(main_anchor_coord, chrom_lengths)
-            if anchor.endswith(':0H'):
-                anchor = anchor[:-2]
-            return anchor + pending_prefix
-        return pending_prefix
+    if not first_main_anchor_text:
+        return _concat_cigar_bodies(*(piece.cigar for piece in pieces))
+    emit_front_main_anchor = (
+        first_main_piece_index is None
+        or first_ref_piece_index != first_main_piece_index
+        or any(index < first_main_piece_index for index in standalone_insertions)
+    )
     rendered: List[str] = []
     if emit_front_main_anchor:
         rendered.append(first_main_anchor_text)
     for piece in pieces:
         if pairwise_ref_span(piece.cigar) == 0:
+            if piece.piece_index in standalone_insertions:
+                rendered.append(main_direction + standalone_insertions[piece.piece_index])
             continue
         plan = plans[piece.piece_index]
         direction, chrom, left_h, _body, right_h = anchor_linear_piece(piece, chrom_lengths)
@@ -6444,13 +7180,20 @@ def serialize_stage3_reflalign(stage3: Stage3Result, chrom_lengths: Dict[str, in
                 # force a fresh anchor on the right main piece.
                 rendered.append(f'{body}{right_h_text}')
             elif plan.claimed_by_main and piece.piece.kind == 'main':
-                clip = f'{left_h}H' if left_h else ''
-                rendered.append(f'{direction}{chrom}:{clip}{body}{right_h_text}')
+                rendered.append(f'{direction}{body}{right_h_text}')
             else:
                 rendered.append(f'{body}{right_h_text}')
         else:
             rendered.append(f'{direction}{chrom}:{left_h_text}{body}{right_h_text}')
-    return ''.join(rendered)
+    if first_main_piece_index is None and main_anchor_coord is not None:
+        tail = (chrom_lengths[main_anchor_coord.chrom] - main_anchor_coord.start
+                if main_anchor_coord.strand == '+' else main_anchor_coord.end)
+        if tail:
+            rendered.append(f'{main_direction}{tail}H')
+    result = ''.join(rendered)
+    if standalone_insertions:
+        result = format_reference_cigar_segments(parse_reference_cigar_segments(result, query_name or 'serialization'))
+    return result
 
 def _fetch_output_ref_chunk(ref_reader: FastaRegionReader, segment: GraphicSegment, rpos: int, n: int) -> Tuple[str, int]:
     if n <= 0:
@@ -6561,6 +7304,9 @@ def _rescue_serialized_di_pairs(
     graph_cigar: str,
     query_sequence: Optional[str],
     ref_reader: Optional[FastaRegionReader],
+    *, stage1=None, graph_sequences=None, graph_mappings=None,
+    min_encode_query_span=50, allowchroms=None,
+    ref_backbone_coord=None, local_duplicate_pieces=None, query_coverages=None,
 ) -> str:
     """Rescue D/I pairs that become adjacent only during serialization.
 
@@ -6574,10 +7320,10 @@ def _rescue_serialized_di_pairs(
     """
     if not graph_cigar or query_sequence is None or ref_reader is None:
         return graph_cigar
-    segments = parse_graphic_segments(graph_cigar, 'serialized D/I rescue')
+    segments = parse_reference_cigar_segments(graph_cigar, 'serialized D/I rescue')
     if not segments:
         return graph_cigar
-    rebuilt: List[str] = []
+    rebuilt: List[ReferenceCigarSegment] = []
     query_offset = 0
     changed = False
     for segment in segments:
@@ -6586,11 +7332,11 @@ def _rescue_serialized_di_pairs(
         body_ref_span = pairwise_ref_span(body_cigar)
         body_query_span = pairwise_query_span(body_cigar)
         if not body_cigar or not segment.path:
-            rebuilt.append(graphic_segment_to_gcigar(segment))
+            rebuilt.append(segment)
             query_offset += body_query_span
             continue
         pairwise = PairwisePiece(
-            kind='main',
+            kind='main' if segment.is_main else 'encoded_qry',
             path=segment.path,
             ref_original_index=None,
             qry_original_index=None,
@@ -6622,74 +7368,52 @@ def _rescue_serialized_di_pairs(
             query_sequence,
             ref_reader,
         )
-        if _SV_REALIGNMENT_ENABLED:
-            try:
-                segment_ref_sequence = ref_reader.fetch(
-                    segment.path,
-                    segment.start,
-                    segment.end,
-                    '-' if segment.direction == '<' else '+',
-                )
-            except Exception:
-                segment_ref_sequence = ''
-            segment_query_sequence = query_sequence[
-                query_offset:query_offset + body_query_span
-            ]
-            serialized_ops = [
-                tok for tok in parse_cigar_ops(rescued.cigar)
-                if tok.op != 'H'
-            ]
-            # This late pass is only for insertions that were scattered across
-            # Stage-4 piece boundaries and first meet in the serialized row.
-            if (
-                sum(tok.op == 'I' for tok in serialized_ops) >= 2
-                and len(segment_ref_sequence) == body_ref_span
-                and len(segment_query_sequence) == body_query_span
-            ):
-                consolidated_ops = _tm_consolidate_sv_ops(
-                    [
-                        (
-                            tok.n,
-                            'M' if tok.op in {'=', 'M'} else tok.op,
-                            tok.payload,
-                        )
-                        for tok in serialized_ops
-                    ],
-                    segment_ref_sequence,
-                    segment_query_sequence,
-                )
-                final_ops: List[CigarOp] = []
-                for n, op, payload in consolidated_ops:
-                    emit_op = '=' if op in {'M', '='} else op
-                    if emit_op == 'X' and payload:
-                        payload = _x_payload_query(payload, n)
-                    _append_recanonicalized_op(
-                        final_ops, emit_op, n, payload,
-                    )
-                consolidated_cigar = ''.join(
-                    _op_to_cigar(tok) for tok in final_ops
-                )
-                if (
-                    pairwise_ref_span(consolidated_cigar) == body_ref_span
-                    and pairwise_query_span(consolidated_cigar)
-                    == body_query_span
-                ):
-                    rescued.cigar = consolidated_cigar
+        rescued, rescued_linear = _consolidate_linear_piece(
+            rescued, _rescued_linear, query_offset, query_sequence, ref_reader)
         if rescued.cigar != body_cigar:
             changed = True
+        if (segment.is_main and rescued.cigar != body_cigar and stage1 is not None
+                and any(tok.op == 'I' and tok.n > min_encode_query_span
+                        for tok in parse_cigar_ops(rescued.cigar))):
+            # Match Stage 4: encode newly repaired main-path insertions once,
+            # using its secondary-LCS evidence. An already encoded segment
+            # keeps internal insertions in its own CIGAR; re-encoding them
+            # would flatten away nested variant calls.
+            if local_duplicate_pieces is None:
+                local_duplicate_pieces = build_secondary_duplicate_lcs_pieces(
+                    stage1, graph_sequences or {}, ref_backbone_coord)
+            if query_coverages is None:
+                query_coverages = build_query_coverages(
+                    stage1.qry_segments, graph_sequences or {}, graph_mappings or {})
+            encoded = encode_large_insertions_in_piece(
+                rescued, query_offset, rescued_linear, query_sequence, stage1,
+                graph_sequences or {}, graph_mappings or {}, ref_reader,
+                min_encode_query_span, local_duplicate_pieces, query_coverages)
+            lengths = {name: index[0] for name, index in ref_reader.index.items()}
+            text = serialize_stage3_reflalign(
+                Stage3Result(encoded), lengths, ref_reader=ref_reader,
+                main_anchor_coord=Coord(segment.path, segment.start, segment.end,
+                                        rescued_linear.strand),
+                allowchroms=allowchroms,
+                query_sequence=query_sequence[query_offset:query_offset + body_query_span])
+            for encoded_segment in parse_reference_cigar_segments(text, 'late repair encoding'):
+                rebuilt.append(encoded_segment)
+            query_offset += body_query_span
+            continue
         rescued_ops = parse_cigar_ops(rescued.cigar)
-        rebuilt.append(_format_interval_gcigar(
+        rendered = _format_interval_gcigar(
             segment.direction,
             segment.path,
             segment.path_len,
             segment.start,
             segment.end,
             rescued_ops,
-        ))
+        ).split(':', 1)[1]
+        rebuilt.append(replace(segment, cigar=rendered, ops=parse_cigar_ops(rendered)))
         query_offset += body_query_span
     if not changed:
         return graph_cigar
-    output = ''.join(rebuilt)
+    output = format_reference_cigar_segments(rebuilt)
     if graph_cigar_query_span(output, 'serialized D/I rescue output') != len(query_sequence):
         raise ValueError(
             'serialized D/I rescue changed the complete query span'
@@ -6967,6 +7691,9 @@ def build_provisional_row(pair: PairRow, gcigars: Dict[str, str], graph_sequence
         else:
             result = build_stage1(reference_gcigar, query_gcigar, pair.ref_name, pair.query_name, reverse_ref_view=reverse_ref_view)
             stage2 = build_stage2(result, graph_sequences)
+        stage2 = _realign_tandem_stage2(
+            result, stage2, ref_backbone, query_sequence, ref_reader,
+        )
         if stage2 is None:
             stage4 = Stage3Result([])
         else:
@@ -6974,7 +7701,10 @@ def build_provisional_row(pair: PairRow, gcigars: Dict[str, str], graph_sequence
             stage4 = build_stage4_linear(result, stage3, graph_sequences, graph_path_coords, chrom_lengths, graph_mappings, ref_reader, ref_backbone_coord=ref_backbone, record_sequences=record_sequences, query_name=pair.query_name)
         stage4 = _canonicalize_stage3_against_sequences(pair, stage4, record_sequences, ref_reader)
         cigar = serialize_stage3_reflalign(stage4, chrom_lengths, ref_reader=ref_reader, main_anchor_coord=ref_backbone, allowchroms=allowchroms, query_sequence=query_sequence, query_name=pair.query_name or pair.label)
-        cigar = _rescue_serialized_di_pairs(cigar, query_sequence, ref_reader)
+        cigar = _rescue_serialized_di_pairs(
+            cigar, query_sequence, ref_reader, stage1=result,
+            graph_sequences=graph_sequences, graph_mappings=graph_mappings,
+            allowchroms=allowchroms, ref_backbone_coord=ref_backbone)
     qcoord_rec = coord_by_name.get(pair.query_name)
     rcoord_rec = coord_by_name.get(pair.ref_name)
     qcoord = f'{qcoord_rec.chrom}:{qcoord_rec.start}-{qcoord_rec.end}{qcoord_rec.strand}' if qcoord_rec is not None else pair.query_coord_text

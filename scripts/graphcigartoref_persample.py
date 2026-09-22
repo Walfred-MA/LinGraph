@@ -519,7 +519,10 @@ def graph_cigar_query_span(graph_cigar: str) -> int:
 
 def slice_graph_cigar_by_query(
     graph_cigar: str, qstart: int, qend: int,
+    *, reference_alignment: bool = False,
 ) -> str:
+    if reference_alignment:
+        return core.slice_reference_cigar_by_query(graph_cigar, qstart, qend)
     qstart = int(qstart)
     qend = int(qend)
     if qstart < 0 or qend <= qstart:
@@ -645,15 +648,9 @@ def alignment_row_locus_support(row, locus: core.Coord) -> Tuple[int, int]:
     return aligned, match_like
 
 
-def alignment_row_locus_score(row, locus: core.Coord) -> int:
-    """Score one row over LOCUS using the downstream alignment policy."""
-    score = 0
-    for operation in _alignment_row_locus_operations(row, locus):
-        if operation.op in {"=", "M"}:
-            score += operation.n
-        elif operation.op in {"X", "I", "D"}:
-            score -= operation.n + core.EDGE_ALIGNMENT_GAP_PENALTY
-    return score
+def alignment_row_locus_score(row, locus: core.Coord) -> float:
+    """Score one row over LOCUS using the standard alignment policy."""
+    return core.alignment_score(_alignment_row_locus_operations(row, locus))
 
 
 def locate_alignment_row(
@@ -3010,7 +3007,7 @@ def truncate_grouped_provisional_row(row_text: str, pair: core.PairRow) -> str:
         raise ValueError(
             f"grouped pair {pair.line_no} produced fewer than seven columns"
         )
-    fields[6] = slice_graph_cigar_by_query(fields[6], qstart, qend)
+    fields[6] = slice_graph_cigar_by_query(fields[6], qstart, qend, reference_alignment=True)
     observed = graph_cigar_query_span(fields[6])
     expected = part_coord.end - part_coord.start
     if observed != expected:
@@ -3185,7 +3182,7 @@ def trim_query_edges_by_alignment_score(
         )
     else:
         # Keep the existing query-clipping/extension path unchanged.
-        trimmed_cigar = core.slice_graph_cigar_by_query(
+        trimmed_cigar = core.slice_reference_cigar_by_query(
             graph_cigar, qstart, qend, "alignment-score edge trim",
             include_left_boundary_deletions=False,
         )
@@ -3325,7 +3322,7 @@ def _reference_flank_gcigar(
 def _reference_alignment_regions_from_gcigar(graph_cigar: str) -> str:
     """Return compact genomic regions actually present in a reference CIGAR."""
     by_key: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
-    for segment in core.parse_graphic_segments(
+    for segment in core.parse_reference_cigar_segments(
         graph_cigar, "rescued reference alignment regions",
     ):
         if segment.end <= segment.start:
@@ -3350,16 +3347,7 @@ def _reference_alignment_regions_from_gcigar(graph_cigar: str) -> str:
 
 def _trimmed_reference_regions(graph_cigar: str) -> str:
     """Account for main continuations in a coordinate-only view of the CIGAR."""
-    main, alternatives = [], []
-    for index, match in enumerate(re.finditer(r"([<>])([^<>]*)", graph_cigar)):
-        direction, value = match.groups()
-        if index == 0:
-            main.append(direction + value)
-        elif ":" not in value:
-            main.append(value)
-        else:
-            alternatives.append(direction + value)
-    return _reference_alignment_regions_from_gcigar("".join(main + alternatives))
+    return _reference_alignment_regions_from_gcigar(graph_cigar)
 
 
 def rescue_score_clipped_query_edges(
@@ -3395,7 +3383,7 @@ def rescue_score_clipped_query_edges(
         or maximum_reference_extension <= 0
     ):
         return initial, trimmed_regions
-    segments = core.parse_graphic_segments(cigar, "score-clipped core")
+    segments = core.parse_reference_cigar_segments(cigar, "score-clipped core")
     if not segments:
         return initial, trimmed_regions
     upstream = _reference_flank_gcigar(
@@ -3410,7 +3398,15 @@ def rescue_score_clipped_query_edges(
     ) if qend < total else ""
     if not upstream and not downstream:
         return initial, trimmed_regions
-    combined = upstream + cigar + downstream
+    def flank_segments(text, boundary):
+        return [dataclasses.replace(
+            piece, is_main=boundary.is_main, main_anchor=boundary.main_anchor,
+        ) for piece in core.parse_reference_cigar_segments(text, "rescued flank")]
+
+    combined = core.format_reference_cigar_segments(
+        flank_segments(upstream, segments[0]) + segments
+        + flank_segments(downstream, segments[-1])
+    )
     if graph_cigar_query_span(combined) != total:
         # Raw-reference flank rescue is optional evidence layered on top of
         # an already score-validated graph alignment.  A rare payload or
@@ -3459,7 +3455,7 @@ def format_provisional_row(
         slice_start, slice_end = getattr(
             pair, "output_slice", (0, graph_cigar_query_span(fields[6])),
         )
-        cigar = slice_graph_cigar_by_query(fields[6], slice_start, slice_end)
+        cigar = slice_graph_cigar_by_query(fields[6], slice_start, slice_end, reference_alignment=True)
         output_coord = getattr(pair, "output_query_coord", None)
         if output_coord is None:
             raise ValueError(f"pair {pair.line_no}: missing output query coordinate")
@@ -4497,7 +4493,7 @@ def _write_parallel(
             tuple(sorted(allowchroms)),
             args.reference,
             getattr(args, "local_reference_templates", ""),
-            bool(getattr(args, "realignment", False)),
+            bool(getattr(args, "realignment", True)),
         )
         writer = _CompletedRowBuffer(output, buffer_size, buffer_bytes)
         completed = 0
@@ -4822,7 +4818,7 @@ def run(args: argparse.Namespace) -> int:
     ) if alternative_path else None
     if alternative_policy and args.unreplace and args.output and os.path.exists(args.output):
         raise ValueError('--alternative requires a fresh output; omit --unreplace to avoid retaining rows from an older interval policy')
-    core.set_sv_realignment_enabled(bool(getattr(args, "realignment", False)))
+    core.set_sv_realignment_enabled(bool(getattr(args, "realignment", True)))
     if args.processes < 1:
         raise ValueError("--processes must be >= 1")
     if args.chunksize < 0:

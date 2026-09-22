@@ -170,7 +170,7 @@ class OwnershipCandidate:
     allele: str
     # 2: mapped valid PA; 1: mapped resurrected PA; 0: unmapped sequence.
     tier: int
-    score: int
+    score: float
     line_number: int
     non_primary: bool = False
 
@@ -722,7 +722,7 @@ def _segment_query_endpoints(
 ) -> Tuple[Tuple[str, int, str], Tuple[str, int, str]]:
     first: Optional[Tuple[str, int, str]] = None
     last: Optional[Tuple[str, int, str]] = None
-    for segment in core.parse_graphic_segments(graph_cigar, row_name):
+    for segment in core.parse_reference_cigar_segments(graph_cigar, row_name):
         rpos = segment.start if segment.direction == ">" else segment.end
         for operation in segment.ops:
             if operation.op == "H":
@@ -776,7 +776,7 @@ def project_reference_position_to_query(
     wanted_path = core.path_key(reference_path)
     query_position = 0
     candidates: List[int] = []
-    for segment in core.parse_graphic_segments(
+    for segment in core.parse_reference_cigar_segments(
         annotation.graph_cigar, annotation.query_name,
     ):
         rpos = segment.start if segment.direction == ">" else segment.end
@@ -876,7 +876,7 @@ def annotation_targets_non_primary(
         ) is None
     paths = [
         segment.path
-        for segment in core.parse_graphic_segments(
+        for segment in core.parse_reference_cigar_segments(
             annotation.graph_cigar, annotation.query_name,
         )
         if segment.end > segment.start
@@ -889,16 +889,16 @@ def annotation_targets_non_primary(
 
 def ownership_priority_score(
     annotation: AnnotationRow,
-    score: int,
+    score: float,
     primary_reference_index: Optional[
         Mapping[str, Tuple[int, int, int, int]]
     ],
-) -> int:
+) -> float:
     """Apply the half-priority rule to alternative/novel alignments."""
     if annotation_targets_non_primary(
         annotation, primary_reference_index,
     ):
-        return score // 2
+        return score / 2.0
     return score
 
 
@@ -1235,7 +1235,7 @@ def _query_window(
 
 
 def _reference_coord_from_cigar(graph_cigar: str, row_name: str) -> core.Coord:
-    segments = core.parse_graphic_segments(graph_cigar, row_name)
+    segments = core.parse_reference_cigar_segments(graph_cigar, row_name)
     if not segments:
         raise ValueError(f"{row_name}: empty gap graph CIGAR")
     paths = {segment.path for segment in segments}
@@ -1250,14 +1250,18 @@ def _reference_coord_from_cigar(graph_cigar: str, row_name: str) -> core.Coord:
 
 def _primary_reference_coord(graph_cigar: str, row_name: str) -> core.Coord:
     """Return the main (first named) reference interval in one graph CIGAR."""
-    segments = core.parse_graphic_segments(graph_cigar, row_name)
+    segments = core.parse_reference_cigar_segments(graph_cigar, row_name)
     if not segments:
         raise ValueError(f"{row_name}: empty graph CIGAR")
-    segment = segments[0]
+    main = [segment for segment in segments if segment.is_main]
+    if not main:
+        direction, path, _length, cursor = segments[0].main_anchor
+        return core.Coord(path, cursor, cursor, "+" if direction == ">" else "-")
+    segment = main[0]
     return core.Coord(
         segment.path,
-        min(segment.start, segment.end),
-        max(segment.start, segment.end),
+        min(s.start for s in main),
+        max(s.end for s in main),
         "+" if segment.direction == ">" else "-",
     )
 
@@ -1265,7 +1269,7 @@ def _primary_reference_coord(graph_cigar: str, row_name: str) -> core.Coord:
 def _reference_alignment_text(graph_cigar: str, row_name: str) -> str:
     """Summarize all reference intervals represented by a graph CIGAR."""
     grouped: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
-    for segment in core.parse_graphic_segments(graph_cigar, row_name):
+    for segment in core.parse_reference_cigar_segments(graph_cigar, row_name):
         if segment.end <= segment.start:
             continue
         strand = "+" if segment.direction == ">" else "-"
@@ -1284,7 +1288,7 @@ def _reference_alignment_text(graph_cigar: str, row_name: str) -> str:
                 output.append(f"{path}:{start}-{end}{strand}")
                 start, end = next_start, next_end
         output.append(f"{path}:{start}-{end}{strand}")
-    return ";".join(output)
+    return ";".join(output) or "."
 
 
 def _refresh_annotation(
@@ -1332,7 +1336,7 @@ def slice_annotation_query_interval(
     qstart, qend = _query_axis_slice(
         row.query_coord, physical_start, physical_end,
     )
-    graph_cigar = core.slice_graph_cigar_by_query(
+    graph_cigar = core.slice_reference_cigar_by_query(
         row.graph_cigar,
         qstart,
         qend,
@@ -1465,7 +1469,7 @@ def convert_reference_overlap_to_query_insertion(
         )
 
     qstart, qend = _query_axis_slice(row.query_coord, kept_start, kept_end)
-    retained = core.slice_graph_cigar_by_query(
+    retained = core.slice_reference_cigar_by_query(
         row.graph_cigar,
         qstart,
         qend,
@@ -1557,7 +1561,7 @@ def select_effective_annotations_for_gap_analysis(
     retained: List[AnnotationRow] = []
     infinite_rows: Dict[str, AnnotationRow] = {}
     candidates_by_sample_contig: Dict[
-        Tuple[str, str], List[Tuple[int, int, int, str, int]]
+        Tuple[str, str], List[Tuple[int, int, float, str, int]]
     ] = {}
     stats = {
         "finite_or_legacy_rows": 0,
@@ -1716,7 +1720,7 @@ def annotation_mapped_query_intervals(
     """Return assembly intervals paired to a graph base by =/M/X."""
     local_position = 0
     physical_intervals: List[Tuple[int, int]] = []
-    for segment in core.parse_graphic_segments(
+    for segment in core.parse_reference_cigar_segments(
         annotation.graph_cigar, annotation.query_name,
     ):
         for operation in segment.ops:
@@ -1811,14 +1815,14 @@ def _uncovered_pieces(
     return output
 
 
-def _score_annotation_cigar(item: Tuple[int, str]) -> Tuple[int, int]:
+def _score_annotation_cigar(item: Tuple[int, str]) -> Tuple[int, float]:
     key, graph_cigar = item
     return key, infinite_fallback_alignment_score(graph_cigar)
 
 
 def _score_annotations_parallel(
     rows: Sequence[AnnotationRow], processes: int,
-) -> Dict[int, int]:
+) -> Dict[int, float]:
     """Score surviving resurrection rows, in parallel when worthwhile."""
     items = [(id(row), row.graph_cigar) for row in rows]
     worker_count = min(max(1, processes), len(items))
@@ -1982,8 +1986,8 @@ def determine_final_pa_ownership(
     """
     lift_by_allele = {row.allele: row for row in lift_rows}
     candidates_by_contig: Dict[str, List[OwnershipCandidate]] = {}
-    mapped_rows_by_allele: Dict[str, int] = {}
-    resurrectable_rows_by_allele: Dict[str, int] = {}
+    mapped_rows_by_allele: Dict[str, float] = {}
+    resurrectable_rows_by_allele: Dict[str, float] = {}
 
     # Lowest-priority ownership covers wholly unmapped PAs and the clipped or
     # insertion-only portion of partially mapped PAs.
@@ -2574,7 +2578,7 @@ def reference_coverage_by_contig(
     """Return merged reference bases represented anywhere in the query."""
     coverage: Dict[str, List[Tuple[int, int]]] = {}
     for row in annotations:
-        for segment in core.parse_graphic_segments(
+        for segment in core.parse_reference_cigar_segments(
             row.graph_cigar, row.query_name,
         ):
             path = _resolve_reference_path(segment.path, reference_index)
@@ -2844,7 +2848,7 @@ def build_gap_row(
         operations,
     )
     gap_size = task.end - task.start
-    graph_cigar = core.slice_graph_cigar_by_query(
+    graph_cigar = core.slice_reference_cigar_by_query(
         complete_cigar,
         left_anchor,
         left_anchor + gap_size,
