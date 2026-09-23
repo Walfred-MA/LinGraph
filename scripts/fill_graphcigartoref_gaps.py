@@ -314,7 +314,11 @@ def _clusters(
     end = ordered[0].query_coord.end
     members = [ordered[0]]
     for row in ordered[1:]:
-        if row.query_coord.start <= end:
+        # Exact adjacency is a real ownership boundary.  In particular, two
+        # adjacent owned query intervals can project to overlapping reference
+        # intervals, which is the evidence for a tandem duplication.  Folding
+        # touching intervals into one cluster hides that boundary entirely.
+        if row.query_coord.start < end:
             end = max(end, row.query_coord.end)
             members.append(row)
             continue
@@ -968,24 +972,25 @@ def discover_gap_tasks(
         ):
             _left_start, gap_start, left_members = left_cluster
             gap_end, _right_end, right_members = right_cluster
-            if gap_end <= gap_start:
+            if gap_end < gap_start:
                 continue
             stats["internal_gaps"] += 1
             gap_size = gap_end - gap_start
-            sequence = query_reader.fetch(contig, gap_start, gap_end, "+")
-            unmasked = count_unmasked(sequence)
-            if not gap_is_eligible(
-                gap_size,
-                unmasked,
-                maximum_gap,
-                minimum_unmasked,
-                minimum_fraction,
-                # The masking exception is fixed at <100 bp.  Changing the
-                # alignment-anchor length must not change gap eligibility.
-                DEFAULT_ANCHOR,
-            ):
-                stats["masked_or_large"] += 1
-                continue
+            if gap_size:
+                sequence = query_reader.fetch(contig, gap_start, gap_end, "+")
+                unmasked = count_unmasked(sequence)
+                if not gap_is_eligible(
+                    gap_size,
+                    unmasked,
+                    maximum_gap,
+                    minimum_unmasked,
+                    minimum_fraction,
+                    # The masking exception is fixed at <100 bp.  Changing the
+                    # alignment-anchor length must not change gap eligibility.
+                    DEFAULT_ANCHOR,
+                ):
+                    stats["masked_or_large"] += 1
+                    continue
             left_edge_rows = tuple(
                 row for row in left_members
                 if row.query_coord.end == gap_start
@@ -1064,7 +1069,7 @@ def discover_gap_tasks(
                     if selected_boundary.strand == "+"
                     else left_boundary.position - right_boundary.position
                 )
-                if reference_gap_size == 0:
+                if reference_gap_size == 0 and gap_size > 0:
                     # The query interval is absent from both neighboring rows
                     # but the two reference breakpoints touch. Preserve it as
                     # a pure insertion instead of silently dropping the gap.
@@ -1106,6 +1111,37 @@ def discover_gap_tasks(
                         continue
                     mode = "tandem-duplication"
                     stats["tandem_duplication"] += 1
+
+            # A zero-width query boundary has no sequence to align.  It is
+            # nevertheless informative when the two owned rows project to an
+            # overlapping reference interval: the lower-priority row's query
+            # prefix/suffix is a tandem copy.  Other zero-width boundaries do
+            # not need a query-gap task (ordinary reference deletions are
+            # handled by discover_reference_gap_deletions()).
+            if gap_size == 0 and mode != "tandem-duplication":
+                continue
+
+            if mode == "tandem-duplication":
+                if insertion_start is None or insertion_end is None:
+                    stats["unprojectable_tandem"] += 1
+                    continue
+                insertion_size = insertion_end - insertion_start
+                if insertion_size <= 0:
+                    stats["unprojectable_tandem"] += 1
+                    continue
+                insertion_sequence = query_reader.fetch(
+                    contig, insertion_start, insertion_end, "+",
+                )
+                if not gap_is_eligible(
+                    insertion_size,
+                    count_unmasked(insertion_sequence),
+                    maximum_gap,
+                    minimum_unmasked,
+                    minimum_fraction,
+                    DEFAULT_ANCHOR,
+                ):
+                    stats["masked_or_large"] += 1
+                    continue
 
             # A bounded alignment must include the *complete* interval between
             # the two reference breakpoints.  The former 1-kb cap sent every
@@ -2396,17 +2432,20 @@ def select_annotations_for_final_ownership(
     lift_by_allele: Mapping[str, object],
     max_impute: int = DEFAULT_MAX_IMPUTE,
 ) -> Tuple[List[AnnotationRow], Dict[str, int]]:
-    """Filter the analysis view to rows with at least one surviving owner.
+    """Slice the analysis view to the finalized PA-owned query intervals.
 
-    Ownership was already finalized and swapped into the GenomeLift overlay.
-    The graph-CIGAR rows were generated per block independently of ownership
-    in graphcigartoref_persample.py, so the analysis view keeps every
-    surviving row byte-identical: no interval clipping, no per-PA expansion,
-    and no CIGAR work.  A row is excluded only when every matching PA lost
-    ownership (pure ``-inf`` after finalization); rows with no matching
-    GenomeLift name are kept for backward compatibility.
+    The seven-column output remains additive and its original rows are still
+    copied byte-for-byte.  Gap discovery, however, must use the ownership
+    intervals written to ``genomeliftfix.tsv``.  Keeping every source row at
+    full length leaves independently aligned neighboring blocks overlapping
+    on the query and hides both their owned boundary and any reference
+    overlap at that boundary.
+
+    A merged annotation can name several PAs.  Each distinct finalized owner
+    receives its own CIGAR slice and only those owner names are retained on
+    that analysis row, so priority lookup uses the block that actually owns
+    the slice.  Legacy rows with no matching GenomeLift name stay unchanged.
     """
-    del max_impute
     retained: List[AnnotationRow] = []
     stats = {
         "input_rows": len(annotations),
@@ -2418,7 +2457,7 @@ def select_annotations_for_final_ownership(
     }
     for annotation in annotations:
         matched = [
-            lift_by_allele[allele]
+            (allele, lift_by_allele[allele])
             for allele in query_name_parts(annotation.query_name)
             if (
                 allele in lift_by_allele
@@ -2429,13 +2468,56 @@ def select_annotations_for_final_ownership(
         if matched:
             stats["logical_pa_rows"] += len(matched)
             owned = [
-                lift for lift in matched
+                (allele, lift) for allele, lift in matched
                 if not _lift_has_infinite_ownership(lift)
             ]
             stats["excluded_pa_rows"] += len(matched) - len(owned)
             if not owned:
                 stats["excluded_rows"] += 1
                 continue
+
+            owners_by_interval: Dict[Tuple[int, int], List[str]] = {}
+            for allele, lift in owned:
+                owned_start, owned_end = apply_interval_extensions_to_coord(
+                    lift.locus.start,
+                    lift.locus.end,
+                    lift.locus.strand,
+                    lift.left_extension,
+                    lift.right_extension,
+                    max_impute,
+                )
+                start = max(annotation.query_coord.start, owned_start)
+                end = min(annotation.query_coord.end, owned_end)
+                if end <= start:
+                    stats["excluded_pa_rows"] += 1
+                    continue
+                owners_by_interval.setdefault((start, end), []).append(allele)
+
+            if not owners_by_interval:
+                stats["excluded_rows"] += 1
+                continue
+
+            ordered_intervals = sorted(owners_by_interval)
+            for previous, current in zip(
+                ordered_intervals, ordered_intervals[1:],
+            ):
+                if previous[1] > current[0]:
+                    raise ValueError(
+                        f"{annotation.query_name}: finalized ownership "
+                        f"intervals overlap: {previous} and {current}"
+                    )
+
+            slices = slice_annotation_query_intervals(
+                annotation, ordered_intervals,
+            )
+            for interval in ordered_intervals:
+                owners = tuple(sorted(set(owners_by_interval[interval])))
+                row = dataclasses.replace(
+                    slices[interval], query_name=";".join(owners),
+                )
+                retained.append(row)
+                stats["retained_bases"] += interval[1] - interval[0]
+            continue
         else:
             stats["legacy_rows"] += 1
         retained.append(annotation)

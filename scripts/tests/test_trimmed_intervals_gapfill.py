@@ -79,6 +79,64 @@ def test_removed_query_i_creates_gap_that_is_discovered_and_aligned(strand):
     assert remaining == []
 
 
+def test_final_ownership_boundary_exposes_tandem_duplication():
+    # The independently projected rows overlap on the query. Final ownership
+    # makes them adjacent, while their reference slices still overlap by 50
+    # bases. That overlap is a tandem copy contributed by the right row.
+    left = gaps.annotation_from_tsv('\t'.join((
+        'q1', 'ref', 'ctg:0-120+', 'chr:100-220+',
+        'ctg:0-120+', 'chr:100-220+', '>chr:100H120=780H',
+    )), 1)
+    right = gaps.annotation_from_tsv('\t'.join((
+        'q2', 'ref', 'ctg:80-250+', 'chr:130-300+',
+        'ctg:80-250+', 'chr:130-300+', '>chr:130H170=700H',
+    )), 2)
+    lifts = {
+        'q1': SimpleNamespace(
+            locus=core.Coord('ctg', 0, 100, '+'),
+            left_extension='0', right_extension='q2:+0',
+        ),
+        'q2': SimpleNamespace(
+            locus=core.Coord('ctg', 100, 250, '+'),
+            left_extension='q1:-0', right_extension='0',
+        ),
+    }
+
+    owned, ownership_stats = gaps.select_annotations_for_final_ownership(
+        [left, right], lifts,
+    )
+    assert [row.query_name for row in owned] == ['q1', 'q2']
+    assert [row.query_coord for row in owned] == [
+        core.Coord('ctg', 0, 100, '+'),
+        core.Coord('ctg', 100, 250, '+'),
+    ]
+    assert [row.reference_coord for row in owned] == [
+        core.Coord('chr', 100, 200, '+'),
+        core.Coord('chr', 150, 300, '+'),
+    ]
+    assert ownership_stats['retained_bases'] == 250
+
+    query = Reader('ctg', 'A' * 250)
+    reference = Reader('chr', 'A' * 1000)
+    tasks, stats = gaps.discover_gap_tasks(
+        owned, lifts, query, reference.index, 'sample',
+    )
+    task, = tasks
+    assert task.mode == 'tandem-duplication'
+    assert (task.start, task.end) == (100, 100)
+    assert task.reference_gap_size == -50
+    assert (task.insertion_start, task.insertion_end) == (100, 150)
+    assert task.selected_side == 'left'
+    assert stats['tandem_duplication'] == 1
+
+    added = gaps.annotation_from_tsv(
+        gaps.build_gap_row(task, query, reference), 3,
+    )
+    assert added.query_coord == core.Coord('ctg', 100, 150, '+')
+    assert added.reference_coord == core.Coord('chr', 200, 200, '+')
+    assert added.graph_cigar == '>chr:200H50IAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA800H'
+
+
 @pytest.mark.parametrize('strand', ['+', '-'])
 def test_trimmed_d_exposes_reference_gap_at_exact_query_breakpoint(strand):
     left = '>chr:100H200=5D695H' if strand == '+' else '<chr:695H5D200=100H'
