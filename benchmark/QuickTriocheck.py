@@ -54,13 +54,25 @@ Default matching:
 
 - child-carried alleles are excluded if either parent lacks reference coverage at the child reference anchor
 
-- separate-haplotype mode trims 10000 bp from both ends of every ##referenceCoverage
+- separate-haplotype mode trims child calls within 10000 bp of either end of
 
-  interval by default before benchmarking. --trim-edges [BP] / --edge-trim [BP]
+  the child assembly query contig *and* the corresponding raw referenceCoverage
 
-  overrides the trim; --trim-edges 0 disables it. Child/parent calls in those edge
+  intervals by default. Query-contig lengths come from the FASTA indexes in
 
-  flanks are excluded, and parental missingness uses the same trimmed coverage.
+  ``--query-paths``; reference-side boundaries come from ``##referenceCoverage``.
+
+  ``--trim-edges [BP]`` overrides both trims; ``--trim-edges 0`` disables them.
+
+- child-only PA-edge QC reconstructs every PA from QUERYCOORD + LABEL_H and
+
+  excludes a child record when any PA is <1000 bp from either contig edge by
+
+  default. ``--pa-edge-distance 0`` disables it. Parents and parental
+
+  referenceCoverage is affected only by ``--trim-edges``; PA-edge filtering remains
+
+  child-query-side only.
 
 """
 
@@ -73,6 +85,8 @@ import gzip
 import os
 
 import re
+
+import shlex
 
 import sys
 
@@ -91,7 +105,9 @@ DEFAULT_MIN_SIZE = 50
 
 SIZE_RATIO_MIN = 0.7
 
-SCRIPT_VERSION = "decomposed-format-v6.2-haplotype-summaries-2026-09-18"
+DEFAULT_PA_EDGE_DISTANCE = 1000
+
+SCRIPT_VERSION = "decomposed-format-v6.6-reference-edge-and-mixed-sv-components-2026-09-26"
 
 
 @dataclass(frozen=True)
@@ -105,6 +121,19 @@ class OriginalLocus:
     start: int
 
     end: int
+
+
+@dataclass(frozen=True)
+
+class QueryLocus:
+
+    contig: str
+
+    start: int
+
+    end: int
+
+    strand: str
 
 
 @dataclass(frozen=True)
@@ -137,6 +166,25 @@ class VariantRecord:
 
     original_loci: Tuple[OriginalLocus, ...] = ()
 
+    query_loci: Tuple[QueryLocus, ...] = ()
+
+    pa_loci: Tuple[QueryLocus, ...] = ()
+
+
+@dataclass(frozen=True)
+
+class SVComponent:
+
+    svtype: str
+
+    size: int
+
+    original_loci: Tuple[OriginalLocus, ...] = ()
+
+    query_loci: Tuple[QueryLocus, ...] = ()
+
+    pa_loci: Tuple[QueryLocus, ...] = ()
+
 
 INFO_RE = re.compile(r"([^=;]+)(?:=([^;]*))?")
 
@@ -153,6 +201,7 @@ REFERENCE_COVERAGE_RE = re.compile(
 )
 
 
+
 def merge_reference_coverage_intervals(
 
     intervals_by_chrom: Dict[str, List[Tuple[int, int]]],
@@ -164,9 +213,13 @@ def merge_reference_coverage_intervals(
     """Trim, then merge 0-based half-open referenceCoverage intervals.
 
     ``edge_trim`` bp are removed independently from both ends of every raw
+
     coverage interval *before* merging.  Trimming before merging is important:
+
     it preserves an unbenchmarkable flank at each alignment/coverage boundary
+
     instead of accidentally erasing internal contig/alignment edges.
+
     """
 
     trim = max(0, int(edge_trim))
@@ -256,38 +309,79 @@ def child_reference_anchors0(rec: VariantRecord) -> List[int]:
     return [max(0, int(rec.pos) - 1)]
 
 
-def filter_records_to_source_coverage(
+def filter_child_records_to_query_core(
 
     records: Sequence[VariantRecord],
 
-    coverage_by_source: Dict[str, Dict[str, List[Tuple[int, int]]]],
+    query_bounds_by_source: Dict[str, Dict[str, Tuple[int, int]]],
 
-) -> Tuple[List[VariantRecord], int]:
+    edge_trim: int,
 
-    """Keep records whose reference anchor is inside their source coverage.
+    stats_by_source: Optional[Dict[str, Dict[str, int]]] = None,
 
-    This is used by --trim-edges after each source VCF's ##referenceCoverage
-    intervals have already been shrunken.  Thus a call within the requested
-    flank of a query/alignment coverage edge is removed from benchmarking.
+) -> Tuple[List[VariantRecord], int, int]:
+
+    """Remove child calls within ``edge_trim`` bp of query-contig ends.
+
+    Trimming uses assembly query coordinates. Reference coverage remains an
+
+    independent, untrimmed parental callability test at the child reference
+
+    anchor.
+
     """
+
+    trim = max(0, int(edge_trim))
+
+    if trim == 0:
+
+        return list(records), 0, 0
 
     kept: List[VariantRecord] = []
 
     excluded = 0
 
+    missing = 0
+
     for rec in records:
 
-        coverage = coverage_by_source.get(rec.source, {})
+        bounds = query_bounds_by_source.get(rec.source, {})
 
-        anchors0 = child_reference_anchors0(rec)
+        if not rec.query_loci or any(
 
-        if anchors0 and all(
-
-            reference_coverage_contains(coverage, rec.chrom, anchor0)
-
-            for anchor0 in anchors0
+            locus.contig not in bounds for locus in rec.query_loci
 
         ):
+
+            missing += 1
+
+            if stats_by_source is not None:
+
+                source_stats = stats_by_source.setdefault(rec.source, {})
+
+                source_stats['records_excluded_missing_query_coordinates'] = (
+
+                    source_stats.get(
+
+                        'records_excluded_missing_query_coordinates', 0
+
+                    ) + 1
+
+                )
+
+            continue
+
+        inside = all(
+
+            locus.start >= bounds[locus.contig][0] + trim
+
+            and locus.end <= bounds[locus.contig][1] - trim
+
+            for locus in rec.query_loci
+
+        )
+
+        if inside:
 
             kept.append(rec)
 
@@ -295,7 +389,212 @@ def filter_records_to_source_coverage(
 
             excluded += 1
 
-    return kept, excluded
+            if stats_by_source is not None:
+
+                source_stats = stats_by_source.setdefault(rec.source, {})
+
+                source_stats['records_excluded_edge_trim'] = (
+
+                    source_stats.get('records_excluded_edge_trim', 0) + 1
+
+                )
+
+    return kept, excluded, missing
+
+
+def filter_child_records_to_reference_core(
+
+    records: Sequence[VariantRecord],
+
+    coverage_by_source: Dict[str, Dict[str, List[Tuple[int, int]]]],
+
+    stats_by_source: Optional[Dict[str, Dict[str, int]]] = None,
+
+) -> Tuple[List[VariantRecord], int, int]:
+
+    """Keep child calls whose reference anchor remains in trimmed referenceCoverage.
+
+    ``coverage_by_source`` is expected to have already been trimmed by
+    ``merge_reference_coverage_intervals(..., edge_trim=--trim-edges)``.
+    This makes --trim-edges symmetric: child QUERYCOORD is checked against the
+    assembly-contig core and the child reference anchor is checked against the
+    reference-side alignment/coverage core.
+    """
+
+    kept: List[VariantRecord] = []
+
+    excluded = 0
+
+    missing = 0
+
+    for rec in records:
+
+        source_cov = coverage_by_source.get(rec.source, {})
+
+        chrom_cov = source_cov.get(rec.chrom, [])
+
+        if not chrom_cov:
+
+            missing += 1
+
+            if stats_by_source is not None:
+
+                source_stats = stats_by_source.setdefault(rec.source, {})
+
+                source_stats['records_excluded_missing_reference_coverage'] = (
+
+                    source_stats.get('records_excluded_missing_reference_coverage', 0) + 1
+
+                )
+
+            continue
+
+        anchors0 = child_reference_anchors0(rec)
+
+        inside = bool(anchors0) and all(
+
+            reference_coverage_contains(source_cov, rec.chrom, anchor0)
+
+            for anchor0 in anchors0
+
+        )
+
+        if inside:
+
+            kept.append(rec)
+
+            continue
+
+        excluded += 1
+
+        if stats_by_source is not None:
+
+            source_stats = stats_by_source.setdefault(rec.source, {})
+
+            source_stats['records_excluded_reference_edge_trim'] = (
+
+                source_stats.get('records_excluded_reference_edge_trim', 0) + 1
+
+            )
+
+            source_stats['records_excluded_edge_trim'] = (
+
+                source_stats.get('records_excluded_edge_trim', 0) + 1
+
+            )
+
+    return kept, excluded, missing
+
+
+def filter_child_records_by_pa_edge(
+
+    records: Sequence[VariantRecord],
+
+    query_bounds_by_source: Dict[str, Dict[str, Tuple[int, int]]],
+
+    edge_distance: int,
+
+    stats_by_source: Optional[Dict[str, Dict[str, int]]] = None,
+
+) -> Tuple[List[VariantRecord], int, int]:
+
+    """Exclude CHILD calls when any associated PA approaches a contig edge.
+
+    PA intervals are reconstructed from child QUERYCOORD + LABEL_H.  For a
+
+    ``+`` query interval, ``leftH_rightH`` gives
+
+        PA = [QUERYCOORD.start - leftH, QUERYCOORD.end + rightH]
+
+    and for ``-`` the H sides are swapped:
+
+        PA = [QUERYCOORD.start - rightH, QUERYCOORD.end + leftH].
+
+    A record is excluded when *any* reconstructed child PA has strictly less
+
+    than ``edge_distance`` bp between either PA boundary and the corresponding
+
+    child assembly contig edge.  Parents are never passed to this function.
+
+    Records without usable PA metadata are retained, but counted separately.
+
+    """
+
+    distance = max(0, int(edge_distance))
+
+    if distance == 0:
+
+        return list(records), 0, 0
+
+    kept: List[VariantRecord] = []
+
+    excluded = 0
+
+    missing = 0
+
+    for rec in records:
+
+        bounds = query_bounds_by_source.get(rec.source, {})
+
+        usable = [
+
+            locus for locus in rec.pa_loci
+
+            if locus.contig in bounds
+
+        ]
+
+        if not usable or len(usable) != len(rec.pa_loci):
+
+            missing += 1
+
+            if stats_by_source is not None:
+
+                source_stats = stats_by_source.setdefault(rec.source, {})
+
+                source_stats['records_missing_pa_coordinates'] = (
+
+                    source_stats.get('records_missing_pa_coordinates', 0) + 1
+
+                )
+
+            # PA-edge filtering is only defined for reconstructable PAs; do not
+
+            # silently discard a call solely because optional PA metadata is absent.
+
+            kept.append(rec)
+
+            continue
+
+        reaches_edge = any(
+
+            locus.start < bounds[locus.contig][0] + distance
+
+            or locus.end > bounds[locus.contig][1] - distance
+
+            for locus in usable
+
+        )
+
+        if reaches_edge:
+
+            excluded += 1
+
+            if stats_by_source is not None:
+
+                source_stats = stats_by_source.setdefault(rec.source, {})
+
+                source_stats['records_excluded_pa_edge'] = (
+
+                    source_stats.get('records_excluded_pa_edge', 0) + 1
+
+                )
+
+            continue
+
+        kept.append(rec)
+
+    return kept, excluded, missing
 
 
 def open_text(path: str):
@@ -314,6 +613,170 @@ def open_text_write(path: str):
         return gzip.open(path, "wt")
 
     return open(path, "w")
+
+
+def read_query_path_contig_lengths(
+
+    query_paths: str,
+
+) -> Dict[str, Dict[str, int]]:
+
+    """Read NAME FASTA [FAI] and return authoritative contig lengths."""
+
+    listing = os.path.abspath(os.path.expanduser(query_paths))
+
+    base = os.path.dirname(listing)
+
+    by_sample: Dict[str, Dict[str, int]] = {}
+
+    with open(listing, "rt", encoding="utf-8") as handle:
+
+        for line_number, raw in enumerate(handle, 1):
+
+            if not raw.strip() or raw.lstrip().startswith("#"):
+
+                continue
+
+            fields = shlex.split(raw, comments=True)
+
+            if len(fields) not in {2, 3}:
+
+                raise ValueError(
+
+                    f"{listing}:{line_number}: expected NAME FASTA [FAI]"
+
+                )
+
+            sample, fasta_text = fields[:2]
+
+            fasta = os.path.expanduser(fasta_text)
+
+            if not os.path.isabs(fasta):
+
+                fasta = os.path.join(base, fasta)
+
+            fai_text = fields[2] if len(fields) == 3 else fasta + ".fai"
+
+            fai = os.path.expanduser(fai_text)
+
+            if not os.path.isabs(fai):
+
+                fai = os.path.join(base, fai)
+
+            if sample in by_sample:
+
+                raise ValueError(
+
+                    f"{listing}:{line_number}: duplicate sample {sample!r}"
+
+                )
+
+            if not os.path.isfile(fai):
+
+                raise FileNotFoundError(
+
+                    f"{listing}:{line_number}: FASTA index not found: {fai}"
+
+                )
+
+            lengths: Dict[str, int] = {}
+
+            with open(fai, "rt", encoding="utf-8") as fai_handle:
+
+                for fai_line_number, fai_raw in enumerate(fai_handle, 1):
+
+                    columns = fai_raw.split()
+
+                    if len(columns) < 2:
+
+                        continue
+
+                    try:
+
+                        length = int(columns[1])
+
+                    except ValueError:
+
+                        raise ValueError(
+
+                            f"{fai}:{fai_line_number}: invalid contig length"
+
+                        ) from None
+
+                    contig = columns[0]
+
+                    if length < 0 or contig in lengths:
+
+                        raise ValueError(
+
+                            f"{fai}:{fai_line_number}: negative length or "
+
+                            f"duplicate contig {contig!r}"
+
+                        )
+
+                    lengths[contig] = length
+
+            if not lengths:
+
+                raise ValueError(f"{fai}: no contig lengths found")
+
+            by_sample[sample] = lengths
+
+    if not by_sample:
+
+        raise ValueError(f"{listing}: no assembly rows found")
+
+    return by_sample
+
+
+def query_bounds_for_vcf_samples(
+
+    sample_names: Sequence[str],
+
+    lengths_by_sample: Dict[str, Dict[str, int]],
+
+    vcf_path: str,
+
+) -> Dict[str, Tuple[int, int]]:
+
+    """Resolve the query-contig bounds for one child haplotype VCF."""
+
+    missing = [name for name in sample_names if name not in lengths_by_sample]
+
+    if missing:
+
+        raise ValueError(
+
+            f"{vcf_path}: sample(s) absent from --query-paths: "
+
+            + ",".join(missing)
+
+        )
+
+    bounds: Dict[str, Tuple[int, int]] = {}
+
+    for sample in sample_names:
+
+        for contig, length in lengths_by_sample[sample].items():
+
+            value = (0, int(length))
+
+            previous = bounds.get(contig)
+
+            if previous is not None and previous != value:
+
+                raise ValueError(
+
+                    f"{vcf_path}: conflicting lengths for query contig "
+
+                    f"{contig!r} across selected samples"
+
+                )
+
+            bounds[contig] = value
+
+    return bounds
 
 
 def parse_info(info: str) -> Dict[str, str]:
@@ -1216,6 +1679,828 @@ def sample_group_original_loci(
 
     return out
 
+
+def sample_group_query_loci(
+
+    sample_fields: Sequence[str],
+
+    fmt_keys: Sequence[str],
+
+    allele_index: int,
+
+) -> List[QueryLocus]:
+
+    """Return carried observations' assembly query intervals.
+
+    Current VCFs store the contig and interval in decomposed
+
+    ``ASSEMBLYCONTIG`` and ``QUERYCOORD`` fields. Legacy HSV payloads carry
+
+    the same values in fields five and six.
+
+    """
+
+    out: List[QueryLocus] = []
+
+    if "HSV" in fmt_keys:
+
+        target = str(allele_index)
+
+        for sample_field in sample_fields:
+
+            hsv = get_hsv_value(sample_field, fmt_keys) or ""
+
+            for token in hsv.split("|"):
+
+                values = parse_hsv_allele_fields(token.strip())
+
+                if values is None or values[0] != target:
+
+                    continue
+
+                parsed = parse_query_range_point(values[5])
+
+                contig = vcf_unescape(values[4])
+
+                if parsed is not None and contig not in {"", "."}:
+
+                    out.append(QueryLocus(contig, *parsed))
+
+    elif (
+
+        "GT" in fmt_keys
+
+        and "ASSEMBLYCONTIG" in fmt_keys
+
+        and "QUERYCOORD" in fmt_keys
+
+    ):
+
+        for sample_field in sample_fields:
+
+            gt = get_format_value(sample_field, fmt_keys, "GT")
+
+            if not gt_has_allele(gt or "", allele_index):
+
+                continue
+
+            observations = aligned_observation_values(
+
+                get_format_value(sample_field, fmt_keys, "ASSEMBLYCONTIG"),
+
+                get_format_value(sample_field, fmt_keys, "QUERYCOORD"),
+
+            )
+
+            for contig_text, coordinate_text in observations:
+
+                contig = vcf_unescape(contig_text)
+
+                parsed = parse_query_range_point(coordinate_text)
+
+                if parsed is not None and contig not in {"", "."}:
+
+                    out.append(QueryLocus(contig, *parsed))
+
+    # Cross-graph observations can repeat the same assembly interval.
+
+    return list(dict.fromkeys(out))
+
+def parse_label_h_pairs(label_h: str) -> List[Tuple[int, int]]:
+
+    """Parse SV LABEL_H components into ``(left_H, right_H)`` distances.
+
+    Cross-graph provenance may contain multiple PA components joined by ``&``.
+
+    Single-H SNP-style LABEL_H values do not define both PA boundaries and are
+
+    therefore not used for PA-edge reconstruction.
+
+    """
+
+    text = vcf_unescape(label_h or "").strip()
+
+    if not text or text == ".":
+
+        return []
+
+    out: List[Tuple[int, int]] = []
+
+    for component in text.split("&"):
+
+        component = component.strip()
+
+        m = re.fullmatch(r"([+-]?\d+)H_?([+-]?\d+)H", component)
+
+        if not m:
+
+            continue
+
+        out.append((int(m.group(1)), int(m.group(2))))
+
+    return out
+
+
+def reconstruct_pa_loci(
+
+    contig: str,
+
+    query_locus: QueryLocus,
+
+    label_h: str,
+
+) -> List[QueryLocus]:
+
+    """Reconstruct PA query intervals from QUERYCOORD and LABEL_H."""
+
+    out: List[QueryLocus] = []
+
+    for left_h, right_h in parse_label_h_pairs(label_h):
+
+        if query_locus.strand == "-":
+
+            start = query_locus.start - right_h
+
+            end = query_locus.end + left_h
+
+        else:
+
+            start = query_locus.start - left_h
+
+            end = query_locus.end + right_h
+
+        if end < start:
+
+            start, end = end, start
+
+        out.append(QueryLocus(contig, start, end, query_locus.strand))
+
+    return out
+
+
+def sample_group_pa_loci(
+
+    sample_fields: Sequence[str],
+
+    fmt_keys: Sequence[str],
+
+    allele_index: int,
+
+) -> List[QueryLocus]:
+
+    """Return all reconstructable PAs for carried observations.
+
+    This uses only child-side assembly metadata when called from separate-file
+
+    mode.  Legacy HSV stores contig/query/LABEL_H in fields 5/6/8; decomposed
+
+    FORMAT stores them as ASSEMBLYCONTIG, QUERYCOORD and LABEL_H.
+
+    """
+
+    out: List[QueryLocus] = []
+
+    if "HSV" in fmt_keys:
+
+        target = str(allele_index)
+
+        for sample_field in sample_fields:
+
+            hsv = get_hsv_value(sample_field, fmt_keys) or ""
+
+            for token in hsv.split("|"):
+
+                raw_token = token.strip()
+
+                values = parse_hsv_allele_fields(raw_token)
+
+                if values is None or values[0] != target:
+
+                    continue
+
+                # parse_hsv_allele_fields() intentionally normalizes an absent
+
+                # legacy LABEL_H to 0H_0H for other coordinate logic.  For PA
+
+                # reconstruction, however, 0H_0H is usable only when LABEL_H
+
+                # was actually present in the input; do not invent a PA from
+
+                # missing legacy metadata.
+
+                first = raw_token.split(":", 3)
+
+                if len(first) != 4:
+
+                    continue
+
+                last_new = first[3].rsplit(":", 4)
+
+                if len(last_new) != 5:
+
+                    continue
+
+                raw_label_h = last_new[-1].strip()
+
+                if raw_label_h in {"", "."} or not _looks_like_label_h_coord(raw_label_h):
+
+                    continue
+
+                parsed = parse_query_range_point(values[5])
+
+                contig = vcf_unescape(values[4])
+
+                if parsed is None or contig in {"", "."}:
+
+                    continue
+
+                qloc = QueryLocus(contig, *parsed)
+
+                out.extend(reconstruct_pa_loci(contig, qloc, raw_label_h))
+
+    elif (
+
+        "GT" in fmt_keys
+
+        and "ASSEMBLYCONTIG" in fmt_keys
+
+        and "QUERYCOORD" in fmt_keys
+
+        and "LABEL_H" in fmt_keys
+
+    ):
+
+        for sample_field in sample_fields:
+
+            gt = get_format_value(sample_field, fmt_keys, "GT")
+
+            if not gt_has_allele(gt or "", allele_index):
+
+                continue
+
+            observations = aligned_observation_values(
+
+                get_format_value(sample_field, fmt_keys, "ASSEMBLYCONTIG"),
+
+                get_format_value(sample_field, fmt_keys, "QUERYCOORD"),
+
+                get_format_value(sample_field, fmt_keys, "LABEL_H"),
+
+            )
+
+            for contig_text, coordinate_text, label_h in observations:
+
+                contig = vcf_unescape(contig_text)
+
+                parsed = parse_query_range_point(coordinate_text)
+
+                if parsed is None or contig in {"", "."}:
+
+                    continue
+
+                qloc = QueryLocus(contig, *parsed)
+
+                out.extend(reconstruct_pa_loci(contig, qloc, label_h))
+
+    return list(dict.fromkeys(out))
+
+
+def _normalize_component_svtype(event_type: str) -> str:
+
+    """Normalize decomposed observation TYPE values for DEL/INS matching."""
+
+    typ = (event_type or "").strip().upper()
+
+    if typ == "DEL" or typ.startswith("DEL_") or typ.endswith("_DEL"):
+
+        return "DEL"
+
+    if typ == "INS" or typ.startswith("INS_") or typ.endswith("_INS"):
+
+        return "INS"
+
+    return typ
+
+
+def _parse_component_size(size_text: str) -> Optional[int]:
+
+    try:
+
+        return abs(int(float(str(size_text).strip())))
+
+    except (TypeError, ValueError):
+
+        return None
+
+
+def _legacy_hsv_raw_label_h(raw_token: str) -> str:
+
+    """Return an explicitly present legacy LABEL_H, otherwise an empty string."""
+
+    first = raw_token.split(":", 3)
+
+    if len(first) != 4:
+
+        return ""
+
+    last_new = first[3].rsplit(":", 4)
+
+    if len(last_new) != 5:
+
+        return ""
+
+    raw_label_h = last_new[-1].strip()
+
+    if raw_label_h in {"", "."} or not _looks_like_label_h_coord(raw_label_h):
+
+        return ""
+
+    return raw_label_h
+
+
+def sample_group_sv_components(
+
+    sample_fields: Sequence[str],
+
+    sample_names: Sequence[str],
+
+    fmt_keys: Sequence[str],
+
+    allele_index: int,
+
+    row_chrom: str,
+
+    row_pos: int,
+
+    use_original_coordinates: bool = False,
+
+) -> List[SVComponent]:
+
+    """Return carried DEL/INS observation components for one ALT allele.
+
+    Decomposed graphreftovcf FORMAT columns are observation-indexed. A replacement
+    allele can therefore contain (for example) TYPE=DEL,INS and SIZE=-120,85.
+    Components are grouped by unique (TYPE, absolute SIZE), with corresponding
+    reference/query/PA metadata aggregated onto each component. The caller decides
+    whether row-level or component-level representation should be used.
+    """
+
+    observations = []
+
+    target = str(allele_index)
+
+    if "HSV" in fmt_keys:
+
+        for sample_field, sample_name in zip(sample_fields, sample_names):
+
+            hsv = get_hsv_value(sample_field, fmt_keys) or ""
+
+            for token in hsv.split("|"):
+
+                raw_token = token.strip()
+
+                if not raw_token or raw_token in {"0", "."}:
+
+                    continue
+
+                prefix = raw_token.split(":", 3)
+
+                if len(prefix) < 3 or prefix[0] != target:
+
+                    continue
+
+                values = parse_hsv_allele_fields(raw_token)
+
+                event_type = values[1] if values is not None else prefix[1]
+
+                size_text = values[2] if values is not None else prefix[2]
+
+                typ = _normalize_component_svtype(event_type)
+
+                size = _parse_component_size(size_text)
+
+                if typ not in {"DEL", "INS"} or size is None:
+
+                    continue
+
+                cigar = values[3] if values is not None else ""
+
+                original_locus = None
+
+                if use_original_coordinates:
+
+                    original_locus = recover_original_reference_locus(
+
+                        row_chrom=row_chrom,
+
+                        row_pos=row_pos,
+
+                        sample_name=sample_name,
+
+                        cigar=vcf_unescape(cigar),
+
+                        event_type=event_type,
+
+                        size_text=size_text,
+
+                    )
+
+                query_locus = None
+
+                pa_loci: Tuple[QueryLocus, ...] = ()
+
+                if values is not None and len(values) >= 8:
+
+                    contig = vcf_unescape(values[4])
+
+                    parsed = parse_query_range_point(values[5])
+
+                    if parsed is not None and contig not in {"", "."}:
+
+                        query_locus = QueryLocus(contig, *parsed)
+
+                        raw_label_h = _legacy_hsv_raw_label_h(raw_token)
+
+                        if raw_label_h:
+
+                            pa_loci = tuple(reconstruct_pa_loci(contig, query_locus, raw_label_h))
+
+                observations.append((typ, size, original_locus, query_locus, pa_loci))
+
+    elif "GT" in fmt_keys and "TYPE" in fmt_keys and "SIZE" in fmt_keys:
+
+        for sample_field, sample_name in zip(sample_fields, sample_names):
+
+            gt = get_format_value(sample_field, fmt_keys, "GT")
+
+            if not gt_has_allele(gt or "", allele_index):
+
+                continue
+
+            aligned = aligned_observation_values(
+
+                get_format_value(sample_field, fmt_keys, "TYPE"),
+
+                get_format_value(sample_field, fmt_keys, "SIZE"),
+
+                get_format_value(sample_field, fmt_keys, "EXTENDGRAPHCIGAR"),
+
+                get_format_value(sample_field, fmt_keys, "ASSEMBLYCONTIG"),
+
+                get_format_value(sample_field, fmt_keys, "QUERYCOORD"),
+
+                get_format_value(sample_field, fmt_keys, "LABEL_H"),
+
+            )
+
+            for event_type, size_text, cigar, contig_text, coordinate_text, label_h in aligned:
+
+                typ = _normalize_component_svtype(event_type)
+
+                size = _parse_component_size(size_text)
+
+                if typ not in {"DEL", "INS"} or size is None:
+
+                    continue
+
+                original_locus = None
+
+                if use_original_coordinates:
+
+                    original_locus = recover_original_reference_locus(
+
+                        row_chrom=row_chrom,
+
+                        row_pos=row_pos,
+
+                        sample_name=sample_name,
+
+                        cigar="" if cigar in {"", "."} else vcf_unescape(cigar),
+
+                        event_type=event_type,
+
+                        size_text=size_text,
+
+                    )
+
+                query_locus = None
+
+                pa_loci: Tuple[QueryLocus, ...] = ()
+
+                contig = vcf_unescape(contig_text)
+
+                parsed = parse_query_range_point(coordinate_text)
+
+                if parsed is not None and contig not in {"", "."}:
+
+                    query_locus = QueryLocus(contig, *parsed)
+
+                    pa_loci = tuple(reconstruct_pa_loci(contig, query_locus, label_h))
+
+                observations.append((typ, size, original_locus, query_locus, pa_loci))
+
+    grouped = {}
+
+    order = []
+
+    for typ, size, original_locus, query_locus, pa_loci in observations:
+
+        key = (typ, size)
+
+        if key not in grouped:
+
+            grouped[key] = {"original": [], "query": [], "pa": []}
+
+            order.append(key)
+
+        bucket = grouped[key]
+
+        if original_locus is not None and original_locus not in bucket["original"]:
+
+            bucket["original"].append(original_locus)
+
+        if query_locus is not None and query_locus not in bucket["query"]:
+
+            bucket["query"].append(query_locus)
+
+        for pa_locus in pa_loci:
+
+            if pa_locus not in bucket["pa"]:
+
+                bucket["pa"].append(pa_locus)
+
+    return [
+
+        SVComponent(
+
+            svtype=typ,
+
+            size=size,
+
+            original_loci=tuple(grouped[(typ, size)]["original"]),
+
+            query_loci=tuple(grouped[(typ, size)]["query"]),
+
+            pa_loci=tuple(grouped[(typ, size)]["pa"]),
+
+        )
+
+        for typ, size in order
+
+    ]
+
+
+def build_group_variant_records(
+
+    *,
+
+    chrom: str,
+
+    pos: int,
+
+    vid: str,
+
+    ref: str,
+
+    alt_allele: str,
+
+    info: Dict[str, str],
+
+    allele_index: int,
+
+    source: str,
+
+    line_no: int,
+
+    sample_fields: Sequence[str],
+
+    sample_names: Sequence[str],
+
+    fmt_keys: Sequence[str],
+
+    min_size: int,
+
+    include_all: bool,
+
+    use_original_coordinates: bool,
+
+    include_query_metadata: bool = False,
+
+) -> Tuple[List[VariantRecord], int]:
+
+    """Build carried records for one role/sample group and one ALT allele.
+
+    Mixed DEL+INS alleles are atomized before the size cutoff, so a replacement
+    can contribute two SVs when both components independently exceed --min-size.
+    The second return value counts otherwise benchmarkable components/records
+    dropped only because original reference coordinates could not be recovered.
+    """
+
+    if not sample_group_has_allele(sample_fields, fmt_keys, allele_index):
+
+        return [], 0
+
+    row_svtype = infer_svtype(ref, alt_allele, info)
+
+    components = sample_group_sv_components(
+
+        sample_fields,
+
+        sample_names,
+
+        fmt_keys,
+
+        allele_index,
+
+        chrom,
+
+        pos,
+
+        use_original_coordinates=use_original_coordinates,
+
+    )
+
+    component_types = {component.svtype for component in components}
+
+    use_components = bool(components) and (
+
+        len(component_types) > 1
+
+        or row_svtype not in {"DEL", "INS"}
+
+        or row_svtype not in component_types
+
+    )
+
+    if use_components:
+
+        out: List[VariantRecord] = []
+
+        missing_original = 0
+
+        for component_number, component in enumerate(components, 1):
+
+            variant_class = classify_variant(
+
+                ref, alt_allele, component.svtype, component.size, min_size
+
+            )
+
+            if not include_all and (
+
+                component.size <= min_size or variant_class != "SV"
+
+            ):
+
+                continue
+
+            if use_original_coordinates and not component.original_loci:
+
+                missing_original += 1
+
+                continue
+
+            component_end = pos + max(component.size, 1) - 1
+
+            base_vid = vid if vid and vid != "." else f"{chrom}:{pos}:{allele_index}"
+
+            out.append(VariantRecord(
+
+                chrom=chrom,
+
+                pos=pos,
+
+                end=component_end,
+
+                svtype=component.svtype,
+
+                size=component.size,
+
+                vid=f"{base_vid}:component{component_number}:{component.svtype}:{component.size}",
+
+                ref=ref,
+
+                alt=alt_allele,
+
+                allele_index=allele_index,
+
+                variant_class=variant_class,
+
+                source=source,
+
+                line_no=line_no,
+
+                original_loci=component.original_loci,
+
+                query_loci=component.query_loci if include_query_metadata else (),
+
+                pa_loci=component.pa_loci if include_query_metadata else (),
+
+            ))
+
+        return out, missing_original
+
+    svtype = row_svtype
+
+    end, size = infer_end_and_size_for_allele(
+
+        pos, ref, alt_allele, info, allele_index
+
+    )
+
+    variant_class = classify_variant(ref, alt_allele, svtype, size, min_size)
+
+    if not include_all:
+
+        if size is None or end is None or size <= min_size or variant_class != "SV":
+
+            return [], 0
+
+    else:
+
+        if end is None:
+
+            if size is None:
+
+                end = pos + max(len(ref), len(alt_allele)) - 1
+
+            else:
+
+                end = pos + max(abs(size), 1) - 1
+
+        if size is None:
+
+            size = max(len(ref), len(alt_allele))
+
+    if end is None or size is None:
+
+        return [], 0
+
+    original_loci = []
+
+    if use_original_coordinates:
+
+        original_loci = sample_group_original_loci(
+
+            sample_fields, sample_names, fmt_keys, allele_index, chrom, pos
+
+        )
+
+        if not original_loci:
+
+            return [], 1
+
+    query_loci = (
+
+        sample_group_query_loci(sample_fields, fmt_keys, allele_index)
+
+        if include_query_metadata else []
+
+    )
+
+    pa_loci = (
+
+        sample_group_pa_loci(sample_fields, fmt_keys, allele_index)
+
+        if include_query_metadata else []
+
+    )
+
+    return [VariantRecord(
+
+        chrom=chrom,
+
+        pos=pos,
+
+        end=end,
+
+        svtype=svtype,
+
+        size=size,
+
+        vid=vid if vid and vid != "." else f"{chrom}:{pos}:{svtype}:{size}:{allele_index}",
+
+        ref=ref,
+
+        alt=alt_allele,
+
+        allele_index=allele_index,
+
+        variant_class=variant_class,
+
+        source=source,
+
+        line_no=line_no,
+
+        original_loci=tuple(original_loci),
+
+        query_loci=tuple(query_loci),
+
+        pa_loci=tuple(pa_loci),
+
+    )], 0
+
+
 def gt_has_allele(gt_value: str, allele_index: int) -> bool:
 
     if not gt_value or gt_value in {".", "./.", ".|."}:
@@ -1824,113 +3109,11 @@ def load_trio_records(
 
             for allele_index, alt_allele in enumerate(alt.split(","), 1):
 
-                svtype = infer_svtype(ref, alt_allele, info)
-
-                end, size = infer_end_and_size_for_allele(pos, ref, alt_allele, info, allele_index)
-
-                variant_class = classify_variant(ref, alt_allele, svtype, size, min_size)
-
-                if not include_all:
-
-                    if size is None or end is None or size <= min_size or variant_class != "SV":
-
-                        continue
-
-                else:
-
-                    if end is None:
-
-                        if size is None:
-
-                            end = pos + max(len(ref), len(alt_allele)) - 1
-
-                        else:
-
-                            end = pos + max(abs(size), 1) - 1
-
-                    if size is None:
-
-                        size = max(len(ref), len(alt_allele))
-
-                if end is None or size is None:
-
-                    continue
-
-                rec = VariantRecord(
-
-                    chrom=chrom,
-
-                    pos=pos,
-
-                    end=end,
-
-                    svtype=svtype,
-
-                    size=size,
-
-                    vid=vid if vid and vid != "." else f"{chrom}:{pos}:{svtype}:{size}:{allele_index}",
-
-                    ref=ref,
-
-                    alt=alt_allele,
-
-                    allele_index=allele_index,
-
-                    variant_class=variant_class,
-
-                    source=os.path.basename(vcf_path),
-
-                    line_no=line_no,
-
-                )
-
                 child_has = sample_group_has_allele(child_group, fmt_keys, allele_index)
 
                 mother_has = sample_group_has_allele(mother_group, fmt_keys, allele_index)
 
                 father_has = sample_group_has_allele(father_group, fmt_keys, allele_index)
-
-                child_loci = (
-
-                    sample_group_original_loci(
-
-                        child_group, matched_samples["child"], fmt_keys, allele_index, chrom, pos
-
-                    )
-
-                    if child_has
-
-                    else []
-
-                )
-
-                mother_loci = (
-
-                    sample_group_original_loci(
-
-                        mother_group, matched_samples["mother"], fmt_keys, allele_index, chrom, pos
-
-                    )
-
-                    if mother_has
-
-                    else []
-
-                )
-
-                father_loci = (
-
-                    sample_group_original_loci(
-
-                        father_group, matched_samples["father"], fmt_keys, allele_index, chrom, pos
-
-                    )
-
-                    if father_has
-
-                    else []
-
-                )
 
                 child_excluded_varins = (
 
@@ -1942,83 +3125,184 @@ def load_trio_records(
 
                 )
 
+                child_role_records: List[VariantRecord] = []
+
+                child_missing_original_count = 0
+
+                if child_has and not child_excluded_varins:
+
+                    child_role_records, child_missing_original_count = build_group_variant_records(
+
+                        chrom=chrom,
+
+                        pos=pos,
+
+                        vid=vid,
+
+                        ref=ref,
+
+                        alt_allele=alt_allele,
+
+                        info=info,
+
+                        allele_index=allele_index,
+
+                        source=os.path.basename(vcf_path),
+
+                        line_no=line_no,
+
+                        sample_fields=child_group,
+
+                        sample_names=matched_samples["child"],
+
+                        fmt_keys=fmt_keys,
+
+                        min_size=min_size,
+
+                        include_all=include_all,
+
+                        use_original_coordinates=use_original_coordinates,
+
+                    )
+
+                mother_role_records, mother_missing_original_count = build_group_variant_records(
+
+                    chrom=chrom,
+
+                    pos=pos,
+
+                    vid=vid,
+
+                    ref=ref,
+
+                    alt_allele=alt_allele,
+
+                    info=info,
+
+                    allele_index=allele_index,
+
+                    source=os.path.basename(vcf_path),
+
+                    line_no=line_no,
+
+                    sample_fields=mother_group,
+
+                    sample_names=matched_samples["mother"],
+
+                    fmt_keys=fmt_keys,
+
+                    min_size=min_size,
+
+                    include_all=include_all,
+
+                    use_original_coordinates=use_original_coordinates,
+
+                )
+
+                father_role_records, father_missing_original_count = build_group_variant_records(
+
+                    chrom=chrom,
+
+                    pos=pos,
+
+                    vid=vid,
+
+                    ref=ref,
+
+                    alt_allele=alt_allele,
+
+                    info=info,
+
+                    allele_index=allele_index,
+
+                    source=os.path.basename(vcf_path),
+
+                    line_no=line_no,
+
+                    sample_fields=father_group,
+
+                    sample_names=matched_samples["father"],
+
+                    fmt_keys=fmt_keys,
+
+                    min_size=min_size,
+
+                    include_all=include_all,
+
+                    use_original_coordinates=use_original_coordinates,
+
+                )
+
+                if child_missing_original_count:
+
+                    parent_missing_stats["child_missing_original"] += child_missing_original_count
+
+                if mother_missing_original_count:
+
+                    parent_missing_stats["mother_missing_original"] += mother_missing_original_count
+
+                if father_missing_original_count:
+
+                    parent_missing_stats["father_missing_original"] += father_missing_original_count
+
                 mother_missing = sample_group_has_missing(mother_group, fmt_keys)
 
                 father_missing = sample_group_has_missing(father_group, fmt_keys)
 
-                mother_original_missing = use_original_coordinates and mother_has and not mother_loci
+                # Preserve the historical conservative rule: if a carried parent
+                # component should be benchmarkable but lacks original coordinates,
+                # treat that parent as missing for child benchmarking.
 
-                father_original_missing = use_original_coordinates and father_has and not father_loci
+                mother_original_missing = (
 
-                child_original_missing = use_original_coordinates and child_has and not child_loci
+                    use_original_coordinates and mother_has and mother_missing_original_count > 0
 
-                if child_original_missing and not child_excluded_varins:
+                )
 
-                    parent_missing_stats["child_missing_original"] += 1
+                father_original_missing = (
 
-                if mother_original_missing:
+                    use_original_coordinates and father_has and father_missing_original_count > 0
 
-                    parent_missing_stats["mother_missing_original"] += 1
+                )
 
-                if father_original_missing:
+                child_excluded_parent_missing = bool(child_role_records) and (
 
-                    parent_missing_stats["father_missing_original"] += 1
-
-                child_excluded_parent_missing = (
-
-                    child_has
-
-                    and not child_excluded_varins
-
-                    and not child_original_missing
-
-                    and (mother_missing or father_missing or mother_original_missing or father_original_missing)
+                    mother_missing or father_missing or mother_original_missing or father_original_missing
 
                 )
 
                 if child_excluded_parent_missing:
 
-                    parent_missing_stats["excluded_child_records"] += 1
+                    excluded_n = len(child_role_records)
+
+                    parent_missing_stats["excluded_child_records"] += excluded_n
 
                     if mother_missing or mother_original_missing:
 
-                        parent_missing_stats["mother_missing"] += 1
+                        parent_missing_stats["mother_missing"] += excluded_n
 
                     if father_missing or father_original_missing:
 
-                        parent_missing_stats["father_missing"] += 1
+                        parent_missing_stats["father_missing"] += excluded_n
 
                     if (mother_missing or mother_original_missing) and (father_missing or father_original_missing):
 
-                        parent_missing_stats["both_missing"] += 1
+                        parent_missing_stats["both_missing"] += excluded_n
 
-                if (
+                else:
 
-                    child_has
+                    child_records.extend(child_role_records)
 
-                    and not child_excluded_varins
+                    if child_role_records:
 
-                    and not child_original_missing
+                        # Keep only rows actually carried by the child and included in
+                        # the benchmark, so --fp/--tp follows the same denominator.
 
-                    and not child_excluded_parent_missing
+                        raw_by_line.setdefault(line_no, raw.rstrip("\n"))
 
-                ):
+                mother_records.extend(mother_role_records)
 
-                    child_records.append(replace(rec, original_loci=tuple(child_loci)))
-
-                    # Keep only rows actually carried by the child and included in the benchmark,
-
-                    # so --fp/--tp follows the same denominator as the summary.
-
-                    raw_by_line.setdefault(line_no, raw.rstrip("\n"))
-
-                if mother_has and (not use_original_coordinates or mother_loci):
-
-                    mother_records.append(replace(rec, original_loci=tuple(mother_loci)))
-
-                if father_has and (not use_original_coordinates or father_loci):
-
-                    father_records.append(replace(rec, original_loci=tuple(father_loci)))
+                father_records.extend(father_role_records)
 
     if not saw_header:
 
@@ -2815,7 +4099,7 @@ def load_haplotype_vcf(
 
     use_original_coordinates: bool = False,
 
-    coverage_edge_trim: int = 0,
+    reference_edge_trim: int = 0,
 
 ) -> Tuple[
 
@@ -2846,6 +4130,10 @@ def load_haplotype_vcf(
     graphcigartoref to be 0-based half-open and are independent of variant-row
 
     presence/absence.
+
+    ``reference_edge_trim`` removes that many bases from both ends of every raw
+
+    referenceCoverage interval before intervals are merged.
 
     Returns carried alleles, merged reference-coverage intervals, and the raw
 
@@ -2949,42 +4237,6 @@ def load_haplotype_vcf(
 
             for allele_index, alt_allele in enumerate(alt.split(','), 1):
 
-                svtype = infer_svtype(ref, alt_allele, info)
-
-                end, size = infer_end_and_size_for_allele(
-
-                    pos, ref, alt_allele, info, allele_index
-
-                )
-
-                variant_class = classify_variant(ref, alt_allele, svtype, size, min_size)
-
-                if not include_all:
-
-                    if size is None or end is None or size <= min_size or variant_class != 'SV':
-
-                        continue
-
-                else:
-
-                    if end is None:
-
-                        if size is None:
-
-                            end = pos + max(len(ref), len(alt_allele)) - 1
-
-                        else:
-
-                            end = pos + max(abs(size), 1) - 1
-
-                    if size is None:
-
-                        size = max(len(ref), len(alt_allele))
-
-                if end is None or size is None:
-
-                    continue
-
                 if not sample_group_has_allele(sample_fields, fmt_keys, allele_index):
 
                     continue
@@ -2997,53 +4249,49 @@ def load_haplotype_vcf(
 
                     continue
 
-                original_loci = []
-
-                if use_original_coordinates:
-
-                    original_loci = sample_group_original_loci(
-
-                        sample_fields, sample_names, fmt_keys, allele_index, chrom, pos
-
-                    )
-
-                    if not original_loci:
-
-                        missing_original += 1
-
-                        continue
-
-                rec = VariantRecord(
+                allele_records, allele_missing_original = build_group_variant_records(
 
                     chrom=chrom,
 
                     pos=pos,
 
-                    end=end,
-
-                    svtype=svtype,
-
-                    size=size,
-
-                    vid=vid if vid and vid != '.' else f'{chrom}:{pos}:{svtype}:{size}:{allele_index}',
+                    vid=vid,
 
                     ref=ref,
 
-                    alt=alt_allele,
+                    alt_allele=alt_allele,
+
+                    info=info,
 
                     allele_index=allele_index,
-
-                    variant_class=variant_class,
 
                     source=vcf_path,
 
                     line_no=line_no,
 
-                    original_loci=tuple(original_loci),
+                    sample_fields=sample_fields,
+
+                    sample_names=sample_names,
+
+                    fmt_keys=fmt_keys,
+
+                    min_size=min_size,
+
+                    include_all=include_all,
+
+                    use_original_coordinates=use_original_coordinates,
+
+                    include_query_metadata=True,
 
                 )
 
-                records.append(rec)
+                missing_original += allele_missing_original
+
+                if not allele_records:
+
+                    continue
+
+                records.extend(allele_records)
 
                 raw_by_line.setdefault(line_no, raw.rstrip('\n'))
 
@@ -3053,7 +4301,7 @@ def load_haplotype_vcf(
 
     reference_coverage = merge_reference_coverage_intervals(
 
-        reference_coverage, edge_trim=coverage_edge_trim
+        reference_coverage, edge_trim=reference_edge_trim
 
     )
 
@@ -3163,13 +4411,21 @@ def exclude_child_parent_missing_separate(
         father_missing = (not father_covered) or (not all(father_covered))
 
         if stats_by_source is not None:
+
             source_stats = stats_by_source.setdefault(rec.source, {})
+
             for key, excluded in (
+
                 ('records_excluded_parent_missing', mother_missing or father_missing),
+
                 ('records_excluded_mother_missing', mother_missing),
+
                 ('records_excluded_father_missing', father_missing),
+
                 ('records_excluded_both_parents_missing', mother_missing and father_missing),
+
             ):
+
                 source_stats[key] = source_stats.get(key, 0) + int(excluded)
 
         if mother_missing:
@@ -3309,65 +4565,131 @@ def write_split_child_outputs(
 
 
 def summarize_child_haplotypes(
+
     child_paths: Sequence[str],
+
     child_records: Sequence[VariantRecord],
+
     mom_hits: Sequence[bool],
+
     dad_hits: Sequence[bool],
+
     include_all: bool,
+
     stats_by_source: Optional[Dict[str, Dict[str, int]]] = None,
+
 ) -> str:
+
     """Report retained calls by source without repeating parental matching."""
+
     counts = defaultdict(Counter)
+
     types = defaultdict(lambda: defaultdict(Counter))
+
     for rec, mother, father in zip(child_records, mom_hits, dad_hits):
+
         found = mother or father
+
         counts[rec.source].update({
+
             'total': 1,
+
             'found_in_mother': int(mother),
+
             'found_in_father': int(father),
+
             'found_in_either_parent': int(found),
+
             'found_in_both_parents': int(mother and father),
+
             'not_found_in_parents': int(not found),
+
         })
+
         kind = rec.variant_class if include_all else rec.svtype
+
         types[rec.source][kind].update(total=1, found=int(found))
 
     lines = []
+
     stats_by_source = stats_by_source or {}
+
     for number, path in enumerate(child_paths, 1):
+
         prefix = f'child_h{number}'
+
         values = counts[path]
+
         total = values['total']
+
         lines.append(f'{prefix}_vcf\t{path}')
+
         for key in (
+
             'vcf_records_scanned',
+
             'records_excluded_edge_trim',
+
+            'records_excluded_reference_edge_trim',
+
+            'records_excluded_missing_reference_coverage',
+
+            'records_excluded_pa_edge',
+
+            'records_missing_pa_coordinates',
+
+            'records_excluded_missing_query_coordinates',
+
             'records_excluded_parent_missing',
+
             'records_excluded_mother_missing',
+
             'records_excluded_father_missing',
+
             'records_excluded_both_parents_missing',
+
             'records_excluded_missing_original_coordinates',
+
         ):
+
             lines.append(f'{prefix}_{key}\t{stats_by_source.get(path, {}).get(key, 0)}')
+
         lines.append(f'{prefix}_records_loaded\t{total}')
+
         total_key = 'total_variants' if include_all else 'total_sv'
+
         lines.append(f'{prefix}_{total_key}\t{total}')
+
         for key in ('found_in_mother', 'found_in_father', 'found_in_either_parent',
+
                     'found_in_both_parents', 'not_found_in_parents'):
+
             lines.append(f'{prefix}_{key}\t{values[key]}')
+
         for key in ('found_in_either_parent', 'not_found_in_parents'):
+
             fraction = f'{values[key] / total:.6f}' if total else 'NA'
+
             lines.append(f'{prefix}_{key}_fraction\t{fraction}')
+
         lines.append('')
 
     kind_label = 'type' if include_all else 'svtype'
+
     lines.append(f'child_haplotype\t{kind_label}\ttotal\tfound_in_either_parent\tfraction_found')
+
     sort_order = {'SNP': 0, 'INDEL': 1, 'SV': 2, 'OTHER': 3}
+
     for number, path in enumerate(child_paths, 1):
+
         for kind in sorted(types[path], key=lambda value: (sort_order.get(value, 99), value)):
+
             values = types[path][kind]
+
             total, found = values['total'], values['found']
+
             lines.append(f'h{number}\t{kind}\t{total}\t{found}\t{found / total:.6f}')
+
     return '\n'.join(lines)
 
 
@@ -3409,11 +4731,23 @@ def summarize_separate_files(
 
     edge_trim_excluded_by_role: Dict[str, int],
 
+    reference_edge_excluded_child: int,
+
+    child_missing_reference_coverage: int,
+
+    pa_edge_distance_bp: int,
+
+    pa_edge_excluded_child: int,
+
+    pa_edge_missing_child: int,
+
     mom_hits: Sequence[bool],
 
     dad_hits: Sequence[bool],
 
     child_stats_by_source: Optional[Dict[str, Dict[str, int]]] = None,
+
+    query_paths: Optional[str] = None,
 
 ) -> str:
 
@@ -3455,16 +4789,53 @@ def summarize_separate_files(
 
     lines.append('father_vcfs\t' + ','.join(father_paths))
 
+    lines.append('query_paths\t' + (query_paths or 'NA'))
+
+    lines.append('query_contig_length_source\tfai' if query_paths else 'query_contig_length_source\tNA')
+
     lines.append('separate_file_parent_missing_semantics\treferenceCoverage_header_0_based_half_open_at_child_reference_anchor')
+
     lines.append(f'edge_trim_bp\t{edge_trim_bp}')
 
-    lines.append('edge_trim_definition\ttrim_each_raw_referenceCoverage_interval_on_both_ends_before_merge_and_benchmark')
+    lines.append('edge_trim_definition\ttrim_child_QUERYCOORD_and_every_raw_referenceCoverage_interval_before_merge')
 
     lines.append(f'child_records_excluded_edge_trim\t{edge_trim_excluded_by_role.get("child", 0)}')
 
-    lines.append(f'mother_records_excluded_edge_trim\t{edge_trim_excluded_by_role.get("mother", 0)}')
+    lines.append(
 
-    lines.append(f'father_records_excluded_edge_trim\t{edge_trim_excluded_by_role.get("father", 0)}')
+        f'child_records_excluded_query_edge_trim\t'
+
+        f'{max(0, edge_trim_excluded_by_role.get("child", 0) - reference_edge_excluded_child)}'
+
+    )
+
+    lines.append(f'child_records_excluded_reference_edge_trim\t{reference_edge_excluded_child}')
+
+    lines.append(f'child_records_excluded_missing_reference_coverage\t{child_missing_reference_coverage}')
+
+    lines.append(f'parent_referenceCoverage_edge_trim_bp\t{edge_trim_bp}')
+
+    lines.append(f'pa_edge_distance_bp\t{pa_edge_distance_bp}')
+
+    lines.append('pa_edge_definition\tchild_only; reconstruct_each_PA_from_QUERYCOORD_plus_LABEL_H; exclude_record_if_any_PA_edge_distance_lt_threshold')
+
+    lines.append(f'child_records_excluded_pa_edge\t{pa_edge_excluded_child}')
+
+    lines.append(f'child_records_without_usable_pa_coordinates\t{pa_edge_missing_child}')
+
+    lines.append(
+
+        'child_records_excluded_missing_query_coordinates\t'
+
+        + str(sum(
+
+            values.get('records_excluded_missing_query_coordinates', 0)
+
+            for values in (child_stats_by_source or {}).values()
+
+        ))
+
+    )
 
     lines.append(f'child_vcf_records_scanned\t{scanned_by_role.get("child", 0)}')
 
@@ -3502,7 +4873,7 @@ def summarize_separate_files(
 
     lines.append('exclude_parent_missing\ttrue')
 
-    lines.append('parent_missing_definition\tany parental haplotype whose ##referenceCoverage intervals do not contain the child reference anchor')
+    lines.append('parent_missing_definition\tany parental haplotype whose edge-trimmed ##referenceCoverage intervals do not contain the child reference anchor')
 
     lines.append(f"child_records_excluded_parent_missing\t{parent_missing_stats.get('excluded_child_records', 0)}")
 
@@ -3571,10 +4942,15 @@ def summarize_separate_files(
         lines.append(f'{key}\t{total_t}\t{found_t}\t{frac:.6f}')
 
     if len(child_paths) > 1:
+
         lines.append('')
+
         lines.append(summarize_child_haplotypes(
+
             child_paths, child_records, mom_hits, dad_hits, include_all,
+
             child_stats_by_source,
+
         ))
 
     return '\n'.join(lines)
@@ -3655,15 +5031,55 @@ def main() -> int:
 
         help=(
 
-            "Separate-haplotype mode: trim BP from both ends of every raw "
+            "Separate-haplotype mode: trim BP from both ends of child assembly "
 
-            "##referenceCoverage interval before benchmarking. Calls in the trimmed "
+            "query contigs and from every raw ##referenceCoverage interval before "
 
-            "flanks are excluded for child/mother/father, and parental missingness uses "
+            "benchmarking. QUERYCOORD uses contig lengths from --query-paths; "
 
-            "the same trimmed intervals. Default: 10000 bp in separate-haplotype mode; "
+            "reference-side trimming applies to child and parental coverage. Default: "
+
+            "10000 bp in separate-haplotype mode; "
 
             "use --trim-edges 0 to disable. In legacy multi-sample mode the default is 0."
+
+        ),
+
+    )
+
+    parser.add_argument(
+
+        "--pa-edge-distance", "--pa-edge-trim", dest="pa_edge_distance",
+
+        default=None, type=int, metavar="BP",
+
+        help=(
+
+            "Separate-haplotype mode, CHILD ONLY: reconstruct every PA from "
+
+            "QUERYCOORD + LABEL_H and exclude a child record when any PA is "
+
+            "strictly closer than BP to either assembly-contig edge. Default: "
+
+            "1000 bp. Use --pa-edge-distance 0 to disable. Parents and parental "
+
+            "referenceCoverage are never filtered by this option."
+
+        ),
+
+    )
+
+    parser.add_argument(
+
+        "-q", "--query-paths", default=None, metavar="FILE",
+
+        help=(
+
+            "NAME FASTA [FAI] assembly list. Required in separate-haplotype "
+
+            "mode when --trim-edges or --pa-edge-distance is greater than zero; "
+
+            "child query-contig lengths are read from the listed .fai files."
 
         ),
 
@@ -3716,11 +5132,20 @@ def main() -> int:
     print(f"Triocheck_version\t{SCRIPT_VERSION}", file=sys.stderr)
 
     # Edge trimming is enabled by default for separate-haplotype benchmarking.
+
     # Legacy multi-sample VCF mode has no per-source ##referenceCoverage edges,
+
     # so preserve its historical behavior unless the user explicitly requests
+
     # an unsupported positive trim (which is rejected below).
+
     if args.edge_trim is None:
+
         args.edge_trim = 0 if args.input is not None else 10000
+
+    if args.pa_edge_distance is None:
+
+        args.pa_edge_distance = 0 if args.input is not None else DEFAULT_PA_EDGE_DISTANCE
 
     if args.min_size < 0:
 
@@ -3729,9 +5154,14 @@ def main() -> int:
     if args.slop < 0:
 
         parser.error("--slop must be >= 0")
+
     if args.edge_trim < 0:
 
         parser.error("--trim-edges/--edge-trim must be >= 0")
+
+    if args.pa_edge_distance < 0:
+
+        parser.error("--pa-edge-distance/--pa-edge-trim must be >= 0")
 
     if not (0 < args.size_ratio <= 1.0):
 
@@ -3764,6 +5194,16 @@ def main() -> int:
     # Legacy mode: one multi-sample VCF and one selector per role.
 
     if args.input is not None:
+
+        if args.pa_edge_distance > 0:
+
+            parser.error(
+
+                "--pa-edge-distance is child-assembly metadata filtering and currently "
+
+                "requires separate-haplotype VCF mode"
+
+            )
 
         if args.edge_trim > 0:
 
@@ -3891,6 +5331,30 @@ def main() -> int:
 
                 parser.error(f"{role} VCF does not exist: {path}")
 
+    if (args.edge_trim > 0 or args.pa_edge_distance > 0) and not args.query_paths:
+
+        parser.error(
+
+            "--query-paths is required for child query/PA edge filtering; "
+
+            "supply query_paths.txt or disable both --trim-edges and --pa-edge-distance"
+
+        )
+
+    try:
+
+        query_lengths_by_sample = (
+
+            read_query_path_contig_lengths(args.query_paths)
+
+            if (args.edge_trim > 0 or args.pa_edge_distance > 0) else {}
+
+        )
+
+    except (OSError, ValueError) as error:
+
+        parser.error(str(error))
+
     role_records: Dict[str, List[VariantRecord]] = {"child": [], "mother": [], "father": []}
 
     scanned_by_role = {"child": 0, "mother": 0, "father": 0}
@@ -3906,6 +5370,8 @@ def main() -> int:
     coverage_by_source: Dict[str, Dict[str, List[Tuple[int, int]]]] = {}
 
     coverage_header_count_by_source: Dict[str, int] = {}
+
+    query_bounds_by_source: Dict[str, Dict[str, Tuple[int, int]]] = {}
 
     for role, paths in (("child", args.child), ("mother", args.mother), ("father", args.father)):
 
@@ -3923,7 +5389,7 @@ def main() -> int:
 
                 use_original_coordinates=original_distance is not None,
 
-                coverage_edge_trim=args.edge_trim,
+                reference_edge_trim=args.edge_trim,
 
             )
 
@@ -3939,52 +5405,205 @@ def main() -> int:
 
             if role == "child":
 
+                if args.edge_trim > 0 or args.pa_edge_distance > 0:
+
+                    try:
+
+                        query_bounds_by_source[path] = (
+
+                            query_bounds_for_vcf_samples(
+
+                                sample_names, query_lengths_by_sample, path
+
+                            )
+
+                        )
+
+                    except ValueError as error:
+
+                        parser.error(str(error))
+
                 child_headers[path] = headers
 
                 child_raw[path] = raw_rows
 
                 child_stats_by_source[path] = {
+
                     'vcf_records_scanned': scanned,
+
                     'records_excluded_missing_original_coordinates': missing_original,
+
+                    'records_excluded_missing_query_coordinates': 0,
+
+                    'records_excluded_edge_trim': 0,
+
+                    'records_excluded_reference_edge_trim': 0,
+
+                    'records_excluded_missing_reference_coverage': 0,
+
+                    'records_excluded_pa_edge': 0,
+
+                    'records_missing_pa_coordinates': 0,
+
                 }
 
             print(f"loaded_{role}_vcf\t{path}\tsamples={','.join(sample_names)}\tcarried_records={len(recs)}\treferenceCoverage_intervals={reference_coverage_count}", file=sys.stderr)
 
-    edge_trim_excluded_by_role = {"child": 0, "mother": 0, "father": 0}
+    if args.edge_trim > 0:
 
-    child_before_edges = Counter(rec.source for rec in role_records['child'])
+        missing_child_coverage_headers = [
+
+            path for path in args.child
+
+            if coverage_header_count_by_source.get(path, 0) == 0
+
+        ]
+
+        if missing_child_coverage_headers:
+
+            parser.error(
+
+                "--trim-edges reference-side filtering requires "
+
+                "##referenceCoverage header intervals in every child VCF; "
+
+                "missing in: " + ", ".join(missing_child_coverage_headers)
+
+            )
+
+    # --trim-edges is symmetric in separate-file mode: child calls must be in
+    # both the assembly-query core and the child's trimmed referenceCoverage core.
+    # Parental referenceCoverage was already trimmed while loading and therefore
+    # also affects the later parent-callability test.
+    edge_trim_excluded_by_role = {"child": 0}
+
+    reference_edge_excluded_child = 0
+
+    child_missing_query_coordinates = 0
+
+    child_missing_reference_coverage = 0
 
     if args.edge_trim > 0:
 
-        for role in ("child", "mother", "father"):
+        (
 
-            role_records[role], edge_trim_excluded_by_role[role] = filter_records_to_source_coverage(
+            role_records["child"],
 
-                role_records[role], coverage_by_source
+            edge_trim_excluded_by_role["child"],
+
+            child_missing_query_coordinates,
+
+        ) = filter_child_records_to_query_core(
+
+            role_records["child"], query_bounds_by_source, args.edge_trim,
+
+            stats_by_source=child_stats_by_source,
+
+        )
+
+        if child_missing_query_coordinates:
+
+            print(
+
+                "WARNING: excluded "
+
+                f"{child_missing_query_coordinates} child record(s) without "
+
+                "usable ASSEMBLYCONTIG/QUERYCOORD for edge trimming",
+
+                file=sys.stderr,
+
+            )
+
+    if args.edge_trim > 0:
+
+        (
+
+            role_records["child"],
+
+            reference_edge_excluded_child,
+
+            child_missing_reference_coverage,
+
+        ) = filter_child_records_to_reference_core(
+
+            role_records["child"],
+
+            coverage_by_source,
+
+            stats_by_source=child_stats_by_source,
+
+        )
+
+        edge_trim_excluded_by_role["child"] += reference_edge_excluded_child
+
+        if child_missing_reference_coverage:
+
+            print(
+
+                "WARNING: excluded "
+
+                f"{child_missing_reference_coverage} child record(s) without "
+
+                "usable child ##referenceCoverage for reference-side edge trimming",
+
+                file=sys.stderr,
+
+            )
+
+    # PA edge filtering remains CHILD ONLY. Mother/father records are not removed
+
+    # by PA metadata; their referenceCoverage has already been trimmed by
+
+    # --trim-edges during loading.
+
+    pa_edge_excluded_child = 0
+
+    pa_edge_missing_child = 0
+
+    if args.pa_edge_distance > 0:
+
+        (
+
+            role_records["child"],
+
+            pa_edge_excluded_child,
+
+            pa_edge_missing_child,
+
+        ) = filter_child_records_by_pa_edge(
+
+            role_records["child"],
+
+            query_bounds_by_source,
+
+            args.pa_edge_distance,
+
+            stats_by_source=child_stats_by_source,
+
+        )
+
+        if pa_edge_missing_child:
+
+            print(
+
+                "WARNING: retained "
+
+                f"{pa_edge_missing_child} child record(s) without fully usable "
+
+                "PA coordinates/LABEL_H for PA-edge filtering",
+
+                file=sys.stderr,
 
             )
 
     child_records_all = role_records["child"]
 
-    child_after_edges = Counter(rec.source for rec in child_records_all)
-    for path in args.child:
-        child_stats_by_source[path]['records_excluded_edge_trim'] = (
-            child_before_edges[path] - child_after_edges[path]
-        )
-
     mother_records = role_records["mother"]
 
     father_records = role_records["father"]
 
-    required_coverage_paths = (
-
-        list(args.child) + list(args.mother) + list(args.father)
-
-        if args.edge_trim > 0
-
-        else list(args.mother) + list(args.father)
-
-    )
+    required_coverage_paths = list(args.mother) + list(args.father)
 
     missing_coverage_headers = [
 
@@ -3998,17 +5617,11 @@ def main() -> int:
 
         parser.error(
 
-            (
+            "Separate-file parent-missing filtering requires "
 
-                "--trim-edges requires ##referenceCoverage header intervals in every child/mother/father VCF; missing in: "
+            "##referenceCoverage header intervals in every parental VCF; "
 
-                if args.edge_trim > 0
-
-                else "Separate-file parent-missing filtering requires ##referenceCoverage header intervals in every parental VCF; missing in: "
-
-            )
-
-            + ", ".join(missing_coverage_headers)
+            "missing in: " + ", ".join(missing_coverage_headers)
 
         )
 
@@ -4100,11 +5713,23 @@ def main() -> int:
 
         edge_trim_excluded_by_role=edge_trim_excluded_by_role,
 
+        reference_edge_excluded_child=reference_edge_excluded_child,
+
+        child_missing_reference_coverage=child_missing_reference_coverage,
+
+        pa_edge_distance_bp=args.pa_edge_distance,
+
+        pa_edge_excluded_child=pa_edge_excluded_child,
+
+        pa_edge_missing_child=pa_edge_missing_child,
+
         mom_hits=mom_hits,
 
         dad_hits=dad_hits,
 
         child_stats_by_source=child_stats_by_source,
+
+        query_paths=args.query_paths,
 
     ))
 

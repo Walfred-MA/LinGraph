@@ -159,6 +159,13 @@ SEPARATE_ADJACENT_INDELS = as_bool(VCF_RUN.get(
 SEPARATE_ADJACENT_INDELS_OPTION = (
     "--separate-adjacent-indels" if SEPARATE_ADJACENT_INDELS else ""
 )
+LOCUS_DUP_AS_INSERT = as_bool(VCF_RUN.get(
+    "locus_dup_as_insert", VCF_RUN.get("gene_dup_as_insert", True)
+))
+LOCUS_DUP_AS_INSERT_OPTION = (
+    "--locus-dup-as-insert"
+    if LOCUS_DUP_AS_INSERT else "--no-locus-dup-as-insert"
+)
 MERGE_MINSVSIZE = int(MERGE_RUN.get("minsvsize", 20))
 MERGE_MODE = MERGE_RUN.get("merge_mode", "svonly")
 MERGE_EMIT_SMALL = MERGE_MODE in ("all", "svindel")
@@ -169,6 +176,14 @@ MERGE_SEQUENCE_SIMILARITY = float(
     MERGE_RUN.get("sequence_similarity", 0.7)
 )
 MERGE_VAR_IN_INSERT = int(MERGE_RUN.get("var_in_insert", 100))
+KEEP_FULL_LOCUS_DUP_INSERTIONS = as_bool(MERGE_RUN.get(
+    "keep_full_locus_dup_insertions", False
+))
+MERGE_LOCUS_DUP_OPTION = (
+    "--keep-full-locus-dup-insertions"
+    if KEEP_FULL_LOCUS_DUP_INSERTIONS
+    else "--ignore-full-locus-dup-insertions"
+)
 MERGE_PROCESSES = int(RUN.get("merge_processes", min(16, SAMPLE_THREADS)))
 MERGE_CHR1_RESOURCE_MULTIPLIER = int(config.get(
     "merge_chr1_resource_multiplier", RUN.get("merge_chr1_resource_multiplier", 2)
@@ -661,6 +676,9 @@ rule fill_graphcigartoref_gaps_sample:
         genomeliftfix=str(
             SAMPLES_ROOT / "{sample}" / "{sample}.genomeliftfix.tsv"
         ),
+        pseudolinear=str(
+            SAMPLES_ROOT / "{sample}" / "{sample}.pseudolinear.tsv"
+        ),
     threads: 1 if SLURM_ENABLED else SAMPLE_THREADS
     resources:
         slurm_jobs=1 if SLURM_ENABLED else 0
@@ -676,6 +694,7 @@ rule fill_graphcigartoref_gaps_sample:
           --input {input.graphcigar:q} \
           --genomelift {input.genomelift:q} \
           --genomelift-fix-output {output.genomeliftfix:q} \
+          --pseudo-linear-output {output.pseudolinear:q} \
           --query-genome {wildcards.sample:q} \
           --fasta-query {input.query_fasta:q} \
           --reference {input.reference:q} --output {output.graphcigar:q} \
@@ -683,15 +702,18 @@ rule fill_graphcigartoref_gaps_sample:
           --processes {SAMPLE_THREADS}
         {WAIT_NONEMPTY} {output.graphcigar:q}
         test -s {output.genomeliftfix:q}
+        {WAIT_NONEMPTY} {output.pseudolinear:q}
         """
 
 
 rule graphreftovcf_sample:
     input:
         stage_config=VCF_CONFIG_PATH,
+        error_bed=([resolve_path(VCF_RUN['error_bed'])] if VCF_RUN.get('error_bed') else []),
         graphcigar=rules.fill_graphcigartoref_gaps_sample.output.graphcigar,
         genomelift=rules.genomelift_sample.output,
         genomeliftfix=rules.fill_graphcigartoref_gaps_sample.output.genomeliftfix,
+        pseudolinear=rules.fill_graphcigartoref_gaps_sample.output.pseudolinear,
         query_fasta=sample_fasta,
         query_fai=sample_fai,
         reference=ancient(RUN["reference_fasta"]),
@@ -709,6 +731,11 @@ rule graphreftovcf_sample:
             "--svcutoff {}".format(int(SV_ONLY_CUTOFF))
             if SV_ONLY_CUTOFF is not None else ""
         ),
+        error_bed=(
+            '--error-bed ' + shlex.quote(resolve_path(VCF_RUN['error_bed']))
+            if VCF_RUN.get('error_bed') else ''
+        ),
+        locus_dup_as_insert=LOCUS_DUP_AS_INSERT_OPTION,
         sequence_options=" ".join(
             option for option in (
                 "--seqcompress" if SEQCOMPRESS else "",
@@ -731,6 +758,9 @@ rule graphreftovcf_sample:
           --columns {wildcards.sample:q} --processes {SAMPLE_THREADS} \
           --format-processes {FORMAT_PROCESSES} \
           --edge-blackregion {EDGE_BLACKREGION} \
+          {params.error_bed} \
+          --pseudo-linear-assignments {input.pseudolinear:q} \
+          {params.locus_dup_as_insert} \
           {CONFLICT_POLICY_OPTION} \
           {VCF_REALIGNMENT_OPTION} \
           {SEPARATE_ADJACENT_INDELS_OPTION} \
@@ -792,7 +822,8 @@ if MERGE_MODE != "snp":
             {params.slurm} {PYTHON:q} {input.script:q} \
               -I {input.vcf_list:q} --stage scan \
               --shards-dir {MERGE_TMPDIR:q} --sv \
-              --processes {MERGE_SCAN_PROCESSES} {params.snps}
+              --processes {MERGE_SCAN_PROCESSES} \
+              {MERGE_LOCUS_DUP_OPTION} {params.snps}
             test -e {output.chroms:q}
             """
 
