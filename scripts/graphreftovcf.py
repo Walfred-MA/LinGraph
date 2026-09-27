@@ -23,6 +23,9 @@ conventions and conservative helper logic.
 from __future__ import annotations
 
 import argparse
+import csv
+from alignment_scoring import (AlignmentScoreComponents, alignment_score,
+                               alignment_score_components, cigar_score, MATCH_SCORE)
 import gc
 import gzip
 import heapq
@@ -46,6 +49,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, 
 
 from local_reference_templates import LocalTemplate, read_templates
 from graph_cigar_payloads import query_only_graph_cigar
+from query_error_bed import QueryErrorBed
 
 try:
     from ssw import AlignmentMgr  # type: ignore
@@ -76,7 +80,9 @@ SV_EVENT_FIELDS_LEGACY = (
 # displacement from the VCF row POS to this observation's actual reference
 # breakpoint.  It is emitted as its own FORMAT field rather than hidden in a
 # leading H chunk of EXTENDGRAPHCIGAR.
-SV_EVENT_FIELDS = SV_EVENT_FIELDS_LEGACY + ("TEMPLATEOFFSET",)
+SV_EVENT_FIELDS = SV_EVENT_FIELDS_LEGACY + (
+    "TEMPLATEOFFSET", "LIFTCATEGORY",
+)
 SNP_EVENT_FIELDS = (
     "GT", "TYPE", "SIZE", "BASE", "ASSEMBLYCONTIG", "QUERYCOORD",
     "ALLELENAME", "LABEL_H",
@@ -84,13 +90,13 @@ SNP_EVENT_FIELDS = (
 # Keep PA provenance as the final two external FORMAT fields so --noPAtag can
 # remove that suffix while retaining TEMPLATEOFFSET.
 SV_FORMAT_FIELDS = (
-    *SV_EVENT_FIELDS_LEGACY[:6], "TEMPLATEOFFSET",
+    *SV_EVENT_FIELDS_LEGACY[:6], "TEMPLATEOFFSET", "LIFTCATEGORY",
     *SV_EVENT_FIELDS_LEGACY[6:],
 )
 SNP_FORMAT_FIELDS = SNP_EVENT_FIELDS
 SV_FORMAT = ":".join(SV_FORMAT_FIELDS)
 SNP_FORMAT = ":".join(SNP_FORMAT_FIELDS)
-SV_FORMAT_BASE_FIELDS = SV_FORMAT_FIELDS[:7]
+SV_FORMAT_BASE_FIELDS = SV_FORMAT_FIELDS[:-2]
 SNP_FORMAT_BASE_FIELDS = SNP_FORMAT_FIELDS[:-2]
 SV_FORMAT_BASE = ":".join(SV_FORMAT_BASE_FIELDS)
 SNP_FORMAT_BASE = ":".join(SNP_FORMAT_BASE_FIELDS)
@@ -711,7 +717,12 @@ def read_liftover_coord_map(path: str, max_impute: int) -> Tuple[Dict[str, SeqRe
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split()
+            # GenomeLift is TSV and may contain empty metadata columns.
+            # Preserve them so fixed column numbers remain meaningful; retain
+            # whitespace-split compatibility for older hand-written maps.
+            parts = raw.rstrip("\r\n").split("\t")
+            if len(parts) == 1:
+                parts = line.split()
             if not parts:
                 continue
             name = parts[0]
@@ -742,8 +753,15 @@ def read_liftover_coord_map(path: str, max_impute: int) -> Tuple[Dict[str, SeqRe
             left_neighbor = ""
             right_neighbor = ""
             if len(parts) >= 3:
-                selected_left = part_value(parts[-2])
-                selected_right = part_value(parts[-1])
+                # GenomeLift's ownership extensions are columns 13/14.
+                # Sparse gap-fill overrides may append stage/class metadata;
+                # those trailing fields must never replace the extensions.
+                if len(parts) >= 14:
+                    selected_left = part_value(parts[12])
+                    selected_right = part_value(parts[13])
+                else:
+                    selected_left = part_value(parts[-2])
+                    selected_right = part_value(parts[-1])
                 if (
                     is_extension_token(selected_left)
                     and is_extension_token(selected_right)
@@ -1021,16 +1039,16 @@ def iter_top_level_chunks(encoded: str) -> Iterator[Tuple[str, str]]:
         i = j
 
 
-def main_path_affine_score_components(
+def main_path_alignment_score_components(
     chunks: Sequence[Tuple[str, str]],
-) -> Tuple[int, int, int, int]:
-    """Return M, X, gap-open, and gap-extension counts for the main path.
+) -> AlignmentScoreComponents:
+    """Return the standard score components for the main path.
 
     The first named graph-CIGAR chunk and subsequent pathless chunks form the
     main alignment.  Every later named chunk is a secondary/encoded traversal:
     its complete query span counts as insertion sequence on the main axis and
     its internal matches cannot improve the main-path score.  Hard clips are
-    coordinate padding and do not interrupt an adjacent affine gap.
+    coordinate padding and do not interrupt an adjacent gap.
     """
     scoring_ops: List[CigarOp] = []
     main_seen = False
@@ -1053,52 +1071,24 @@ def main_path_affine_score_components(
         elif main_seen:
             scoring_ops.extend(parse_pairwise_ops(text))
 
-    matches = 0
-    mismatches = 0
-    gap_opens = 0
-    gap_extensions = 0
-    active_gap = ""
-    for operation in scoring_ops:
-        if operation.n <= 0:
-            continue
-        if operation.op in {"I", "D"}:
-            if active_gap == operation.op:
-                gap_extensions += operation.n
-            else:
-                gap_opens += 1
-                gap_extensions += max(0, operation.n - 1)
-                active_gap = operation.op
-            continue
-        if operation.op == "H":
-            continue
-        active_gap = ""
-        if operation.op in {"=", "M"}:
-            matches += operation.n
-        elif operation.op == "X":
-            mismatches += operation.n
-    return matches, mismatches, gap_opens, gap_extensions
+    return alignment_score_components(scoring_ops)
 
 
-def infinite_fallback_alignment_score(encoded: str) -> int:
-    """Score a complete graph alignment for ``-inf`` ownership fallback.
+def main_path_affine_score_components(
+    chunks: Sequence[Tuple[str, str]],
+) -> Tuple[int, int, int, int]:
+    """Legacy raw-count API; n-1 extension counts are diagnostic only."""
+    value = main_path_alignment_score_components(chunks)
+    return value.matches, value.mismatches, value.gap_opens, value.gap_extensions
 
-    The score requested for choosing between overlapping unowned blocks is:
 
-        matched bases - 4 * number of insertion/deletion operations
-
-    Mismatch bases are neither matches nor insertion/deletion events. Indel
-    length is deliberately not charged a second time: one I or D CIGAR token
-    is one event regardless of the number of bases that token consumes.
-    """
-    score = 0
-    for _direction, text in iter_top_level_chunks(encoded or ""):
-        body = text.split(":", 1)[1] if ":" in text else text
-        for operation in parse_pairwise_ops(body):
-            if operation.op == "=":
-                score += operation.n
-            elif operation.op in {"I", "D"}:
-                score -= 4
-    return score
+def infinite_fallback_alignment_score(encoded: str) -> float:
+    """Standard complete-graph score for unowned-block selection."""
+    return alignment_score(
+        operation
+        for _direction, text in iter_top_level_chunks(encoded or "")
+        for operation in parse_pairwise_ops(text.split(":", 1)[-1])
+    )
 
 
 def graph_cigar_operation_count(chunks: Sequence[Tuple[str, str]]) -> int:
@@ -1141,6 +1131,38 @@ def terminal_main_indel_indexes(
 def terminal_main_insertion_indexes(chunks: Sequence[Tuple[str, str]]) -> set:
     # Compatibility name; callers now skip both types of terminal indel.
     return terminal_main_indel_indexes(chunks)
+
+
+def terminal_encoded_chunk_indexes(
+    chunks: Sequence[Tuple[str, str]], *, row_operation_count: Optional[int] = None,
+) -> set:
+    """Identify encoded insertions outside the main alignment's anchors.
+
+    Matches inside an insertion's template do not anchor that insertion to
+    the main reference. Keep the existing single-operation row exception,
+    including explicit insertion-only rows emitted by gap filling.
+    """
+    if row_operation_count is None:
+        row_operation_count = graph_cigar_operation_count(chunks)
+    if row_operation_count <= 1:
+        return set()
+    anchors = []
+    encoded = []
+    main_seen = False
+    for index, (_direction, text) in enumerate(chunks):
+        if ':' in text:
+            if main_seen:
+                encoded.append(index)
+                continue
+            main_seen = True
+        if main_seen and any(
+            op.n > 0 and op.op in {'=', 'M', 'X'}
+            for op in parse_pairwise_ops(text.split(':', 1)[-1])
+        ):
+            anchors.append(index)
+    if not anchors:
+        return set(encoded)
+    return {index for index in encoded if index < anchors[0] or index > anchors[-1]}
 
 
 def encoded_query_len(text: str) -> int:
@@ -1197,6 +1219,21 @@ def local_ref_to_genomic(ref_rec: SeqRecord, f0: int, f1: int) -> Tuple[int, int
     # Reference/path records may themselves have a genomic strand.  Convert
     # forward local offsets on that record to genomic coordinates.
     return ref_rec.genomic_interval_from_local(f0, f1)
+
+
+def validate_deletion_reference_interval(
+    ref_rec: SeqRecord, f0: int, f1: int, *, line_no: object, query: str,
+) -> None:
+    """Reject reference overruns before coordinate/fetch helpers clip them."""
+    start, end = sorted((int(f0), int(f1)))
+    length = ref_len_for_rec(ref_rec)
+    if not 0 <= start < end <= length:
+        raise ValueError(
+            f"line {line_no} query {query!r}: deletion interval on reference "
+            f"path {ref_rec.name!r} [{start}, {end}) is outside [0, {length}); "
+            "check the graph CIGAR and reference/template length; clipping "
+            "this interval would preserve an incorrect deletion size"
+        )
 
 
 def local_ref_point_to_genomic(ref_rec: SeqRecord, off: int) -> int:
@@ -1376,7 +1413,9 @@ def object_interval_is_owned(
     return None if intervals is None else bool(intervals)
 
 
-def label_for_object_interval(query_rec: SeqRecord, label_rec: SeqRecord, base_label: str, q0: int, q1: int, is_snp: bool, max_impute: int, bp_uncertain: int) -> str:
+def label_for_object_interval(query_rec: SeqRecord, label_rec: SeqRecord, base_label: str, q0: int, q1: int, is_snp: bool, max_impute: int, bp_uncertain: int, *, metadata_only: bool = False) -> str:
+    if metadata_only:
+        return base_label
     owned = object_interval_is_owned(query_rec, base_label, q0, q1)
     if owned is False:
         return ""
@@ -1412,6 +1451,9 @@ def score_merge_by_index(
 
     `isgap(x)` identifies background items.  Hits are variant tokens.  A merge
     boundary survives only if both left-to-right and right-to-left passes agree.
+    Background matches cost ``gap_penalty`` per base (default 4); mismatches
+    marked with ``op='X'`` cost -8 per base, supporting a merge.  Both still
+    count toward the hard background-distance limit.
     """
     if not items:
         return []
@@ -1429,7 +1471,8 @@ def score_merge_by_index(
             if isgap(x):
                 g = max(1, int(gap_size(x)))
                 consecutive_gap += g
-                score -= gap_penalty * g
+                cost = -8 if x.get("op") == "X" else gap_penalty
+                score -= cost * g
                 if score < 0 or consecutive_gap > gap_break:
                     score = 0
                     consecutive_gap = 0
@@ -1574,7 +1617,34 @@ class SVUnit:
     main_mismatch_bases: int = 0
     main_gap_opens: int = 0
     main_gap_extensions: int = 0
+    main_gap_lengths: Tuple[int, ...] = ()
     alternative_regions: Optional[Tuple[Tuple[str, int, int], ...]] = None
+    # Post-gapfill pseudo-linear provenance. PACLASS is a row-level INFO
+    # summary selected from the representative observation; LIFTCATEGORY is
+    # retained per observation in FORMAT.
+    pa_class: str = "primary"
+    liftover_category: str = "."
+    # True for a variant called against the template carried by an encoded
+    # insertion. Its reference coordinates are relative to that template,
+    # which is deliberately absent from the main-path pseudo-linear election.
+    source_relative: bool = False
+    # Nonempty only for parent calls made from the elected pseudo-linear map.
+    # Used to concatenate adjacent insertion pieces without PA conflict tests.
+    pseudolinear_strand: str = ""
+    # True for every call made from an elected pseudo-linear interval,
+    # including source-relative calls where pseudolinear_strand is empty.
+    pseudolinear: bool = False
+    # Query-to-source-locus CIGAR for a full-locus duplication parent.  Source-
+    # relative variants do not carry this field, which lets cohort merging
+    # omit the redundant parent while retaining variants on the source locus.
+    alternative_mapping_cigar: str = ""
+    alternative_mapping_source: str = ""
+    # Consecutive duplicated PAs (and an optional <5 kb unmapped interval)
+    # share one parent replacement event after all source rows are parsed.
+    pseudolinear_group: str = ""
+    pseudolinear_group_ref_start: int = -1
+    pseudolinear_group_ref_end: int = -1
+    pseudolinear_group_pa_class: str = "primary"
 
     @property
     def max_size(self) -> int:
@@ -1597,13 +1667,14 @@ class SVUnit:
         return self.ins_size - self.del_size
 
     @property
-    def main_alignment_score(self) -> int:
-        return (
-            self.main_match_bases
-            - 4 * self.main_mismatch_bases
-            - 4 * self.main_gap_opens
-            - self.main_gap_extensions
+    def main_alignment_score(self) -> float:
+        components = AlignmentScoreComponents(
+            self.main_match_bases, self.main_mismatch_bases, self.main_gap_lengths,
         )
+        if (components.gap_opens != self.main_gap_opens
+                or components.gap_extensions != self.main_gap_extensions):
+            raise ValueError('main-path scoring requires the original gap lengths')
+        return components.score
 
 
 @dataclass
@@ -1637,15 +1708,17 @@ class MainPathAlignmentEvidence:
     main_mismatch_bases: int = 0
     main_gap_opens: int = 0
     main_gap_extensions: int = 0
+    main_gap_lengths: Tuple[int, ...] = ()
 
     @property
-    def alignment_score(self) -> int:
-        return (
-            self.main_match_bases
-            - 4 * self.main_mismatch_bases
-            - 4 * self.main_gap_opens
-            - self.main_gap_extensions
+    def alignment_score(self) -> float:
+        components = AlignmentScoreComponents(
+            self.main_match_bases, self.main_mismatch_bases, self.main_gap_lengths,
         )
+        if (components.gap_opens != self.main_gap_opens
+                or components.gap_extensions != self.main_gap_extensions):
+            raise ValueError('main-path scoring requires the original gap lengths')
+        return components.score
 
 
 @dataclass
@@ -2000,7 +2073,7 @@ def label_for_query_interval(rec: SeqRecord, base_label: str, q0: int, q1: int, 
 # Per-line parser
 # ---------------------------------------------------------------------------
 
-def parse_graphcigartoref_row(line: str, line_no: int) -> Optional[dict]:
+def parse_graphcigartoref_row(line: str, line_no: int, error_regions=None) -> Optional[dict]:
     line = line.strip()
     if not line or line.startswith("#"):
         return None
@@ -2052,6 +2125,16 @@ def parse_graphcigartoref_row(line: str, line_no: int) -> Optional[dict]:
     else:
         row["labels"] = parts[2]
         row["encoded"] = normalize_encoded_cigar_text(parts[3])
+    if error_regions is not None:
+        coordinates = [parse_coord_token(token) for token in row['query_coord'].split(';')]
+        if any(coord is None for coord in coordinates):
+            raise ValueError(f"line {line_no}: invalid query coordinate for --error-bed: {row['query_coord']!r}")
+        if any(error_regions.overlaps(chrom, start, end)
+               for chrom, start, end, _strand in coordinates):
+            # Return metadata for sample inference, but do not inspect the
+            # excluded alignment or let it contribute calls/coverage/evidence.
+            row['error_bed_filtered'] = True
+            return row
     # Accept older gap/refinement output at the input boundary, then keep one
     # query-only convention for validation and variant calling. No alignment
     # or genomic coordinates change when dropping the reference half of X.
@@ -2219,7 +2302,7 @@ def resolve_infinite_fallback_candidates(
     competing_bases = 0
 
     for sample_contig, raw_candidates in candidates_by_sample_contig.items():
-        candidates: List[Tuple[int, int, int, str, int, bool]] = []
+        candidates: List[Tuple[int, int, float, str, int, bool]] = []
         for start, end, score, label, line_no in raw_candidates:
             if (
                 score >= MIN_INFINITE_FALLBACK_ALIGNMENT_SCORE
@@ -2259,7 +2342,7 @@ def resolve_infinite_fallback_candidates(
 
         active_ids = set()
         active_label_counts: Dict[str, int] = defaultdict(int)
-        score_heap: List[Tuple[int, int, str, int, int]] = []
+        score_heap: List[Tuple[float, int, str, int, int]] = []
         previous_coordinate: Optional[int] = None
         event_index = 0
 
@@ -2352,7 +2435,7 @@ def build_effective_interval_ownership(
     primary_by_label: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
     fallback_by_label: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
     infinite_by_sample_contig: Dict[
-        Tuple[str, str], List[Tuple[int, int, int, str, int]]
+        Tuple[str, str], List[Tuple[int, int, float, str, int]]
     ] = defaultdict(list)
     label_contig: Dict[str, str] = {}
     label_sample: Dict[str, str] = {}
@@ -2677,7 +2760,8 @@ def parse_hsv_allele(allele: str) -> Optional[List[str]]:
     """Parse one FORMAT/HSV allele while preserving ':' inside EXTENDGRAPHCIGAR.
 
     Internal SV format is
-    GT:TYPE:SIZE:CIGAR:assemblycontig:query_range:allelename:label_H:offset.
+    GT:TYPE:SIZE:CIGAR:assemblycontig:query_range:allelename:label_H:offset:
+    liftover_category.
     Legacy eight- and seven-field alleles are accepted and receive a missing
     TEMPLATEOFFSET (and, for seven fields, a missing LABEL_H).
     Encoded CIGAR chunks contain reference names like ``NC_060932.1:57561709...``,
@@ -2693,19 +2777,27 @@ def parse_hsv_allele(allele: str) -> Optional[List[str]]:
     if len(first) != 4:
         return None
     rest = first[3]
+    last_category = rest.rsplit(":", 6)
+    if (
+        len(last_category) == 7
+        and _looks_like_label_h_coord(last_category[-3])
+        and re.fullmatch(r"[+-]?\d+|\.", last_category[-2] or "")
+        and last_category[-1] in {"Pri", "Dup", "DivergeDup", "."}
+    ):
+        return first[:3] + last_category
     last_offset = rest.rsplit(":", 5)
     if (
         len(last_offset) == 6
         and _looks_like_label_h_coord(last_offset[-2])
         and re.fullmatch(r"[+-]?\d+|\.", last_offset[-1] or "")
     ):
-        return first[:3] + last_offset
+        return first[:3] + last_offset + ["."]
     last_new = rest.rsplit(":", 4)
     if len(last_new) == 5 and _looks_like_label_h_coord(last_new[-1]):
-        return first[:3] + last_new + ["."]
+        return first[:3] + last_new + [".", "."]
     last_old = rest.rsplit(":", 3)
     if len(last_old) == 4:
-        return first[:3] + last_old + [".", "."]
+        return first[:3] + last_old + [".", ".", "."]
     return None
 
 
@@ -2841,6 +2933,19 @@ def _add_coverage_span(spans: List[Tuple[str, str, int, int]], query_name: str, 
         g0, g1 = g1, g0
     if g1 == g0:
         g1 = g0 + 1
+    if spans:
+        previous_query, previous_contig, previous_start, previous_end = spans[-1]
+        if (
+            previous_query == query_name
+            and previous_contig == ref_rec.contig
+            and g0 <= previous_end
+            and previous_start <= g1
+        ):
+            spans[-1] = (
+                query_name, ref_rec.contig,
+                min(previous_start, g0), max(previous_end, g1),
+            )
+            return
     spans.append((query_name, ref_rec.contig, g0, g1))
 
 
@@ -2927,6 +3032,7 @@ def call_variants_inside_encoded_insertion(
     separate_adjacent_indels: bool = False,
     snps_only: bool = False,
     row_operation_count: Optional[int] = None,
+    pa_metadata_only: bool = False,
 ) -> Tuple[List[dict], List[SNPUnit], List[Tuple[str, str, int, int]]]:
     """Call additional variants inside one encoded insertion segment.
 
@@ -2959,15 +3065,16 @@ def call_variants_inside_encoded_insertion(
     qcur = 0
     rcur = 0
 
-    def add_gap(n: int, text: str):
+    def add_gap(n: int, op: str):
         if n > 0 and not snps_only:
-            stream.append({"kind": "gap", "text": text, "gap_len": n})
+            stream.append({"kind": "gap", "op": op, "text": f"{n}{op}", "gap_len": n})
 
     def add_variant(tok: dict):
         tok["idx"] = len(stream)
         stream.append(tok)
 
-    ignored_edges = terminal_indel_indexes(ops, row_operation_count=row_operation_count)
+    ignored_edges = (set() if pa_metadata_only else
+                     terminal_indel_indexes(ops, row_operation_count=row_operation_count))
     for index, op in enumerate(ops):
         if op.n <= 0 or op.op == 'H':
             continue
@@ -2978,7 +3085,7 @@ def call_variants_inside_encoded_insertion(
                 rcur += op.n
             continue
         if op.op in {"=", "M"}:
-            add_gap(op.n, f"{op.n}=")
+            add_gap(op.n, "=")
             rcur += op.n
             qcur += op.n
             continue
@@ -3010,8 +3117,8 @@ def call_variants_inside_encoded_insertion(
                     g0, g1 = g1, g0
                 q_local = parent_query_start + qcur + i
                 qg = query_rec.genomic_point_from_local(q_local)
-                label = label_for_object_interval(query_rec, label_rec, base_label, q_local, q_local + 1, True, max_impute, bp_uncertain)
-                if label:
+                label = label_for_object_interval(query_rec, label_rec, base_label, q_local, q_local + 1, True, max_impute, bp_uncertain, metadata_only=pa_metadata_only)
+                if label or pa_metadata_only:
                     nested_snps.append(SNPUnit(
                         query=query_rec.name,
                         sample=sample,
@@ -3029,7 +3136,7 @@ def call_variants_inside_encoded_insertion(
                         qry_local_start=q_local,
                         qry_local_end=q_local + 1,
                     ))
-            add_gap(op.n, f"{op.n}X")
+            add_gap(op.n, "X")
             rcur += op.n
             qcur += op.n
             continue
@@ -3038,6 +3145,9 @@ def call_variants_inside_encoded_insertion(
                 rcur += op.n
                 continue
             f0, f1 = segment_interval_to_forward(nested_ref_rec, direction, lead_h, trail_h, rcur, rcur + op.n)
+            validate_deletion_reference_interval(
+                nested_ref_rec, f0, f1, line_no=line_no, query=query_rec.name,
+            )
             lf0, lf1 = min(f0, f1), max(f0, f1)
             g0, g1 = local_ref_to_genomic(nested_ref_rec, lf0, lf1)
             if g1 < g0:
@@ -3108,7 +3218,7 @@ def call_variants_inside_encoded_insertion(
             qcur += op.n
             continue
         if op.op == "S":
-            add_gap(op.n, f"{op.n}S")
+            add_gap(op.n, "S")
             qcur += op.n
 
     if snps_only:
@@ -3158,8 +3268,8 @@ def call_variants_inside_encoded_insertion(
             event_cigar = _plain_cigar_body_from_items(span_items, direction)
         if ins_size <= 0 and del_size <= 0:
             continue
-        label = label_for_object_interval(query_rec, label_rec, base_label, qloc0, qloc1, False, max_impute, bp_uncertain)
-        if not label:
+        label = label_for_object_interval(query_rec, label_rec, base_label, qloc0, qloc1, False, max_impute, bp_uncertain, metadata_only=pa_metadata_only)
+        if not label and not pa_metadata_only:
             continue
         label_h = format_label_h_span(query_rec, label_rec, qloc0, qloc1)
         qg0, qg1 = query_rec.genomic_interval_from_local(qloc0, qloc1)
@@ -3210,9 +3320,11 @@ def parse_row_events(
     separate_adjacent_indels: bool = False,
     call_insertion_snps: bool = True,
 ) -> RowParseResult:
+    pa_metadata_only = bool(row.get("pseudolinear"))
     query_name = row["query"]
-    source_rec = resolve_record(query_name, sequence_lookup) or resolve_record(query_name, query_lookup)
-    base_label = first_label_token(row.get("labels", "")) or query_name
+    source_rec = row.get("sequence_record") or resolve_record(query_name, sequence_lookup) or resolve_record(query_name, query_lookup)
+    base_label = (row.get("pa_label", "") if pa_metadata_only else
+                  first_label_token(row.get("labels", "")) or query_name)
     synthetic_reference_deletion = (
         query_name.startswith("DEL") and base_label == "DEL"
     )
@@ -3332,7 +3444,7 @@ def parse_row_events(
         right_neighbor=label_meta.right_neighbor,
         source="input_label+coord_map",
     )
-    sample = get_event_haplotype(query_name, base_label)
+    sample = get_event_haplotype(query_name, '' if pa_metadata_only else base_label)
 
     encoded_row = drop_empty_encoded_segments(row.get("encoded", ""))
     if strict:
@@ -3363,6 +3475,14 @@ def parse_row_events(
     ignore_terminal_indels = terminal_main_indel_indexes(
         chunks, row_operation_count=row_operation_count,
     )
+    ignore_terminal_encoded = terminal_encoded_chunk_indexes(
+        chunks, row_operation_count=row_operation_count,
+    )
+    if pa_metadata_only:
+        # Assignment boundaries have already been resolved on the complete
+        # query/reference map. A source PA's edge is no longer a call filter.
+        ignore_terminal_indels = set()
+        ignore_terminal_encoded = set()
     main_op_index = 0
     first_named_seen = False
     # We need the full main op list only for lead/trail H.  It is safe to collect
@@ -3385,7 +3505,7 @@ def parse_row_events(
         reference_start_local: int,
     ) -> None:
         """Add only reference spans whose equal-length query bases are owned."""
-        owned = owned_object_local_intervals(
+        owned = None if pa_metadata_only else owned_object_local_intervals(
             query_rec, base_label, query_start_local, query_end_local,
         )
         if owned is None:
@@ -3411,10 +3531,10 @@ def parse_row_events(
                 forward_end,
             )
 
-    def add_gap(n: int, text: str):
+    def add_gap(n: int, op: str):
         if n <= 0:
             return
-        stream.append({"kind": "gap", "text": text, "gap_len": n})
+        stream.append({"kind": "gap", "op": op, "text": f"{n}{op}", "gap_len": n})
 
     def add_variant(tok: dict):
         tok["idx"] = len(stream)
@@ -3439,7 +3559,7 @@ def parse_row_events(
                 continue
             if op.op in {"=", "M"}:
                 add_owned_match_coverage(qpos, qpos + op.n, rpos)
-                add_gap(op.n, f"{op.n}=")
+                add_gap(op.n, "=")
                 rpos += op.n
                 qpos += op.n
             elif op.op == "X":
@@ -3460,8 +3580,8 @@ def parse_row_events(
                     if rb != qb:
                         g0, g1 = local_ref_to_genomic(ref_rec, min(fbase0, fbase1), max(fbase0, fbase1))
                         qg = query_rec.genomic_point_from_local(qpos + i)
-                        label = label_for_object_interval(query_rec, label_rec, base_label, qpos + i, qpos + i + 1, True, max_impute, bp_uncertain)
-                        if label:
+                        label = label_for_object_interval(query_rec, label_rec, base_label, qpos + i, qpos + i + 1, True, max_impute, bp_uncertain, metadata_only=pa_metadata_only)
+                        if label or pa_metadata_only:
                             snps.append(SNPUnit(
                                 query=query_rec.name,
                                 sample=sample,
@@ -3478,17 +3598,24 @@ def parse_row_events(
                                 qry_local_start=qpos + i,
                                 qry_local_end=qpos + i + 1,
                             ))
-                add_gap(op.n, f"{op.n}X")
+                add_gap(op.n, "X")
                 rpos += op.n
                 qpos += op.n
             elif op.op == "D":
                 f0, f1 = segment_interval_to_forward(ref_rec, direction, lead_h, trail_h, rpos, rpos + op.n)
+                validate_deletion_reference_interval(
+                    ref_rec, f0, f1, line_no=row.get('line_no', '.'),
+                    query=query_rec.name,
+                )
                 # A bracketed reference-only row emitted by
                 # graphcigartoref_persample is an explicit absence call, not
                 # evidence that the sample covers the deleted reference span.
                 deletion_owned = object_interval_is_owned(
                     query_rec, base_label, qpos, qpos,
                 )
+                # In pseudo-linear mode a D reaches this caller only inside an
+                # elected interval, so it is a called absence: count its
+                # reference span as coverage, as for ordinary rows.
                 if (
                     not synthetic_reference_deletion
                     and deletion_owned is not False
@@ -3561,11 +3688,11 @@ def parse_row_events(
                 qpos += op.n
             elif op.op == "S":
                 # Soft clips are row-local sequence context, not SV calls.
-                add_gap(op.n, f"{op.n}S")
+                add_gap(op.n, "S")
                 qpos += op.n
 
     first_named_seen = False
-    for d, text in chunks:
+    for chunk_index, (d, text) in enumerate(chunks):
         if ":" in text:
             name, body = text.split(":", 1)
             if not first_named_seen:
@@ -3582,6 +3709,13 @@ def parse_row_events(
                     if operation.op in QUERY_OPS
                 )
                 if qlen <= 0:
+                    continue
+                if chunk_index in ignore_terminal_encoded:
+                    # This row ends/starts inside an insertion. Its template
+                    # matches cannot establish the missing main-reference
+                    # flank. Consume the query but emit neither a partial
+                    # parent insertion nor orphaned nested calls.
+                    qpos += qlen
                     continue
                 raw = source_rec.fetch_local(qpos, qpos + qlen)
                 if len(raw) != qlen:
@@ -3620,6 +3754,7 @@ def parse_row_events(
                         separate_adjacent_indels=separate_adjacent_indels,
                         snps_only=var_in_insert_min_bp <= 0,
                         row_operation_count=row_operation_count,
+                        pa_metadata_only=pa_metadata_only,
                     )
                     nested_sv_candidates.extend(n_svs)
                     if call_insertion_snps:
@@ -3708,9 +3843,10 @@ def parse_row_events(
             else label_for_object_interval(
                 query_rec, label_rec, base_label, qloc0, qloc1,
                 False, max_impute, bp_uncertain,
+                metadata_only=pa_metadata_only,
             )
         )
-        if not label:
+        if not label and not pa_metadata_only:
             continue
         label_h = (
             "0H_0H"
@@ -3812,6 +3948,7 @@ def parse_row_events(
             line_no=row.get("line_no", 0),
             qry_local_start=int(cand.get("qry_local_start", -1)),
             qry_local_end=int(cand.get("qry_local_end", -1)),
+            source_relative=True,
         )
         if has_non_acgt(nested_unit.raw_ins_seq) or cigar_has_non_acgt_in_iops(nested_unit.cigar):
             filtered_spans.append((
@@ -3827,7 +3964,7 @@ def parse_row_events(
     svs.extend(accepted_nested)
 
     edge_filtered_events = 0
-    edge_blackregion = max(0, int(edge_blackregion))
+    edge_blackregion = 0 if pa_metadata_only else max(0, int(edge_blackregion))
     if edge_blackregion:
         retained_svs: List[SVUnit] = []
         for sv in svs:
@@ -3902,20 +4039,19 @@ def parse_row_events(
 
     main_path_evidence: List[MainPathAlignmentEvidence] = []
     if score_main_alignment:
-        matches, mismatches, gap_opens, gap_extensions = (
-            main_path_affine_score_components(chunks)
-        )
+        components = main_path_alignment_score_components(chunks)
         evidence = MainPathAlignmentEvidence(
             query=query_rec.name,
             sample=sample,
             allele_name=base_label,
             qry_contig=query_rec.contig,
-            main_match_bases=matches,
+            main_match_bases=components.matches,
             complete_query_length=max(0, int(query_rec.seqlen)),
             line_no=int(row.get("line_no", 0)),
-            main_mismatch_bases=mismatches,
-            main_gap_opens=gap_opens,
-            main_gap_extensions=gap_extensions,
+            main_mismatch_bases=components.mismatches,
+            main_gap_opens=components.gap_opens,
+            main_gap_extensions=components.gap_extensions,
+            main_gap_lengths=components.gap_lengths,
         )
         main_path_evidence.append(evidence)
         for sv in svs:
@@ -3924,6 +4060,7 @@ def parse_row_events(
             sv.main_mismatch_bases = evidence.main_mismatch_bases
             sv.main_gap_opens = evidence.main_gap_opens
             sv.main_gap_extensions = evidence.main_gap_extensions
+            sv.main_gap_lengths = evidence.main_gap_lengths
 
     from alternative_intervals import filter_result
     return filter_result(RowParseResult(
@@ -4076,6 +4213,7 @@ def _event_main_path_evidence(
         main_mismatch_bases=max(0, int(sv.main_mismatch_bases)),
         main_gap_opens=max(0, int(sv.main_gap_opens)),
         main_gap_extensions=max(0, int(sv.main_gap_extensions)),
+        main_gap_lengths=sv.main_gap_lengths,
     )
 
 
@@ -4083,7 +4221,7 @@ def _compare_main_path_evidence(
     left: MainPathAlignmentEvidence,
     right: MainPathAlignmentEvidence,
 ) -> int:
-    """Compare affine score, matched bases, then earlier input row."""
+    """Compare standard alignment score, matched bases, then earlier input row."""
     if left.alignment_score != right.alignment_score:
         return 1 if left.alignment_score > right.alignment_score else -1
     if left.main_match_bases != right.main_match_bases:
@@ -4091,6 +4229,25 @@ def _compare_main_path_evidence(
     if left.line_no != right.line_no:
         return 1 if left.line_no < right.line_no else -1
     return 0
+
+
+def _shared_ownership_alignment(
+    left: MainPathAlignmentEvidence,
+    right: MainPathAlignmentEvidence,
+) -> bool:
+    """Identify ownership views of one physical merged input alignment.
+
+    Equal scores alone are insufficient: independent alignments must retain
+    normal conflict resolution. Expansion preserves the source row, composite
+    query name and scoring evidence, changing only the ownership allele.
+    """
+    labels = set(left.query.split(';'))
+    return (
+        left.line_no > 0
+        and left.allele_name != right.allele_name
+        and left.allele_name in labels and right.allele_name in labels
+        and replace(left, allele_name=right.allele_name) == right
+    )
 
 
 def _alignment_score_detail(evidence: MainPathAlignmentEvidence) -> str:
@@ -4322,7 +4479,7 @@ def validate_cross_graph_svs(
     assembled across its rows.  Singleton or inconsistent ``*`` groups are
     removed exactly as in graphvcfmerge.py unless score resolution is
     explicitly enabled.  In score mode, one conflicting PA survives only if
-    it is strictly better than every opposing PA after affine score, matched
+    it is strictly better than every opposing PA after standard alignment score, matched
     bases, and input-order tie breaking.
     """
     output = [sv for sv in svs if "*" not in (sv.label or "")]
@@ -4415,12 +4572,19 @@ def validate_cross_graph_svs(
                         best_evidence = evidence
 
                 opponent_evidence: List[MainPathAlignmentEvidence] = []
+                shared_evidence: List[MainPathAlignmentEvidence] = []
+                missing_opponent = False
                 seen_opponents = set()
 
                 def add_opponent(
                     evidence: Optional[MainPathAlignmentEvidence],
                 ) -> None:
+                    nonlocal missing_opponent
                     if evidence is None:
+                        missing_opponent = True
+                        return
+                    if _shared_ownership_alignment(best_evidence, evidence):
+                        shared_evidence.append(evidence)
                         return
                     identity = (
                         evidence.query,
@@ -4430,6 +4594,7 @@ def validate_cross_graph_svs(
                         evidence.main_mismatch_bases,
                         evidence.main_gap_opens,
                         evidence.main_gap_extensions,
+                        evidence.main_gap_lengths,
                     )
                     if identity in seen_opponents:
                         return
@@ -4451,7 +4616,10 @@ def validate_cross_graph_svs(
 
                 score_winner = (
                     resolve_conflicts_by_alignment_score
-                    and bool(opponent_evidence)
+                    and (
+                        bool(opponent_evidence)
+                        or (bool(shared_evidence) and not missing_opponent)
+                    )
                     and all(
                         _compare_main_path_evidence(
                             best_evidence, opponent,
@@ -4462,6 +4630,8 @@ def validate_cross_graph_svs(
                 if score_winner:
                     reason = (
                         f"{base_reason}_resolved_by_main_alignment_score"
+                        if opponent_evidence else
+                        f"{base_reason}_resolved_by_shared_alignment"
                     )
                     best_member.sv.label = (
                         best_member.first_label
@@ -4634,7 +4804,7 @@ def write_cross_graph_inconsistency_report(
         "source_line", "query_record", "variant_name", "allele_name",
         "main_path_matched_bases", "complete_row_query_length",
         "main_path_mismatch_bases", "main_path_gap_opens",
-        "main_path_gap_extensions", "main_path_alignment_score",
+        "main_path_gap_extensions", "main_path_gap_extension_penalty", "main_path_alignment_score",
         "selected_variant_names", "selected_alignment_scores",
         "rejected_variant_names", "rejected_alignment_scores",
         "variant_type", "variant_size", "insertion_size", "deletion_size",
@@ -4666,6 +4836,10 @@ def write_cross_graph_inconsistency_report(
                         sv.allelename, sv.main_match_bases,
                         sv.complete_query_length, sv.main_mismatch_bases,
                         sv.main_gap_opens, sv.main_gap_extensions,
+                        AlignmentScoreComponents(
+                            sv.main_match_bases, sv.main_mismatch_bases,
+                            sv.main_gap_lengths,
+                        ).extension_penalty,
                         sv.main_alignment_score,
                         "&".join(group.selected_variant_names) or ".",
                         ";".join(group.selected_alignment_scores) or ".",
@@ -5121,7 +5295,23 @@ def insertion_sequence_target(
     local_end = int(sv.qry_local_end)
     direction = ">"
     sequence = ""
-    if (
+    if sv.pseudolinear:
+        # qry_local_* is relative to the elected interval view, whereas
+        # resolve_record(sv.query) normally returns the complete source row.
+        # Use the genomic QUERYCOORD span to select and offset the covering
+        # assembly record.
+        sequence, rec, local_start, local_end, requested_strand = (
+            fetch_allele_query_sequence_with_record(
+                [
+                    "", "", "", "", vcf_escape(sv.qry_contig),
+                    format_query_range(sv),
+                ],
+                query_lookup,
+            )
+        )
+        if rec is not None and rec.strand != requested_strand:
+            direction = "<"
+    elif (
         rec is not None
         and local_start >= 0
         and local_end > local_start
@@ -5317,6 +5507,7 @@ def format_sv_sample_event(
         vcf_escape(sv.label),
         vcf_escape(sv.label_h),
         str(template_offset),
+        sv.liftover_category or ".",
     ])
 
 
@@ -5380,6 +5571,52 @@ def write_reference_coverage_header(handle, sample_names, reference_coverage_map
                 )
 
 
+def _pseudolinear_interval_text(row: Mapping[str, object], prefix: str) -> str:
+    path_key = "query_contig" if prefix == "query" else f"{prefix}_path"
+    path = row.get(path_key)
+    start = row.get(f"{prefix}_start")
+    end = row.get(f"{prefix}_end")
+    if path in {None, "", "."} or not isinstance(start, int) or not isinstance(end, int):
+        return "."
+    strand = "-" if row.get(f"{prefix}_strand") in {"-", "<"} else "+"
+    return f"{path}:{start}-{end}{strand}"
+
+
+def write_pseudolinear_mapping_header(
+    handle, indexed_assignments, sample_names: Sequence[str],
+) -> None:
+    """Write the elected query-to-reference map as compact VCF metadata."""
+    if not indexed_assignments:
+        return
+    handle.write("##pseudoLinearMappingCoordinateSystem=0-based-half-open\n")
+    for rows in indexed_assignments.values():
+        for row in rows:
+            query = _pseudolinear_interval_text(row, "query")
+            category = str(row.get("kind") or ".")
+            sample = get_event_haplotype(
+                str(row.get("pa_name") or ""),
+                str(row.get("pa_name") or ""),
+            )
+            if len(sample_names) == 1:
+                sample = sample_names[0]
+            elif sample not in sample_names:
+                sample = "."
+            references = [_pseudolinear_interval_text(row, "reference")]
+            alternative = _pseudolinear_interval_text(row, "alternative")
+            if alternative != ".":
+                # For locus duplications the insertion coordinate is emitted
+                # first, immediately followed by its mapped source interval.
+                references.append(alternative)
+            for reference in references:
+                handle.write(
+                    "##pseudoLinearMapping=<"
+                    f"Sample={_vcf_meta_quote(sample)},"
+                    f"Query={_vcf_meta_quote(query)},"
+                    f"Reference={_vcf_meta_quote(reference)},"
+                    f"Category={_vcf_meta_quote(category)}>\n"
+                )
+
+
 def write_vcf_header(
     handle,
     sample_names: Sequence[str],
@@ -5390,6 +5627,7 @@ def write_vcf_header(
     reference_contigs: Sequence[Tuple[str, int]] = (),
     local_template_coordinates: bool = False,
     local_templates: Sequence[LocalTemplate] = (),
+    pseudolinear_assignments=None,
 ):
     handle.write("##fileformat=VCFv4.2\n")
     handle.write("##source=refexalign_vcf_rewrite.py\n")
@@ -5408,6 +5646,9 @@ def write_vcf_header(
         f"{max(0, int(edge_blackregion))}\n"
     )
     handle.write("##localBlockContributorSeparator=&\n")
+    write_pseudolinear_mapping_header(
+        handle, pseudolinear_assignments, sample_names,
+    )
     local_template_contigs: List[Tuple[str, int]] = []
     if local_template_coordinates or local_templates:
         handle.write("##referenceFreeLocalTemplateFallback=true\n")
@@ -5449,14 +5690,16 @@ def write_vcf_header(
         seen_contigs.add(contig)
         handle.write(f"##contig=<ID={contig},length={int(length)}>\n")
     handle.write('##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Structural variant type">\n')
-    handle.write('##INFO=<ID=END,Number=1,Type=Integer,Description="End coordinate, 1-based inclusive for symbolic alleles">\n')
-    handle.write('##INFO=<ID=NSUP,Number=1,Type=Integer,Description="Number of samples/haplotypes with a valid variant label">\n')
+    handle.write('##INFO=<ID=END,Number=1,Type=Integer,Description="End coordinate, 1-based inclusive for symbolic alleles; for a bracketed insertion, the second supported reference anchor">\n')
+    handle.write('##INFO=<ID=NSUP,Number=1,Type=Integer,Description="Number of samples/haplotypes supporting the variant">\n')
     handle.write('##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="Representative signed length: insertion positive, deletion negative">\n')
     handle.write('##INFO=<ID=MAXSIZE,Number=1,Type=Integer,Description="Maximum insertion/deletion component size among cluster members">\n')
     handle.write('##INFO=<ID=CIGAR,Number=1,Type=String,Description="Representative EXTENDGRAPHCIGAR with payloads; large alleles prefer encoded representatives when available">\n')
     handle.write('##INFO=<ID=SVINSSEQ,Number=1,Type=String,Description="Complete representative inserted sequence; required for every allele with an inserted component">\n')
     handle.write('##INFO=<ID=SVDELSEQ,Number=1,Type=String,Description="Representative deleted reference sequence for alleles with deleted component <=500 bp, otherwise .">\n')
     handle.write('##INFO=<ID=QUERYSEQ,Number=1,Type=String,Description="VCF-escaped representative query contig and 0-based query coordinate or range with strand, separated by |">\n')
+    handle.write('##INFO=<ID=PACLASS,Number=1,Type=String,Description="Pseudo-linear assignment class of the representative observation: primary or fulllocusdup">\n')
+    handle.write('##INFO=<ID=ALTERNATIVECIGAR,Number=1,Type=String,Description="Query-to-source-locus alignment CIGAR for a full-locus duplication insertion; adjacent elected pieces are joined by &">\n')
     handle.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Haploid genotype: 1 variant, 0 callable reference, . no call">\n')
     handle.write('##FORMAT=<ID=TYPE,Number=.,Type=String,Description="Per-observation variant type">\n')
     handle.write('##FORMAT=<ID=SIZE,Number=.,Type=Integer,Description="Per-observation signed variant size">\n')
@@ -5465,6 +5708,7 @@ def write_vcf_header(
     handle.write('##FORMAT=<ID=ASSEMBLYCONTIG,Number=.,Type=String,Description="Per-observation assembly contig">\n')
     handle.write('##FORMAT=<ID=QUERYCOORD,Number=.,Type=String,Description="Per-observation 0-based query coordinate or range with strand">\n')
     handle.write('##FORMAT=<ID=TEMPLATEOFFSET,Number=.,Type=Integer,Description="Signed displacement from the VCF row POS to the observation breakpoint">\n')
+    handle.write('##FORMAT=<ID=LIFTCATEGORY,Number=.,Type=String,Description="Per-observation GenomeLift category: Pri (types 1/2), Dup (type 3), DivergeDup (type 4), or .">\n')
     handle.write('##FORMAT=<ID=ALLELENAME,Number=.,Type=String,Description="Per-observation allele name; cross-graph contributors are joined by &">\n')
     handle.write('##FORMAT=<ID=LABEL_H,Number=.,Type=String,Description="Per-observation PA-relative label coordinate; cross-graph contributors are joined by &">\n')
     handle.write('##FORMAT=<ID=HSV,Number=1,Type=String,Description="Legacy escaped structural-variant sample payload accepted by downstream readers">\n')
@@ -5537,8 +5781,7 @@ def sv_cluster_to_row(
     alt = f"<{svtype}>"
     event_by_sample: Dict[str, List[SVUnit]] = defaultdict(list)
     for m in members:
-        if m.label:
-            event_by_sample[m.sample].append(m)
+        event_by_sample[m.sample].append(m)
     nsup = len(event_by_sample)
     if nsup == 0:
         return None
@@ -5602,7 +5845,13 @@ def sv_cluster_to_row(
         f"CIGAR={info_cigar}",
         f"SVINSSEQ={vcf_escape(svinsseq)}",
         f"SVDELSEQ={vcf_escape(svdelseq)}",
+        f"PACLASS={rep.pa_class or 'primary'}",
     ]
+    if rep.alternative_mapping_cigar:
+        info_parts.append(
+            "ALTERNATIVECIGAR="
+            f"{vcf_escape(rep.alternative_mapping_cigar)}"
+        )
     if queryseq_coord:
         info_parts.append(f"QUERYSEQ={queryseq_coord}")
     sample_fields: List[str] = []
@@ -5644,8 +5893,7 @@ def snp_cluster_to_row(key: Tuple[str, int, str, str], members: List[SNPUnit], s
     chrom, pos0, ref, alt = key
     event_by_sample: Dict[str, List[SNPUnit]] = defaultdict(list)
     for m in members:
-        if m.label:
-            event_by_sample[m.sample].append(m)
+        event_by_sample[m.sample].append(m)
     nsup = len(event_by_sample)
     if nsup == 0:
         return None
@@ -6244,6 +6492,9 @@ def ssw_local_align(query_seq: str, target_seq: str) -> Optional[dict]:
     t_sub = target_seq[t0:t1]
     body = cigarextend(cigar, t_sub, q_sub)
     aligned, sim = summarize_extend_body(body)
+    score = cigar_score(body)
+    if score <= 0:
+        return None
     return {
         "q0": q0,
         "q1": q1,
@@ -6258,48 +6509,14 @@ def ssw_local_align(query_seq: str, target_seq: str) -> Optional[dict]:
 
 
 def minimap2_local_align(query_seq: str, target_seq: str) -> Optional[dict]:
-    """Local align query to target using mappy (minimap2 Python bindings).
-
-    Used for sequences > 1000 bp where SSW O(m*n) DP is too slow.
-    Returns the same dict format as ssw_local_align.
-    """
+    """Rank forward local candidates using the standard alignment score."""
     if mappy is None or not query_seq or not target_seq:
         return None
     try:
         aligner = mappy.Aligner(seq=target_seq, preset="asm10", best_n=1)
-    except Exception as exc:
+    except Exception:
         return None
-    hit = None
-    for h in aligner.map(query_seq):
-        hit = h
-        break
-    if hit is None:
-        return None
-    q0 = int(hit.q_st)
-    q1 = int(hit.q_en)
-    t0 = int(hit.r_st)
-    t1 = int(hit.r_en)
-    cigar = hit.cigar_str
-
-    if not cigar or q1 <= q0 or t1 <= t0:
-        return None
-    q_sub = query_seq[q0:q1]
-    t_sub = target_seq[t0:t1]
-    
-    body = cigarextend(cigar, t_sub, q_sub)
-    aligned, sim = summarize_extend_body(body)
-    score = float(hit.mlen)
-    return {
-        "q0": q0,
-        "q1": q1,
-        "target_t0": t0,
-        "target_t1": t1,
-        "cigar": cigar,
-        "body": body,
-        "score": score,
-        "aligned": aligned,
-        "similarity": sim,
-    }
+    return _minimap2_insertion_alignment(query_seq, target_seq, aligner=aligner)
 
 
 def _minimap2_insertion_alignment(
@@ -6345,7 +6562,7 @@ def _minimap2_insertion_alignment(
                 "target_t1": t1,
                 "cigar": cigar,
                 "body": body,
-                "score": float(getattr(hit, "mlen", aligned)),
+                "score": cigar_score(body),
                 "aligned": aligned,
                 "similarity": similarity,
                 "mapq": int(getattr(hit, "mapq", 0)),
@@ -6357,10 +6574,10 @@ def _minimap2_insertion_alignment(
     return max(
         candidates,
         key=lambda value: (
+            float(value["score"]),
             int(value["aligned"]),
             float(value["similarity"]),
             int(value["mapq"]),
-            float(value["score"]),
         ),
     )
 
@@ -6858,7 +7075,7 @@ def segmented_encode_raw_insertion(raw_seq: str, encoded_locs: Sequence[dict], r
         if loc.get("seq"):
             targets.append(loc)
     if not targets and raw_target_seq:
-        targets.append({"kind": "raw", "seq": raw_target_seq, "score": len(raw_target_seq)})
+        targets.append({"kind": "raw", "seq": raw_target_seq, "score": MATCH_SCORE * len(raw_target_seq)})
 
     if not targets:
         return ""
@@ -6991,9 +7208,16 @@ def _best_encoded_for_allele(
 # ---------------------------------------------------------------------------
 
 
-# Interval index: contig/allelename → all SeqRecords for that contig, for
-# covering-range lookup when multiple FASTA segments share the same contig name.
-_QUERY_INTERVAL_INDEX: Dict[str, List[SeqRecord]] = {}
+@dataclass(frozen=True)
+class _ContigIntervalBucket:
+    records: Tuple[SeqRecord, ...]
+    starts: Tuple[int, ...]
+    prefix_max_ends: Tuple[int, ...]
+
+
+# Interval index: contig/allelename → start-sorted SeqRecords. Prefix maximum
+# ends let a covering lookup stop before scanning every record on the contig.
+_QUERY_INTERVAL_INDEX: Dict[str, _ContigIntervalBucket] = {}
 # The lookup dict _QUERY_INTERVAL_INDEX was built from.  When a caller passes
 # this exact dict, the index provably contains every record the covering-record
 # acceptance check could match, so the O(n) fallback scan can be skipped.
@@ -7001,13 +7225,15 @@ _QUERY_INTERVAL_INDEX_SOURCE: Optional[Dict[str, SeqRecord]] = None
 _REENCODE_WORKER_CONTEXT = {}
 
 
-def build_contig_interval_index(lookup: Dict[str, SeqRecord]) -> Dict[str, List[SeqRecord]]:
+def build_contig_interval_index(
+    lookup: Dict[str, SeqRecord],
+) -> Dict[str, _ContigIntervalBucket]:
     """Build contig→[SeqRecord, ...] index over all records in lookup.
 
     Used to find a specific FASTA segment that fully covers a requested
     genomic range when multiple segments share the same contig/allelename.
     """
-    index: Dict[str, List[SeqRecord]] = {}
+    grouped: Dict[str, List[SeqRecord]] = {}
     seen: set = set()
     for rec in lookup.values():
         rid = id(rec)
@@ -7016,7 +7242,19 @@ def build_contig_interval_index(lookup: Dict[str, SeqRecord]) -> Dict[str, List[
         seen.add(rid)
         for key in {rec.name, strip_match_name(rec.name), rec.contig, strip_match_name(rec.contig), rec.allelename, strip_match_name(rec.allelename)}:
             if key:
-                index.setdefault(key, []).append(rec)
+                grouped.setdefault(key, []).append(rec)
+    index = {}
+    for key, records in grouped.items():
+        records.sort(key=lambda rec: (rec.start, rec.end, rec.name))
+        prefix_max_ends = []
+        furthest = -1
+        for rec in records:
+            furthest = max(furthest, rec.end)
+            prefix_max_ends.append(furthest)
+        index[key] = _ContigIntervalBucket(
+            tuple(records), tuple(rec.start for rec in records),
+            tuple(prefix_max_ends),
+        )
     return index
 
 
@@ -7062,8 +7300,15 @@ def _find_covering_record(contig: str, g0: int, g1: int, lookup: Dict[str, SeqRe
 
     # Header-index path: contig/name/allelename -> all candidate FASTA intervals.
     for key in {contig, strip_match_name(contig)}:
-        for r in _QUERY_INTERVAL_INDEX.get(key, []):
-            add_candidate(r)
+        bucket = _QUERY_INTERVAL_INDEX.get(key)
+        if bucket is None:
+            continue
+        index = bisect.bisect_right(bucket.starts, g0) - 1
+        while index >= 0:
+            if bucket.prefix_max_ends[index] < g1:
+                break
+            add_candidate(bucket.records[index])
+            index -= 1
     add_candidate(resolve_record(contig, lookup))
     # O(n) last-resort fallback, skipped when the active index was built from
     # this exact lookup: the index is keyed by all six identity fields the
@@ -7274,6 +7519,10 @@ def line_level_reencode_vcf(tmp_path: str, out_path: str, realignment: bool, ref
                     yield first_data_line
                 yield from src
 
+            def needs_reencoding(line: str) -> bool:
+                columns = line.rstrip("\n").split("\t", 9)
+                return len(columns) >= 9 and is_sv_format(columns[8])
+
             worker_count = max(1, int(processes))
             print(
                 f"[graphreftovcf] realigning VCF rows with "
@@ -7288,19 +7537,35 @@ def line_level_reencode_vcf(tmp_path: str, out_path: str, realignment: bool, ref
                     initargs=(context,),
                     maxtasksperchild=64,
                 ) as pool:
-                    consume(
-                        pool.imap(
-                            _reencode_vcf_line_worker,
-                            data_lines(),
-                            chunksize=32,
-                        ),
-                        dst,
-                    )
+                    pending = []
+
+                    def flush_pending() -> None:
+                        if not pending:
+                            return
+                        consume(
+                            pool.imap(
+                                _reencode_vcf_line_worker, pending,
+                                chunksize=32,
+                            ),
+                            dst,
+                        )
+                        pending.clear()
+
+                    for line in data_lines():
+                        if needs_reencoding(line):
+                            pending.append(line)
+                            if len(pending) >= 4096:
+                                flush_pending()
+                        else:
+                            flush_pending()
+                            dst.write(line)
+                    flush_pending()
             else:
-                consume(
-                    (_reencode_vcf_line_worker(line) for line in data_lines()),
-                    dst,
-                )
+                for line in data_lines():
+                    if needs_reencoding(line):
+                        consume((_reencode_vcf_line_worker(line),), dst)
+                    else:
+                        dst.write(line)
         print(
             f"[graphreftovcf] finished realigning {completed} VCF rows",
             file=sys.stderr,
@@ -7642,6 +7907,959 @@ _ROW_WORKER_CONTEXT = {}
 _FORMAT_WORKER_CONTEXT = {}
 
 
+def _allow_large_delimited_fields() -> int:
+    """Raise :mod:`csv`'s process-wide field limit without overflowing C long.
+
+    Pseudo-linear alignment fields can legitimately contain complete graph
+    CIGARs larger than Python's 128 KiB default.  ``csv.field_size_limit``
+    accepts a C ``long`` on some Python builds, so reduce ``sys.maxsize`` only
+    when the platform rejects it.  Never lower a limit configured by the
+    caller.
+    """
+    current = csv.field_size_limit()
+    candidate = sys.maxsize
+    while candidate > current:
+        try:
+            csv.field_size_limit(candidate)
+            return candidate
+        except OverflowError:
+            candidate //= 10
+    return current
+
+
+def read_pseudolinear_assignments(path: str) -> Dict[int, List[dict]]:
+    """Index post-gapfill assignments by source graphcigartoref line."""
+    _allow_large_delimited_fields()
+    indexed: Dict[int, List[dict]] = defaultdict(list)
+    with open(path, newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        legacy_required = {
+            "kind", "query_contig", "query_start", "query_end",
+            "reference_path", "reference_start", "reference_end",
+            "alternative_path",
+            "alternative_start", "alternative_end", "source_line",
+        }
+        readable_required = {
+            "type", "query_interval", "reference_interval",
+            "alternative_interval", "source_line",
+        }
+        fieldnames = set(reader.fieldnames or ())
+        legacy = legacy_required.issubset(fieldnames)
+        readable = readable_required.issubset(fieldnames)
+        if not legacy and not readable:
+            raise ValueError(
+                f"{path}: pseudo-linear TSV has neither the readable schema "
+                f"{sorted(readable_required)} nor the legacy schema "
+                f"{sorted(legacy_required)}"
+            )
+        for row in reader:
+            source = row["source_line"]
+            if not source.startswith("line:"):
+                continue
+            try:
+                line_number = int(source.split(":", 1)[1])
+            except ValueError:
+                continue
+            if readable:
+                row["kind"] = row["type"]
+                for prefix, field in (
+                    ("query", "query_interval"),
+                    ("reference", "reference_interval"),
+                    ("alternative", "alternative_interval"),
+                ):
+                    parsed = parse_coord_token(row.get(field, ""))
+                    if parsed is None:
+                        row[f"{prefix}_contig" if prefix == "query"
+                            else f"{prefix}_path"] = None
+                        row[f"{prefix}_start"] = None
+                        row[f"{prefix}_end"] = None
+                        continue
+                    contig, start, end, strand = parsed
+                    row[f"{prefix}_contig" if prefix == "query"
+                        else f"{prefix}_path"] = contig
+                    row[f"{prefix}_start"] = start
+                    row[f"{prefix}_end"] = end
+                    row[f"{prefix}_strand"] = strand
+                parsed_anchor = parse_coord_token(
+                    row.get("insertion_anchor_interval", "")
+                )
+                if parsed_anchor is None:
+                    row["insertion_anchor_path"] = None
+                    row["insertion_anchor_start"] = None
+                    row["insertion_anchor_end"] = None
+                else:
+                    (
+                        row["insertion_anchor_path"],
+                        row["insertion_anchor_start"],
+                        row["insertion_anchor_end"],
+                        _anchor_strand,
+                    ) = parsed_anchor
+            else:
+                for key in (
+                    "query_start", "query_end", "reference_start", "reference_end",
+                    "alternative_start", "alternative_end",
+                ):
+                    value = row.get(key, ".")
+                    row[key] = int(value) if value not in {"", "."} else None
+            # Retain only fields consumed by election-aware calling. Keeping
+            # every CSV column in a per-row dict makes whole-genome tables
+            # several times larger in memory, especially with millions of
+            # short intervals.
+            retained = {
+                key: row.get(key)
+                for key in (
+                    "kind", "query_contig", "query_start", "query_end",
+                    "query_strand", "reference_path", "reference_start",
+                    "reference_end", "reference_strand",
+                    "reference_alignment_cigar", "alternative_path",
+                    "alternative_start", "alternative_end",
+                    "alternative_strand", "alternative_alignment_cigar",
+                    "pa_name", "lift_stage", "secondary_lift", "lift_kind",
+                    "lift_role", "encoded",
+                    "dup_group", "insertion_group",
+                    "insertion_anchor_path", "insertion_anchor_start",
+                    "insertion_anchor_end",
+                )
+            }
+            for key in (
+                "kind", "query_contig", "query_strand", "reference_path",
+                "reference_strand", "alternative_path",
+                "alternative_strand", "pa_name", "lift_stage",
+                "secondary_lift", "lift_kind", "lift_role", "encoded",
+                "dup_group", "insertion_group", "insertion_anchor_path",
+            ):
+                value = retained.get(key)
+                if isinstance(value, str):
+                    if key in {"dup_group", "insertion_group"} and value == ".":
+                        value = ""
+                        retained[key] = value
+                    retained[key] = sys.intern(value)
+            indexed[line_number].append(retained)
+    return dict(indexed)
+
+
+def _assignment_overlaps_sv(assignment: dict, sv: SVUnit) -> bool:
+    start = assignment.get("query_start")
+    end = assignment.get("query_end")
+    return (
+        start is not None and end is not None
+        and sv.qry_contig == assignment.get("query_contig")
+        and sv.qry_end > start and sv.qry_start < end
+    )
+
+
+def _assignment_match_size(assignment: dict, sv: SVUnit) -> int:
+    """Return the overlap supporting assignment metadata for one SV."""
+    start = assignment.get("query_start")
+    end = assignment.get("query_end")
+    if (
+        isinstance(start, int) and isinstance(end, int)
+        and sv.qry_contig == assignment.get("query_contig")
+    ):
+        if sv.qry_end > sv.qry_start:
+            overlap = min(sv.qry_end, end) - max(sv.qry_start, start)
+            if overlap > 0:
+                return overlap
+        elif start <= sv.qry_start <= end:
+            return 1
+    if sv.svtype == "DEL":
+        r0 = assignment.get("reference_start")
+        r1 = assignment.get("reference_end")
+        if (
+            assignment.get("reference_path") == sv.ref_contig
+            and isinstance(r0, int) and isinstance(r1, int)
+        ):
+            overlap = min(sv.ref_end, r1) - max(sv.ref_start, r0)
+            if overlap > 0:
+                return overlap
+    return 0
+
+
+def _lift_category(assignment: Optional[dict]) -> str:
+    if not assignment:
+        return "."
+    try:
+        stage = int(assignment.get("lift_stage", 0) or 0)
+    except (TypeError, ValueError):
+        stage = 0
+    secondary = str(
+        assignment.get("secondary_lift") or "0"
+    ).strip().lower() in {"1", "true", "yes"}
+    if not secondary and stage in {1, 2, 3}:
+        return "Pri"
+    if secondary and stage in {2, 3}:
+        return "Dup"
+    if stage == 4:
+        return "DivergeDup"
+    return "."
+
+
+def _is_full_locus_dup_assignment(assignment: Optional[dict]) -> bool:
+    """Identify an alternative-source insertion covering a duplicated PA.
+
+    An alternative mapping establishes that the inserted query interval has a
+    source locus.  ``fulllocusdup`` additionally means that interval belongs
+    to a duplicated PA.  Alternative mappings outside duplicated PAs are not
+    callable on either the source path or as parent insertions.
+    """
+    if not assignment:
+        return False
+    pa_name = str(assignment.get("pa_name") or "").strip()
+    secondary = str(assignment.get("secondary_lift") or "0").strip().lower()
+    return bool(
+        pa_name not in {"", "."}
+        and secondary in {"1", "true", "yes"}
+        and assignment.get("kind") == "INSERTION"
+        and assignment.get("alternative_path") not in {None, "", "."}
+    )
+
+
+def _annotate_pseudolinear_provenance(
+    svs: Sequence[SVUnit], assignments: Sequence[dict],
+) -> None:
+    """Attach the best overlapping PA assignment to each observation."""
+    for sv in svs:
+        candidates = [
+            (_assignment_match_size(row, sv), index, row)
+            for index, row in enumerate(assignments)
+        ]
+        candidates = [item for item in candidates if item[0] > 0]
+        selected = max(candidates, default=None, key=lambda item: (
+            item[0],
+            1 if item[2].get("kind") == "PRIMARY" else 0,
+            -item[1],
+        ))
+        assignment = selected[2] if selected is not None else None
+        sv.liftover_category = _lift_category(assignment)
+        duplication_candidates = [
+            item for item in candidates
+            if _is_full_locus_dup_assignment(item[2])
+        ]
+        duplication_selected = max(
+            duplication_candidates, default=None,
+            key=lambda item: (item[0], -item[1]),
+        )
+        duplication_assignment = (
+            duplication_selected[2]
+            if duplication_selected is not None else None
+        )
+        # Only the encoded parent synthesized for the elected duplicated
+        # query interval represents the full-locus duplication.  Ordinary
+        # indels called from an alignment inside the same query span can
+        # overlap that interval too, but they are independent variants and
+        # must survive the cohort merge's parent-duplication filter.
+        is_full_locus_dup = bool(
+            duplication_assignment is not None
+            and sv.encoded
+            and not sv.source_relative
+        )
+        sv.pa_class = "fulllocusdup" if is_full_locus_dup else "primary"
+        alternative_cigar = (
+            duplication_assignment.get("alternative_alignment_cigar")
+            if is_full_locus_dup else ""
+        )
+        sv.alternative_mapping_cigar = (
+            str(alternative_cigar)
+            if alternative_cigar not in {None, "", "."} else ""
+        )
+        sv.alternative_mapping_source = (
+            str(duplication_assignment.get("alternative_path") or "")
+            if is_full_locus_dup else ""
+        )
+
+
+def _merged_deletion_anchors(
+    assignments: Sequence[dict],
+) -> Dict[str, List[Tuple[int, int]]]:
+    by_path: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for row in assignments:
+        start = row.get("reference_start")
+        end = row.get("reference_end")
+        if (
+            row.get("kind") == "DELETION"
+            and isinstance(start, int) and isinstance(end, int)
+            and end > start
+        ):
+            by_path[row.get("reference_path", ".")].append((start, end))
+    merged: Dict[str, List[Tuple[int, int]]] = {}
+    for path, intervals in by_path.items():
+        local = []
+        for start, end in sorted(intervals):
+            if local and start <= local[-1][1]:
+                local[-1] = (local[-1][0], max(local[-1][1], end))
+            else:
+                local.append((start, end))
+        merged[path] = local
+    return merged
+
+
+def _anchors_contain_interval(
+    anchors: Mapping[str, Sequence[Tuple[int, int]]],
+    path: str,
+    interval_start: int,
+    interval_end: int,
+) -> bool:
+    # Assignment lists are normally only a handful of spans per source row.
+    # A forward scan avoids a global interval index or repeated all-row search.
+    for start, end in anchors.get(path, ()):
+        if start > interval_start:
+            return False
+        if end >= interval_end:
+            return True
+    return False
+
+
+def _deletion_token_intervals(sv: SVUnit) -> List[Tuple[int, int]]:
+    """Return the original reference-consuming deletion runs in an SV call.
+
+    A scored interval replacement can span matches, mismatches, or insertions
+    between several deletion runs. Those intervening bases are not deleted
+    and therefore must not require pseudo-linear DELETION ownership.
+    """
+    intervals: List[Tuple[int, int]] = []
+    for token in sv.tokens:
+        if token.get("op") != "D":
+            continue
+        start = token.get("ref_start")
+        end = token.get("ref_end")
+        if (
+            isinstance(start, int) and isinstance(end, int)
+            and end > start
+        ):
+            intervals.append((start, end))
+    return intervals
+
+
+def _merged_anchors_contain_deletion(
+    anchors: Mapping[str, Sequence[Tuple[int, int]]], sv: SVUnit,
+) -> bool:
+    deletion_intervals = _deletion_token_intervals(sv)
+    if not deletion_intervals:
+        # Synthetic and legacy SVUnit instances may not retain tokens. Their
+        # declared reference span is the only deletion interval available.
+        deletion_intervals = [(sv.ref_start, sv.ref_end)]
+    return all(
+        _anchors_contain_interval(anchors, sv.ref_contig, start, end)
+        for start, end in deletion_intervals
+    )
+
+
+def apply_pseudolinear_vcf_policy(
+    result: RowParseResult,
+    assignments: Sequence[dict],
+    *,
+    locus_dup_as_insert: bool,
+) -> RowParseResult:
+    """Apply exclusive ownership and bracketed-deletion call policy.
+
+    Source-relative SNP/SV calls remain in ``result``.  Only the parent
+    encoded insertion covering a query-only assignment is removed by default.
+    A deletion is retained only when the pseudo-linear election found both
+    neighboring query/reference anchors with overlapping extended contexts.
+    Existing rows are unchanged when no assignment exists for their source
+    line; this preserves synthetic deletion rows already validated by gapfill.
+    """
+    if assignments:
+        _annotate_pseudolinear_provenance(result.svs, assignments)
+        deletion_anchors = _merged_deletion_anchors(assignments)
+        result.svs = [
+            sv for sv in result.svs
+            if sv.svtype != "DEL"
+            # Pseudo-linear deletion rows describe missing sequence on the
+            # elected main reference path. Encoded parents and variants
+            # called inside encoded templates use a different coordinate
+            # space and must retain their source-relative calls.
+            or sv.encoded
+            or sv.source_relative
+            or _merged_anchors_contain_deletion(deletion_anchors, sv)
+        ]
+    duplications = [
+        row for row in assignments if _is_full_locus_dup_assignment(row)
+    ]
+    if locus_dup_as_insert or not duplications:
+        return result
+    result.svs = [
+        sv for sv in result.svs
+        if not (
+            sv.encoded
+            and any(_assignment_overlaps_sv(row, sv) for row in duplications)
+        )
+    ]
+    return result
+
+
+def _set_pseudolinear_deletion_points(indexed: Mapping[int, Sequence[dict]]) -> None:
+    """Attach query breakpoints from the already elected flanking alignments.
+
+    One sorted reference sweep, not a search through all anchors per deletion.
+    No second ownership or conflict election is performed here.
+    """
+    by_source_path = defaultdict(list)
+    for source_line, rows in indexed.items():
+        for row in rows:
+            if (row.get('kind') in {'PRIMARY', 'DELETION', 'INSERTION'}
+                    and isinstance(row.get('reference_start'), int)
+                    and (row.get('kind') == 'DELETION'
+                         or isinstance(row.get('query_start'), int))):
+                by_source_path[(source_line, row['reference_path'])].append(row)
+    for rows in by_source_path.values():
+        rows.sort(key=lambda r: (r['reference_start'], r['reference_end']))
+        left = None
+        pending = []
+
+        def assign(right):
+            anchor = left if left is not None else right
+            if anchor is None:
+                return
+            same = (anchor.get('query_strand', '+') in {'+', '>'}) == (anchor.get('reference_strand', '+') in {'+', '>'})
+            point = anchor['query_end' if (same == (left is not None)) else 'query_start']
+            for deletion in pending:
+                if isinstance(deletion.get('query_start'), int):
+                    continue
+                deletion['query_contig'] = anchor['query_contig']
+                deletion['query_start'] = deletion['query_end'] = point
+                deletion['query_strand'] = anchor.get('query_strand', '+')
+
+        for row in rows:
+            if row['kind'] == 'DELETION':
+                pending.append(row)
+            else:
+                assign(row)
+                pending.clear()
+                left = row
+        assign(None)
+
+
+class _ElectedSequenceReader:
+    """A zero-copy oriented interval view of an existing query FASTA record."""
+
+    def __init__(self, source: SeqRecord, name: str, start: int, end: int, strand: str):
+        self.source = source
+        self.start, self.end, self.strand = start, end, strand
+        self.index = {name: (end - start, 0, 1, 1)}
+
+    def fetch(self, name, start, end, strand='+'):
+        if self.strand == '+':
+            g0, g1 = self.start + start, self.start + end
+        else:
+            g0, g1 = self.end - end, self.end - start
+        if self.source.strand == '+':
+            q0, q1 = g0 - self.source.start, g1 - self.source.start
+        else:
+            q0, q1 = self.source.end - g1, self.source.end - g0
+        sequence = self.source.fetch_local(q0, q1)
+        if self.source.strand != self.strand:
+            sequence = revcomp(sequence)
+        return revcomp(sequence) if strand == '-' else sequence
+
+
+def _elected_sequence_record(row: dict, contig: str, start: int, end: int, strand: str, ctx: dict) -> SeqRecord:
+    # Original assembly records also cover elected extensions outside a PA's
+    # original sequence view. Metadata without sequence must not shadow them.
+    source = None
+    for lookup in (ctx['sequence_records'], ctx['query_records']):
+        for name in (row['query'], contig):
+            candidate = resolve_record(name, lookup)
+            if (candidate is not None and candidate.reader is not None
+                    and candidate.contig == contig
+                    and candidate.start <= start <= end <= candidate.end):
+                source = candidate
+                break
+        if source is not None:
+            break
+    return SeqRecord(
+        row['query'], row['query'], contig, start, end, strand,
+        seqlen=end-start,
+        reader=(_ElectedSequenceReader(source, row['query'], start, end, strand)
+                if source is not None else None),
+    )
+
+
+def _elected_cigar_parts(cigar: str) -> List[Tuple[bool, str, str]]:
+    """Return (is_main, direction, body) without main-path padding."""
+    parts = []
+    for index, (direction, text) in enumerate(iter_top_level_chunks(cigar)):
+        if index and ':' in text:
+            parts.append((False, direction, text))
+        else:
+            body = text.split(':', 1)[-1]
+            ops = parse_pairwise_ops(body)
+            body = ''.join(
+                f'{op.n}{op.op}{op.payload}' for op in ops if op.op != 'H'
+            )
+            if body:
+                parts.append((True, direction, body))
+    return parts
+
+
+def _merge_report_cigars_for_elected_run(
+    run: Sequence[dict], path: str, direction: str, ref: SeqRecord,
+) -> str:
+    """Merge non-source coordinate systems such as duplication parents."""
+    first, last = run[0], run[-1]
+    head = first['r0'] - ref.start if direction == '>' else ref.end - first['r1']
+    tail = ref.end - last['r1'] if direction == '>' else last['r0'] - ref.start
+    bodies = []
+    on_main_path = True
+    for piece in run:
+        for is_main, part_direction, body in _elected_cigar_parts(piece['cigar']):
+            if is_main:
+                if not on_main_path:
+                    bodies.append(part_direction)
+                bodies.append(body)
+                on_main_path = True
+            else:
+                bodies.append(part_direction + body)
+                on_main_path = False
+    # A run starting at path coordinate 0 with a named segment needs the
+    # explicit 0H anchor; an empty main chunk is invalid graph-CIGAR.
+    leading_segment = bool(bodies) and bodies[0].startswith(('<', '>'))
+    head_text = f'{head}H' if head or leading_segment else ''
+    tail_text = f'{tail}H' if tail else ''
+    tail_prefix = direction if tail_text and not on_main_path else ''
+    return (f'{direction}{path}:' + head_text + ''.join(bodies)
+            + tail_prefix + tail_text)
+
+
+def parse_pseudolinear_row_events(row: dict, assignments: Sequence[dict], ctx: dict) -> RowParseResult:
+    """Call the elected CIGARs; PA names are optional provenance, never gates.
+
+    Adjacent elected pieces from this source are walked as continuous runs so
+    within-alignment indel scoring is preserved. Parent insertion fragments
+    from different sources are concatenated once after collecting all rows.
+    """
+    result = RowParseResult([], [], [], [], [row['query']])
+    pieces = []
+    source_pieces = []
+    fallback_coord = parse_coord_token(row['query_coord'])
+    for assignment in assignments:
+        kind = assignment.get('kind')
+        path = assignment.get('reference_path')
+        r0, r1 = assignment.get('reference_start'), assignment.get('reference_end')
+        q0, q1 = assignment.get('query_start'), assignment.get('query_end')
+        contig = assignment.get('query_contig')
+        if kind == 'DELETION' and not isinstance(q0, int):
+            # Legacy TSVs may omit breakpoints. Prefer elected neighboring
+            # anchors prepared globally; retain the source point as metadata
+            # only when no such anchor is available.
+            contig, q0, _end, strand = fallback_coord
+            q1 = q0
+        else:
+            strand = assignment.get('query_strand', '+')
+        if not isinstance(q0, int) or not isinstance(q1, int):
+            continue
+        strand = '-' if strand in {'-', '<'} else '+'
+        alternate = assignment.get('alternative_path') not in {None, '', '.'}
+        dup_group = str(assignment.get('dup_group') or '').strip()
+        if dup_group == '.':
+            dup_group = ''
+        insertion_group = str(
+            assignment.get('insertion_group') or dup_group
+        ).strip()
+        if insertion_group == '.':
+            insertion_group = ''
+        pa_name = assignment.get('pa_name', '') or ''
+        metadata = ('' if pa_name == '.' else pa_name, _lift_category(assignment),
+                    str(assignment.get('secondary_lift', '0')))
+        base = dict(assignment=assignment, contig=contig, q0=q0, q1=q1,
+                    strand=strand, metadata=metadata, dup_group=dup_group,
+                    insertion_group=insertion_group)
+        if kind == 'UNMAPPED':
+            # Query sequence without one alignment CIGAR spanning the
+            # insertion and its reference anchor is report-only. Neighboring
+            # mapped intervals must not turn an unsupported gap into a VCF INS.
+            continue
+        full_locus_dup_assignment = _is_full_locus_dup_assignment(assignment)
+        if kind == 'INSERTION' and alternate:
+            # Alternative-source election is callable only for a duplicated
+            # PA.  A primary PA or an outside-PA interval that loses reference
+            # ownership must not become either a source-relative call or a
+            # synthetic parent insertion.
+            if not full_locus_dup_assignment:
+                continue
+            alt_cigar = assignment.get('alternative_alignment_cigar', '')
+            if not alt_cigar or alt_cigar == '.':
+                raise ValueError('pseudo-linear alternative alignment is missing its CIGAR; rerun gapfill')
+            source_pieces.append(dict(base, path=assignment['alternative_path'],
+                r0=assignment['alternative_start'], r1=assignment['alternative_end'],
+                direction='<' if assignment.get('alternative_strand') in {'-', '<'} else '>',
+                cigar=alt_cigar, source_relative=True))
+            if not ctx.get('locus_dup_as_insert', True):
+                continue
+        if dup_group and not ctx.get('locus_dup_as_insert', True):
+            continue
+        if path in {None, '', '.'} or not isinstance(r0, int) or not isinstance(r1, int):
+            # Unanchored sequence remains in the report; it cannot form a
+            # reference-coordinate VCF record.
+            continue
+        direction = '<' if assignment.get('reference_strand') in {'-', '<'} else '>'
+        cigar = assignment.get('reference_alignment_cigar', '')
+        if kind == 'INSERTION' and (alternate or dup_group):
+            source = _elected_sequence_record(row, contig, q0, q1, strand, ctx)
+            sequence = source.fetch_local(0, q1-q0)
+            if len(sequence) != q1-q0:
+                raise ValueError(f"{row['query']}: missing assembly sequence for elected insertion {contig}:{q0}-{q1}")
+            cigar = direction + f'{q1-q0}I{sequence}'
+        elif kind == 'INSERTION' and (not cigar or cigar == '.'):
+            # Backward-compatible safety for older pseudo-linear reports that
+            # labelled clipped/uncovered query sequence as INSERTION. Without
+            # an alignment CIGAR there is no supported insertion anchor.
+            continue
+        elif not cigar or cigar == '.':
+            raise ValueError('pseudo-linear alignment is missing its CIGAR; rerun gapfill')
+        pieces.append(dict(
+            base, path=path, r0=r0, r1=r1,
+            direction=direction, cigar=cigar, source_relative=False,
+        ))
+
+    def call_run(run):
+        first, last = run[0], run[-1]
+        path, direction = first['path'], first['direction']
+        labels = list(dict.fromkeys(
+            piece['metadata'][0] for piece in run if piece['metadata'][0]
+        ))
+        run_label = ';'.join(labels)
+        run_lift_category = next(
+            (piece['metadata'][1] for piece in run if piece['metadata'][1] != '.'),
+            '.',
+        )
+        dup_group = first.get('dup_group', '')
+        insertion_group_pieces = [
+            piece for piece in run if piece.get('insertion_group')
+        ]
+        insertion_group_ids = list(dict.fromkeys(
+            piece['insertion_group'] for piece in insertion_group_pieces
+        ))
+        insertion_group = (
+            insertion_group_ids[0] if len(insertion_group_ids) == 1 else ''
+        )
+        insertion_group_piece = (
+            insertion_group_pieces[0] if insertion_group else None
+        )
+        insertion_group_query_start = min(
+            (piece['q0'] for piece in insertion_group_pieces), default=0,
+        )
+        insertion_group_query_end = max(
+            (piece['q1'] for piece in insertion_group_pieces), default=0,
+        )
+        full_locus_dup = bool(
+            not first['source_relative']
+            and (
+                dup_group
+                or _is_full_locus_dup_assignment(first['assignment'])
+            )
+        )
+        run_pa_class = 'fulllocusdup' if full_locus_dup else 'primary'
+        alternative_cigars = list(dict.fromkeys(
+            str(piece['assignment'].get('alternative_alignment_cigar') or '')
+            for piece in run
+            if _is_full_locus_dup_assignment(piece['assignment'])
+            and piece['assignment'].get('alternative_alignment_cigar')
+            not in {None, '', '.'}
+        )) if full_locus_dup else []
+        ref = resolve_record(path, ctx['ref_lookup'])
+        if ref is None:
+            raise KeyError(f'pseudo-linear reference path {path!r} is absent from the reference FASTA')
+        start, end = min(p['q0'] for p in run), max(p['q1'] for p in run)
+        strand = first['strand']
+        # pseudolinear_assignments.py already sliced every elected mapping
+        # interval from its source CIGAR. Consume those interval CIGARs once;
+        # reparsing and reslicing the full source row for every run makes a
+        # row with many mapping segments quadratic.
+        cigar = _merge_report_cigars_for_elected_run(
+            run, path, direction, ref,
+        )
+        selected = dict(row, pseudolinear=True, pa_label=run_label,
+                        query_coord=f"{first['contig']}:{start}-{end}{strand}",
+                        encoded=query_only_graph_cigar(cigar), alternative_intervals=None,
+                        sequence_record=_elected_sequence_record(row, first['contig'], start, end, strand, ctx))
+        parsed = parse_row_events(
+            selected, ctx['ref_lookup'], ctx['query_records'], ctx['label_records'],
+            ctx['sequence_records'], ctx['max_impute'], 0,
+            ctx['within_gap_break'], ctx['within_gap_penalty'],
+            ctx['var_in_insert_min_bp'], 1, strict=ctx['strict'],
+            edge_blackregion=0,
+            filter_non_acgt_sequences=ctx['filter_non_acgt_sequences'],
+            separate_adjacent_indels=ctx.get('separate_adjacent_indels', False),
+            call_insertion_snps=ctx.get('call_insertion_snps', True),
+        )
+        for sv in parsed.svs:
+            sv.source_relative = sv.source_relative or first['source_relative']
+            sv.pseudolinear_strand = '' if sv.source_relative else direction
+            sv.pseudolinear = True
+            sv.liftover_category = run_lift_category
+            sv.pa_class = run_pa_class
+            sv.alternative_mapping_cigar = '&'.join(alternative_cigars)
+            sv.alternative_mapping_source = (
+                str(first['assignment'].get('alternative_path') or '')
+                if (
+                    not first['source_relative']
+                    and first['assignment'].get('alternative_path')
+                    not in {None, '', '.'}
+                ) else ''
+            )
+            if (
+                not sv.source_relative
+                and insertion_group
+                and sv.ins_size > 0
+                # Group reconstruction is valid only when the complete call
+                # is inside the elected INSERTION span.  Merely touching a
+                # group edge, or containing the group as one component of a
+                # larger D/I replacement, must not tag the whole call: doing
+                # so would rebuild the replacement from the insertion flanks
+                # and discard its original deletion component.
+                and sv.qry_start >= insertion_group_query_start
+                and sv.qry_end <= insertion_group_query_end
+                and sv.qry_start < sv.qry_end
+            ):
+                sv.pseudolinear_group = insertion_group
+                group_assignment = insertion_group_piece['assignment']
+                sv.pseudolinear_group_ref_start = int(
+                    group_assignment.get('insertion_anchor_start')
+                    if isinstance(
+                        group_assignment.get('insertion_anchor_start'), int
+                    ) else group_assignment['reference_start']
+                )
+                sv.pseudolinear_group_ref_end = int(
+                    group_assignment.get('insertion_anchor_end')
+                    if isinstance(
+                        group_assignment.get('insertion_anchor_end'), int
+                    ) else group_assignment['reference_end']
+                )
+                sv.pseudolinear_group_pa_class = (
+                    'fulllocusdup'
+                    if any(piece.get('dup_group') for piece in run)
+                    else 'primary'
+                )
+            if not run_label:
+                sv.label_h = '.'
+        if not run_label:
+            for snp in parsed.snps:
+                snp.label_h = '.'
+        result.svs.extend(parsed.svs)
+        result.snps.extend(parsed.snps)
+        result.coverage_spans.extend(parsed.coverage_spans)
+        result.filtered_spans.extend(parsed.filtered_spans)
+
+    # A duplicated PA may call SNP/SV differences on its own alternative
+    # source path.  The elected PA-bounded query slice and its materialized
+    # alternative CIGAR define that call; no outside-PA source calls enter
+    # source_pieces.  These calls remain when the parent insertion is omitted.
+    for piece in source_pieces:
+        call_run([piece])
+    pieces.sort(key=lambda p: (p['contig'], p['strand'],
+        p['q0'] if p['strand'] == '+' else -p['q1'],
+        p['q1'] if p['strand'] == '+' else -p['q0'],
+        p['r0'] if p['direction'] == '>' else -p['r1']))
+    run = []
+
+    def duplication_key(piece):
+        assignment = piece['assignment']
+        if (
+            piece['source_relative']
+            or assignment.get('alternative_path') in {None, '', '.'}
+        ):
+            return None
+        return (
+            assignment.get('alternative_path'),
+            '-' if assignment.get('alternative_strand') in {'-', '<'} else '+',
+        )
+
+    for piece in pieces:
+        if run:
+            previous = run[-1]
+            qexit = previous['q1'] if previous['strand'] == '+' else previous['q0']
+            qentry = piece['q0'] if piece['strand'] == '+' else piece['q1']
+            rexit = previous['r1'] if previous['direction'] == '>' else previous['r0']
+            rentry = piece['r0'] if piece['direction'] == '>' else piece['r1']
+            if (qexit != qentry or rexit != rentry or any(
+                    previous[key] != piece[key]
+                    for key in ('path', 'direction', 'contig', 'strand'))
+                    or duplication_key(previous) != duplication_key(piece)):
+                call_run(run)
+                run = []
+        run.append(piece)
+    if run:
+        call_run(run)
+    return result
+
+
+def merge_pseudolinear_insertions(svs: Sequence[SVUnit]) -> List[SVUnit]:
+    """Concatenate bracketed insertion groups and same-point fragments."""
+    insertion_groups = defaultdict(list)
+    grouped_replacements = []
+    eligible, output = [], []
+    for sv in svs:
+        if sv.pseudolinear_group and not sv.source_relative:
+            insertion_groups[(sv.sample, sv.pseudolinear_group)].append(sv)
+        else:
+            (eligible if sv.pseudolinear_strand and sv.ins_size > 0
+             and sv.del_size == 0 and not sv.source_relative else output).append(sv)
+
+    for (_sample, group_id), members in sorted(insertion_groups.items()):
+        members.sort(key=lambda sv: (sv.qry_start, sv.qry_end, sv.id))
+        if any(member.del_size > 0 for member in members):
+            # Defensive compatibility for reports produced before insertion
+            # groups required full query containment.  A call that already
+            # carries a deletion is a complete interval replacement; its
+            # original reference span and CIGAR are authoritative.  Rebuilding
+            # it from group anchors can turn e.g. 120D100I into a plain 100I.
+            output.extend(members)
+            continue
+        first = members[0]
+        expected = first.qry_start
+        for member in members:
+            if member.qry_start != expected:
+                raise ValueError(
+                    f"pseudo-linear insertion group {group_id!r} has "
+                    f"a query gap or overlap at {member.qry_contig}:"
+                    f"{expected}-{member.qry_start}"
+                )
+            expected = member.qry_end
+            if (
+                member.ref_contig != first.ref_contig
+                or member.pseudolinear_group_ref_start
+                != first.pseudolinear_group_ref_start
+                or member.pseudolinear_group_ref_end
+                != first.pseudolinear_group_ref_end
+                or member.qry_contig != first.qry_contig
+                or member.qry_strand != first.qry_strand
+            ):
+                raise ValueError(
+                    f"pseudo-linear insertion group {group_id!r} has "
+                    "inconsistent query/reference geometry"
+                )
+        ordered = members if first.qry_strand == '+' else list(reversed(members))
+        sequence = ''.join(member.raw_ins_seq for member in ordered)
+        insertion_size = sum(member.ins_size for member in members)
+        reference_start = first.pseudolinear_group_ref_start
+        reference_end = first.pseudolinear_group_ref_end
+        deletion_size = reference_end - reference_start
+        cigar = f'>{insertion_size}I{sequence}'
+        if deletion_size:
+            cigar += f'{deletion_size}D'
+        labels = list(dict.fromkeys(
+            member.allelename for member in ordered if member.allelename
+        ))
+        alternative_cigars = list(dict.fromkeys(
+            member.alternative_mapping_cigar for member in ordered
+            if member.alternative_mapping_cigar
+        ))
+        alternative_sources = list(dict.fromkeys(
+            member.alternative_mapping_source for member in ordered
+            if member.alternative_mapping_source
+        ))
+        group_pa_class = first.pseudolinear_group_pa_class or first.pa_class
+        combined = replace(
+            first,
+            qry_start=members[0].qry_start,
+            qry_end=members[-1].qry_end,
+            ref_start=reference_start,
+            ref_end=reference_end,
+            ins_size=insertion_size,
+            del_size=deletion_size,
+            raw_ins_seq=sequence,
+            cigar=cigar,
+            encoded=True,
+            tokens=[],
+            allelename=';'.join(labels),
+            label=';'.join(labels),
+            label_h='.',
+            qry_local_start=-1,
+            qry_local_end=-1,
+            pa_class=group_pa_class,
+            liftover_category=(
+                'Dup' if group_pa_class == 'fulllocusdup'
+                else first.liftover_category
+            ),
+            alternative_mapping_cigar='&'.join(alternative_cigars),
+            alternative_mapping_source='&'.join(alternative_sources),
+        )
+        output.append(combined)
+        if combined.ref_end > combined.ref_start:
+            grouped_replacements.append(combined)
+
+    if grouped_replacements:
+        # The two flanks define the reference component of the replacement.
+        # Suppress any independently recovered pure deletion wholly contained
+        # in that component; the grouped event already carries it.  Build one
+        # merged interval index per sample/path, then use binary search rather
+        # than comparing every deletion with every insertion group.
+        replacement_intervals = defaultdict(list)
+        for replacement in grouped_replacements:
+            replacement_intervals[(
+                replacement.sample, replacement.ref_contig,
+            )].append((replacement.ref_start, replacement.ref_end))
+        replacement_index = {}
+        for key, intervals in replacement_intervals.items():
+            merged = []
+            for start, end in sorted(intervals):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            replacement_index[key] = (
+                [start for start, _end in merged], merged,
+            )
+
+        retained_output = []
+        for sv in output:
+            if sv.ins_size == 0 and sv.del_size > 0:
+                indexed = replacement_index.get((sv.sample, sv.ref_contig))
+                if indexed is not None:
+                    starts, intervals = indexed
+                    interval_index = bisect.bisect_right(
+                        starts, sv.ref_start,
+                    ) - 1
+                    if (
+                        interval_index >= 0
+                        and intervals[interval_index][1] >= sv.ref_end
+                    ):
+                        continue
+            retained_output.append(sv)
+        output = retained_output
+
+    eligible.sort(key=lambda sv: (sv.sample, sv.qry_contig, sv.qry_start, sv.qry_end))
+    run = []
+
+    def flush():
+        if len(run) == 1:
+            output.append(run[0])
+        elif run:
+            first = run[0]
+            ordered = run if first.qry_strand == '+' else list(reversed(run))
+            labels = list(dict.fromkeys(sv.allelename for sv in ordered if sv.allelename))
+            combined = replace(first, qry_end=run[-1].qry_end,
+                ins_size=sum(sv.ins_size for sv in run),
+                raw_ins_seq=''.join(sv.raw_ins_seq for sv in ordered),
+                cigar=''.join(sv.cigar for sv in ordered),
+                encoded=any(sv.encoded for sv in run), tokens=[],
+                allelename=';'.join(labels), label=';'.join(labels), label_h='.',
+                qry_local_start=-1, qry_local_end=-1,
+                alternative_mapping_cigar='&'.join(
+                    cigar for cigar in dict.fromkeys(
+                        sv.alternative_mapping_cigar for sv in ordered
+                    ) if cigar
+                ),
+                alternative_mapping_source=first.alternative_mapping_source)
+            output.append(combined)
+
+    for sv in eligible:
+        if run:
+            previous = run[-1]
+            if (previous.qry_end != sv.qry_start or any(
+                    getattr(previous, key) != getattr(sv, key)
+                    for key in ('sample', 'qry_contig', 'qry_strand', 'ref_contig',
+                                'ref_start', 'ref_end', 'pseudolinear_strand',
+                                'pa_class', 'alternative_mapping_source'))):
+                flush()
+                run = []
+        run.append(sv)
+    flush()
+    return output
+
+
+
 def _init_row_worker(ctx: dict) -> None:
     global _ROW_WORKER_CONTEXT
     global _ACTIVE_INTERVAL_OWNERSHIP
@@ -7651,12 +8869,21 @@ def _init_row_worker(ctx: dict) -> None:
 
 def _row_worker_parse(item):
     line_no, raw = item
-    row = parse_graphcigartoref_row(raw, line_no)
+    ctx = _ROW_WORKER_CONTEXT
+    row = parse_graphcigartoref_row(raw, line_no, ctx.get('error_regions'))
     if row is None:
         return line_no, None
-    ctx = _ROW_WORKER_CONTEXT
+    if row.get('error_bed_filtered'):
+        return line_no, RowParseResult([], [], [], [], [row['query']], row_filter_reason='error_bed')
     if not ctx:
         raise RuntimeError("row worker context is not initialized")
+    if ctx.get("use_pseudolinear", False):
+        assignments = ctx["pseudolinear_assignments"].get(line_no, ())
+        # A source with no elected query bases must not re-enter through the
+        # old PA parser. Explicit zero-query gapfill deletions predate the
+        # assignment table and retain their already validated calling path.
+        if assignments or not str(row['query']).startswith('DEL'):
+            return line_no, parse_pseudolinear_row_events(row, assignments, ctx)
     results = []
     for ownership_row in expand_graphcigartoref_ownership_rows(row):
         results.append(parse_row_events(
@@ -7681,7 +8908,10 @@ def _row_worker_parse(item):
             call_insertion_snps=ctx.get("call_insertion_snps", True),
         ))
     if len(results) == 1:
-        return line_no, results[0]
+        return line_no, apply_pseudolinear_vcf_policy(
+            results[0], ctx.get("pseudolinear_assignments", {}).get(line_no, ()),
+            locus_dup_as_insert=ctx.get("locus_dup_as_insert", True),
+        )
     combined = RowParseResult([], [], [], [], [])
     all_non_acgt = bool(results)
     for result in results:
@@ -7699,12 +8929,19 @@ def _row_worker_parse(item):
         )
     if all_non_acgt:
         combined.row_filter_reason = "non_acgt_query_sequence"
-    return line_no, combined
+    return line_no, apply_pseudolinear_vcf_policy(
+        combined, ctx.get("pseudolinear_assignments", {}).get(line_no, ()),
+        locus_dup_as_insert=ctx.get("locus_dup_as_insert", True),
+    )
 
 
 def _init_format_worker(ctx: dict) -> None:
-    global _FORMAT_WORKER_CONTEXT
+    global _FORMAT_WORKER_CONTEXT, _QUERY_INTERVAL_INDEX
+    global _QUERY_INTERVAL_INDEX_SOURCE
     _FORMAT_WORKER_CONTEXT = ctx
+    if "query_interval_index" in ctx:
+        _QUERY_INTERVAL_INDEX = ctx["query_interval_index"]
+        _QUERY_INTERVAL_INDEX_SOURCE = ctx.get("query_lookup")
 
 
 def _format_snp_batch(batch):
@@ -7797,8 +9034,12 @@ def _format_rows_to_body(
     formatter = _format_snp_batch if kind == "SNP" else _format_sv_batch
     completed = 0
     next_report = 100_000
-    global _FORMAT_WORKER_CONTEXT
+    global _FORMAT_WORKER_CONTEXT, _QUERY_INTERVAL_INDEX
+    global _QUERY_INTERVAL_INDEX_SOURCE
     _FORMAT_WORKER_CONTEXT = context
+    if "query_interval_index" in context:
+        _QUERY_INTERVAL_INDEX = context["query_interval_index"]
+        _QUERY_INTERVAL_INDEX_SOURCE = context.get("query_lookup")
 
     def consume(results, output):
         nonlocal completed, next_report
@@ -7859,6 +9100,7 @@ def _write_header_and_bodies(
     reference_contigs: Sequence[Tuple[str, int]] = (),
     local_template_coordinates: bool = False,
     local_templates: Sequence[LocalTemplate] = (),
+    pseudolinear_assignments=None,
 ) -> None:
     started = time.monotonic()
     print(
@@ -7876,6 +9118,7 @@ def _write_header_and_bodies(
             reference_contigs=reference_contigs,
             local_template_coordinates=local_template_coordinates,
             local_templates=local_templates,
+            pseudolinear_assignments=pseudolinear_assignments,
         )
         for body_path in body_paths:
             with open(body_path) as body:
@@ -7891,6 +9134,33 @@ def _write_header_and_bodies(
 def main():
     parser = argparse.ArgumentParser(description="Rewrite graphcigartoref/refexalign output to VCF with safe within-line and across-sample clustering.")
     parser.add_argument("-i", "--input", required=True, help="graphcigartoref/refexalign output")
+    parser.add_argument(
+        "--pseudo-linear-assignments",
+        help=(
+            "call directly from this post-gapfill exclusive assignment TSV; "
+            "PA labels are metadata only and PA conflict checks are skipped; "
+            "duplicated query spans retain source-relative calls and emit "
+            "their full-locus parent insertion by default"
+        ),
+    )
+    locus_dup_group = parser.add_mutually_exclusive_group()
+    locus_dup_group.add_argument(
+        "--locus-dup-as-insert", "--gene-dup-as-insert",
+        dest="locus_dup_as_insert",
+        action="store_true",
+        default=True,
+        help=(
+            "with --pseudo-linear-assignments, emit parent insertions for "
+            "query spans with alternative source-locus alignments (default)"
+        ),
+    )
+    locus_dup_group.add_argument(
+        "--no-locus-dup-as-insert", "--no-gene-dup-as-insert",
+        dest="locus_dup_as_insert",
+        action="store_false",
+        help="suppress full-locus duplication parent insertions",
+    )
+    parser.add_argument("--error-bed", help="exclude whole input rows whose query interval overlaps this BED (assembly contig names; 0-based, half-open; strand ignored)")
     parser.add_argument("--ref", "-r", required=True, help="reference FASTA with .fai")
     parser.add_argument(
         "--local-reference-templates",
@@ -7944,7 +9214,7 @@ def main():
     parser.add_argument("--max-impute", type=int, default=10000, help="imputation size/cap used for extension ownership and breakpoint-uncertain neighbor-break calculation")
     parser.add_argument("--breakpoint-uncertain", type=int, default=200, help="breakpoint uncertainty for SV labels: self-side uses this bp size and keeps old label; neighbor-side uses 2x this size and emits *selflabel*neighbor")
     parser.add_argument("--within-gap-break", type=int, default=100, help="hard background bp break for within-line score merge")
-    parser.add_argument("--within-gap-penalty", type=int, default=4, help="score penalty per background bp for within-line merge")
+    parser.add_argument("--within-gap-penalty", type=int, default=4, help="cost per matching/soft-clipped bp for within-line merge; mismatches cost -8 per bp")
     parser.add_argument(
         "--separate-adjacent-indels",
         "--separate-adjacent-indel-components",
@@ -8008,7 +9278,7 @@ def main():
         default=True,
         help=(
             "retain a singleton or inconsistent cross-graph SV only when "
-            "its PA has the uniquely best main-path affine alignment score; "
+            "its PA has the uniquely best main-path standard alignment score; "
             "enabled by default"
         ),
     )
@@ -8052,6 +9322,10 @@ def main():
     parser.add_argument("-t", "--processes", type=int, default=1, help="worker processes for input-row parsing, SV clustering, VCF formatting, and optional realignment")
     parser.add_argument("--format-processes", type=int, default=DEFAULT_FORMAT_PROCESSES, metavar="N", help=f"maximum workers for memory-heavy VCF formatting and optional realignment (default: {DEFAULT_FORMAT_PROCESSES}; parsing and clustering still use -t)")
     args = parser.parse_args()
+    print(
+        f"[graphreftovcf] implementation: {os.path.realpath(__file__)}",
+        file=sys.stderr,
+    )
 
     if args.processes < 1:
         parser.error("-t/--processes must be at least 1")
@@ -8083,6 +9357,8 @@ def main():
         args.validate_cross_graph_svs = True
     for attribute, option in (
         ("input", "--input"),
+        ("pseudo_linear_assignments", "--pseudo-linear-assignments"),
+        ("error_bed", "--error-bed"),
         ("ref", "--ref"),
         ("local_reference_templates", "--local-reference-templates"),
         ("query", "--query"),
@@ -8099,6 +9375,23 @@ def main():
             )
         except ValueError as error:
             parser.error(str(error))
+    error_regions = QueryErrorBed.read(args.error_bed) if args.error_bed else None
+    pseudolinear_assignments = (
+        read_pseudolinear_assignments(args.pseudo_linear_assignments)
+        if args.pseudo_linear_assignments else {}
+    )
+    if args.pseudo_linear_assignments:
+        _set_pseudolinear_deletion_points(pseudolinear_assignments)
+        args.validate_cross_graph_svs = False
+        args.resolve_conflicts_by_alignment_score = False
+        args.inconsistency_report = None
+        args.edge_blackregion = 0
+        print(
+            "[graphreftovcf] calling elected pseudo-linear alignments; PA "
+            "labels are metadata only; PA ownership, source-edge filtering "
+            "and cross-graph conflict validation are disabled",
+            file=sys.stderr,
+        )
     inconsistency_report_path = args.inconsistency_report
     if (
         inconsistency_report_path is None
@@ -8189,18 +9482,16 @@ def main():
                     query_order.append(x)
                     seen.add(x)
 
-    # GenomeLift (optionally overlaid by genomeliftfix.tsv) is the sole PA
-    # ownership authority.  Do not perform a second graph-CIGAR-dependent
-    # election while formatting VCF records: doing so would make one-map and
-    # two-map calls follow different ownership rules and could override the
-    # decision already finalized by fill_graphcigartoref_gaps.py.
+    # With an elected map, GenomeLift supplies PA provenance only. Legacy
+    # inputs without that map retain their original coordinate-map policy.
     interval_ownership = {}
     if coord_map_paths:
         print(
             "[graphreftovcf] loaded "
             f"{len(coord_map_paths)} comma-ordered coordinate map(s); later "
-            "PA rows override earlier rows and coordinate-map ownership is "
-            "authoritative",
+            "PA rows override earlier rows; "
+            + ("PA labels are metadata only" if args.pseudo_linear_assignments
+               else "coordinate-map ownership is authoritative"),
             file=sys.stderr,
         )
 
@@ -8222,9 +9513,14 @@ def main():
     ] = {}
     next_id = 1
     non_acgt_filtered_rows = 0
+    error_bed_filtered_rows = 0
     edge_filtered_events = 0
 
     alternative_filtered_events = 0
+    parse_started = time.monotonic()
+    parsed_input_rows = 0
+    next_parse_report = 100
+    last_parse_report = parse_started
 
     # SNP observations are spilled to a temp pickle stream as parse results
     # arrive and reloaded only after the SV structures are freed, so the
@@ -8269,6 +9565,7 @@ def main():
                 main_mismatch_bases=evidence.main_mismatch_bases,
                 main_gap_opens=evidence.main_gap_opens,
                 main_gap_extensions=evidence.main_gap_extensions,
+                main_gap_lengths=evidence.main_gap_lengths,
             )
         key = (
             evidence.sample,
@@ -8284,12 +9581,32 @@ def main():
 
     def consume_row_result(line_no: int, result: Optional[RowParseResult]):
         nonlocal next_id, non_acgt_filtered_rows, edge_filtered_events
+        nonlocal error_bed_filtered_rows
         nonlocal alternative_filtered_events
         nonlocal spilled_snp_count
+        nonlocal parsed_input_rows, next_parse_report, last_parse_report
+        parsed_input_rows += 1
+        now = time.monotonic()
+        if (
+            parsed_input_rows >= next_parse_report
+            or now - last_parse_report >= 30.0
+        ):
+            elapsed = max(now - parse_started, 1e-9)
+            print(
+                f"[graphreftovcf] parsed {parsed_input_rows} input row(s) "
+                f"in {elapsed:.1f}s "
+                f"({parsed_input_rows / elapsed:.1f} rows/s)",
+                file=sys.stderr,
+            )
+            while next_parse_report <= parsed_input_rows:
+                next_parse_report += 1_000
+            last_parse_report = now
         if result is None:
             return
         if result.row_filter_reason == "non_acgt_query_sequence":
             non_acgt_filtered_rows += 1
+        if result.row_filter_reason == "error_bed":
+            error_bed_filtered_rows += 1
         edge_filtered_events += result.edge_filtered_events
         alternative_filtered_events += result.alternative_filtered_events
         for sv in result.svs:
@@ -8339,15 +9656,30 @@ def main():
         "filter_non_acgt_sequences": not args.allow_non_acgt_sequences,
         "strict": not args.lenient,
         "interval_ownership": interval_ownership,
+        "error_regions": error_regions,
         "score_main_alignment": args.resolve_conflicts_by_alignment_score,
         "separate_adjacent_indels": args.separate_adjacent_indels,
+        "pseudolinear_assignments": pseudolinear_assignments,
+        "use_pseudolinear": bool(args.pseudo_linear_assignments),
+        "locus_dup_as_insert": args.locus_dup_as_insert,
     }
 
-    #print(f"[graphreftovcf] parsing input rows (processes={args.processes}) ...", file=sys.stderr)
+    print(
+        f"[graphreftovcf] parsing "
+        f"{'elected pseudo-linear' if args.pseudo_linear_assignments else 'input'} "
+        f"rows "
+        f"(processes={args.processes}) ...",
+        file=sys.stderr,
+    )
     with open_text(args.input) as fh:
         row_iter = ((line_no, raw) for line_no, raw in enumerate(fh, start=1))
         if args.processes > 1:
             _freeze_shared_heap()
+            print(
+                f"[graphreftovcf] initializing {args.processes} parse "
+                "worker processes ...",
+                file=sys.stderr,
+            )
             # Recycle parse workers periodically so refcount writes into the
             # shared record/sequence structures cannot accumulate into large
             # private copies over a worker's lifetime (64 chunks of 16 rows).
@@ -8355,6 +9687,10 @@ def main():
                                    initializer=_init_row_worker,
                                    initargs=(_ROW_WORKER_CONTEXT,),
                                    maxtasksperchild=64) as pool:
+                print(
+                    f"[graphreftovcf] {args.processes} parse workers ready",
+                    file=sys.stderr,
+                )
                 for line_no, result in pool.imap(_row_worker_parse, row_iter, chunksize=16):
                     consume_row_result(line_no, result)
         else:
@@ -8362,8 +9698,19 @@ def main():
                 line_no, result = _row_worker_parse(item)
                 consume_row_result(line_no, result)
     _flush_snp_spill()
+    if args.pseudo_linear_assignments:
+        svs = merge_pseudolinear_insertions(svs)
+        for event_id, sv in enumerate(svs, 1):
+            sv.id = event_id
     parsed_snp_total = spilled_snp_count if spill_snps else len(snps)
-    print(f"[graphreftovcf] parsed: {len(svs)} SVs, {parsed_snp_total} SNPs from {len(seen_queries)} queries", file=sys.stderr)
+    if error_regions is not None:
+        print(f"[graphreftovcf] --error-bed excluded {error_bed_filtered_rows} input row(s)", file=sys.stderr)
+    print(
+        f"[graphreftovcf] parsed: {len(svs)} SVs, {parsed_snp_total} SNPs "
+        f"from {len(seen_queries)} queries and {parsed_input_rows} input "
+        f"row(s) in {time.monotonic() - parse_started:.1f}s",
+        file=sys.stderr,
+    )
 
     if not haplotype_mode:
         # In per-query mode, sample columns are exact query records, not haplotype labels.
@@ -8570,6 +9917,9 @@ def main():
 
     sv_body = _temporary_body_path(args.output, "sv")
     snp_body = None
+    query_interval_index = build_contig_interval_index(
+        query_sequence_lookup,
+    )
     try:
         sv_context = {
             "id_to_sv": id_to_sv,
@@ -8578,6 +9928,7 @@ def main():
             "filtered_map": filtered_map,
             "ref_records": ref_records,
             "query_lookup": query_sequence_lookup,
+            "query_interval_index": query_interval_index,
             "var_in_insert_min_bp": max(0, int(args.var_in_insert or 0)),
             "svcutoff": args.svcutoff,
         }
@@ -8714,6 +10065,7 @@ def main():
                 reference_contigs=reference_contigs,
                 local_template_coordinates=bool(local_templates),
                 local_templates=local_templates,
+                pseudolinear_assignments=pseudolinear_assignments,
             )
             finalize_vcf_temp(
                 indelsv_tmp, indelsv_out, realign=args.realignment,
@@ -8731,6 +10083,7 @@ def main():
                 reference_contigs=reference_contigs,
                 local_template_coordinates=bool(local_templates),
                 local_templates=local_templates,
+                pseudolinear_assignments=pseudolinear_assignments,
             )
             _write_header_and_bodies(
                 indelsv_tmp, sample_names, "indelsv", [sv_body],
@@ -8740,6 +10093,7 @@ def main():
                 reference_contigs=reference_contigs,
                 local_template_coordinates=bool(local_templates),
                 local_templates=local_templates,
+                pseudolinear_assignments=pseudolinear_assignments,
             )
             finalize_vcf_temp(snp_tmp, snp_out, realign=False)
             finalize_vcf_temp(
@@ -8755,6 +10109,7 @@ def main():
                 reference_contigs=reference_contigs,
                 local_template_coordinates=bool(local_templates),
                 local_templates=local_templates,
+                pseudolinear_assignments=pseudolinear_assignments,
             )
             finalize_vcf_temp(tmp, args.output, realign=args.realignment)
     finally:

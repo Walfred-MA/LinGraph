@@ -2999,6 +2999,13 @@ _SV_WINDOW_GAP_EXTEND = 1
 _SV_SECONDARY_AFFINE_MAX_CELLS = 100_000_000
 _SV_SECONDARY_AFFINE_MAX_AXIS = 50_000
 
+# Traceback tables cost ~2-4 bytes per cell (up to ~1.6 GB for one masked-
+# repeat window).  graphcigartoref_persample sets this shared semaphore before
+# forking so only a few workers hold such tables at once.  It only delays
+# work; alignments are unchanged.
+_LARGE_ALIGN_GATE = None
+_LARGE_ALIGN_GATE_CELLS = 20_000_000
+
 
 def _sv_window_affine_align(ref_win: str, qry_win: str) -> List[Tuple[int, str, str]]:
     """Affine SV candidate; acceptance uses the separate masked SV score."""
@@ -3035,16 +3042,27 @@ def _global_affine_payload_align(
     matrix = _parasail_scoring_matrix(
         alphabet, match_score, mismatch_score,
     )
-    result = _parasail.nw_trace_striped_16(
-        qry_upper, ref_upper, gap_open, gap_extend,
-        matrix,
-    )
-    if result.saturated:
-        result = _parasail.nw_trace_striped_32(
-            qry_upper, ref_upper, gap_open,
-            gap_extend, matrix,
+    gate = (_LARGE_ALIGN_GATE
+            if len(ref_upper) * len(qry_upper) >= _LARGE_ALIGN_GATE_CELLS
+            else None)
+    if gate is not None:
+        gate.acquire()
+    try:
+        result = _parasail.nw_trace_striped_16(
+            qry_upper, ref_upper, gap_open, gap_extend,
+            matrix,
         )
-    body = result.cigar.decode
+        if result.saturated:
+            result = None
+            result = _parasail.nw_trace_striped_32(
+                qry_upper, ref_upper, gap_open,
+                gap_extend, matrix,
+            )
+        body = result.cigar.decode
+        result = None
+    finally:
+        if gate is not None:
+            gate.release()
     if isinstance(body, bytes):
         body = body.decode('ascii')
     out = []
@@ -5012,8 +5030,508 @@ def _anchor_annealed_linear_piece(template: AnnealTemplate, cigar: str) -> Optio
         return None
     return LinearPiece(piece=piece, chrom=template.chrom, strand=template.strand, genome_start=genome_start, genome_end=genome_end, cigar=cigar)
 
-def _consolidate_linear_piece(piece, linear, query_offset, query_sequence, ref_reader):
-    """Consolidate either indel direction before large-insertion encoding."""
+# Soft-masked repeat windows (stage 4). SVs whose own sequence starts or ends in
+# soft-masked repeat are realigned over a window defined by the masking, not by
+# the input gap placement, so the same allele gets the same representation in
+# every haplotype. Runs first; later stage-4 realignment skips these windows.
+_MASKED_REPEAT_MIN_SV = 50
+_MASKED_REPEAT_MIN_EDGE = 50
+_MASKED_REPEAT_MERGE_GAP = 100
+_MASKED_REPEAT_ANCHOR = 500
+_MASKED_REPEAT_CELLS_PER_SV = 100_000_000
+_MASKED_REPEAT_MAX_CELLS = 400_000_000
+# alignment_scoring units (match 4, mismatch -8). With the final gap merge,
+# a gap open of 24 gives the best agreement between haplotypes that differ by
+# one SNP/1-bp indel (slop-0 124/150 vs 109/150 at 60) while keeping one SV
+# event per expansion; 12 starts fragmenting SVs, and higher costs pull the SV
+# toward a haplotype's small indels.
+_MASKED_REPEAT_GAP_OPEN = 24
+_MASKED_REPEAT_GAP_EXTEND = 2
+_LOWERCASE_RUN_RE = re.compile(r'[a-z]+')
+_LOWERCASE = 'abcdefghijklmnopqrstuvwxyz'
+
+
+def _masked_column_runs(ops, reference, query):
+    """Alignment columns whose reference or query base is soft-masked.
+
+    Returns sorted, disjoint ``[start, end)`` column runs.
+    """
+    spans = []
+    column = r = q = 0
+    for n, op, _payload in ops:
+        sources = (
+            ((reference, r), (query, q)) if op in 'M=X'
+            else ((query, q),) if op == 'I'
+            else ((reference, r),) if op == 'D' else ()
+        )
+        for sequence, offset in sources:
+            for match in _LOWERCASE_RUN_RE.finditer(sequence, offset, offset + n):
+                spans.append((column + match.start() - offset,
+                              column + match.end() - offset))
+        column += n
+        r += n if op in 'M=XD' else 0
+        q += n if op in 'M=XI' else 0
+    spans.sort()
+    runs = []
+    for start, end in spans:
+        if runs and start <= runs[-1][1]:
+            runs[-1][1] = max(runs[-1][1], end)
+        else:
+            runs.append([start, end])
+    return runs
+
+
+def _masked_edge_length(sequence):
+    """Masked bases counted inward from either end of an SV sequence."""
+    return max(len(sequence) - len(sequence.lstrip(_LOWERCASE)),
+               len(sequence) - len(sequence.rstrip(_LOWERCASE)))
+
+
+def _masked_repeat_plan(ops, reference, query):
+    """Masked realignment windows: ``[(left, right, sv_count)]`` in columns.
+
+    Units come from the existing SV linking (score-linked groups); an unlinked
+    SV (I/D >= 50 bp) is its own unit. A unit triggers when one of its SVs has
+    >= 50 masked bases counted inward from either end of its own sequence. Its
+    window is the unit span joined with every masked interval (masked columns
+    merged across unmasked gaps < 100 bp) it overlaps, plus anchors of
+    min(500, window / 2) whose edges are unmasked. Overlapping windows are
+    joined; ``sv_count`` sets the cell budget.
+    """
+    columns, ref_offsets, qry_offsets = _tm_alignment_offsets(ops)
+    svs = [i for i, (n, op, _p) in enumerate(ops)
+           if op in 'ID' and n >= _MASKED_REPEAT_MIN_SV]
+    if not svs:
+        return []
+
+    def triggered(i):
+        n, op, _payload = ops[i]
+        if op == 'I':
+            sequence = query[qry_offsets[i]:qry_offsets[i] + n]
+        else:
+            sequence = reference[ref_offsets[i]:ref_offsets[i] + n]
+        return _masked_edge_length(sequence) >= _MASKED_REPEAT_MIN_EDGE
+
+    variants = [i for i, (_n, op, _p) in enumerate(ops) if op in 'IDX']
+    units = []
+    linked = set()
+    for first, last in _tm_score_linked_indel_groups(ops):
+        a, b = variants[first], variants[last]
+        members = [i for i in svs if a <= i <= b]
+        linked.update(members)
+        units.append((columns[a], columns[b + 1], members))
+    units.extend(
+        (columns[i], columns[i + 1], [i]) for i in svs if i not in linked
+    )
+
+    runs = _masked_column_runs(ops, reference, query)
+    merged = []
+    for start, end in runs:
+        if merged and start - merged[-1][1] < _MASKED_REPEAT_MERGE_GAP:
+            merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    run_starts = [start for start, _end in runs]
+
+    def run_at(position):
+        index = bisect.bisect_right(run_starts, position) - 1
+        if index >= 0 and runs[index][0] <= position < runs[index][1]:
+            return runs[index]
+        return None
+
+    total = columns[-1]
+    windows = []
+    for start, end, members in units:
+        if not any(triggered(i) for i in members):
+            continue
+        core_start, core_end = start, end
+        for masked_start, masked_end in merged:
+            if masked_start < end and masked_end > start:
+                core_start = min(core_start, masked_start)
+                core_end = max(core_end, masked_end)
+        anchor = min(_MASKED_REPEAT_ANCHOR, (core_end - core_start) // 2)
+        left = max(0, core_start - anchor)
+        right = min(total, core_end + anchor)
+        # Anchor edges must be unique (unmasked) sequence.
+        run = run_at(left)
+        if run is not None and left < core_start:
+            left = min(run[1], core_start)
+        run = run_at(right - 1)
+        if run is not None and right > core_end:
+            right = max(run[0], core_end)
+        windows.append([left, right])
+    windows.sort()
+    joined = []
+    for left, right in windows:
+        if joined and left <= joined[-1][1]:
+            joined[-1][1] = max(joined[-1][1], right)
+        else:
+            joined.append([left, right])
+    return [
+        (left, right, sum(1 for i in svs
+                          if left <= columns[i] and columns[i + 1] <= right))
+        for left, right in joined
+    ]
+
+
+def _realign_masked_repeat_windows(ops, reference, query, *, reverse=False):
+    """Canonically realign masked-repeat SV windows (see _masked_repeat_plan).
+
+    Each window is realigned once by global affine parasail when reference x
+    query < min(sv_count x 100M, 400M) cells, left-normalized, and replaces
+    the window unconditionally: in a diverged repeat many placements score
+    alike, and a strict-improvement rule would keep each haplotype's arbitrary
+    input placement. Planning runs in forward genomic orientation so both
+    strands give the same placement.
+
+    Returns ``(ops, windows)``; windows are ``(r0, r1, q0, q1)`` offsets in the
+    supplied (traversal) orientation, empty when nothing was realigned.
+    """
+    if (_parasail is None
+            or not any(op in 'ID' and n >= _MASKED_REPEAT_MIN_SV
+                       for n, op, _ in ops)
+            or sum(n for n, op, _ in ops if op in 'M=XD') != len(reference)
+            or sum(n for n, op, _ in ops if op in 'M=XI') != len(query)):
+        return ops, []
+    original_ops = ops
+    if reverse:
+        reference, query = revcomp(reference), revcomp(query)
+        ops = _tm_ops_from_cigar_on_sequences(reference, query, ''.join(
+            f"{n}{'=' if op == 'M' else op}" for n, op, _ in reversed(ops)
+        ))
+    ops = [(n, 'M' if op == '=' else op, payload) for n, op, payload in ops]
+    plan = _masked_repeat_plan(ops, reference, query)
+    if not plan:
+        return original_ops, []
+    columns, ref_offsets, qry_offsets = _tm_alignment_offsets(ops)
+    rebuilt = []
+    cursor = 0
+    done = []
+    for left, right, sv_count in plan:
+        r0, q0 = _tm_axis_offset_at_column(
+            ops, columns, ref_offsets, qry_offsets, left)
+        r1, q1 = _tm_axis_offset_at_column(
+            ops, columns, ref_offsets, qry_offsets, right)
+        budget = min(sv_count * _MASKED_REPEAT_CELLS_PER_SV,
+                     _MASKED_REPEAT_MAX_CELLS)
+        if (r1 - r0) * (q1 - q0) >= budget:
+            continue
+        ref_window, qry_window = reference[r0:r1], query[q0:q1]
+        replacement = [
+            (n, 'M' if op == '=' else op, payload)
+            for n, op, payload in _global_affine_payload_align(
+                ref_window, qry_window,
+                gap_open=_MASKED_REPEAT_GAP_OPEN,
+                gap_extend=_MASKED_REPEAT_GAP_EXTEND,
+            )
+        ]
+        if (sum(n for n, op, _ in replacement if op in 'MXD') != r1 - r0
+                or sum(n for n, op, _ in replacement if op in 'MXI')
+                != q1 - q0):
+            continue
+        replacement = _normalize_repeat_indels(
+            replacement, ref_window, qry_window)
+        for piece in _tm_slice_ops_by_columns(ops, columns, cursor, left):
+            _tm_add_op(rebuilt, *piece)
+        for piece in replacement:
+            _tm_add_op(rebuilt, *piece)
+        cursor = right
+        done.append((r0, r1, q0, q1))
+    if not done:
+        return original_ops, []
+    for piece in _tm_slice_ops_by_columns(ops, columns, cursor, columns[-1]):
+        _tm_add_op(rebuilt, *piece)
+    ops = rebuilt
+    if reverse:
+        ref_length, qry_length = len(reference), len(query)
+        reference, query = revcomp(reference), revcomp(query)
+        ops = _tm_ops_from_cigar_on_sequences(reference, query, ''.join(
+            f"{n}{'=' if op == 'M' else op}" for n, op, _ in reversed(ops)
+        ))
+        done = [(ref_length - r1, ref_length - r0, qry_length - q1,
+                 qry_length - q0) for r0, r1, q0, q1 in reversed(done)]
+    return [(n, 'M' if op == '=' else op, payload)
+            for n, op, payload in ops], done
+
+
+def _masked_repeat_realign_linear_piece(piece, linear, query_offset, query_sequence, ref_reader):
+    """Stage-4 masked-repeat realignment, before D/I rescue and consolidation.
+
+    Returns ``(piece, linear, frozen)``: ``frozen`` holds each realigned window
+    as ``(query_start, query_end, genome_start, genome_end)`` in absolute query
+    and genome coordinates, which later stage-4 steps must not realign again.
+    """
+    if not _SV_REALIGNMENT_ENABLED or query_sequence is None or ref_reader is None:
+        return piece, linear, ()
+    tokens = parse_cigar_ops(piece.cigar)
+    if not any(tok.op in 'ID' and tok.n >= _MASKED_REPEAT_MIN_SV for tok in tokens):
+        return piece, linear, ()
+    try:
+        reference = ref_reader.fetch(linear.chrom, linear.genome_start,
+                                     linear.genome_end, linear.strand)
+    except (KeyError, ValueError, OSError):
+        return piece, linear, ()
+    query = query_sequence[query_offset:query_offset + pairwise_query_span(piece.cigar)]
+    if len(reference) != pairwise_ref_span(piece.cigar) or len(query) != pairwise_query_span(piece.cigar):
+        return piece, linear, ()
+    candidate, windows = _realign_masked_repeat_windows(
+        [(tok.n, tok.op, tok.payload) for tok in tokens], reference, query,
+        reverse=linear.strand == '-')
+    if not windows:
+        return piece, linear, ()
+    frozen = []
+    for r0, r1, q0, q1 in windows:
+        if linear.strand == '-':
+            genome = (linear.genome_end - r1, linear.genome_end - r0)
+        else:
+            genome = (linear.genome_start + r0, linear.genome_start + r1)
+        frozen.append((query_offset + q0, query_offset + q1) + genome)
+    body = []
+    for n, op, payload in candidate:
+        _append_recanonicalized_op(body, '=' if op == 'M' else op, n, payload)
+    cigar = ''.join(_op_to_cigar(tok) for tok in body)
+    if cigar == piece.cigar:
+        return piece, linear, tuple(frozen)
+    repaired = replace(piece, cigar=cigar)
+    return repaired, replace(linear, piece=repaired, cigar=cigar), tuple(frozen)
+
+
+def _overlaps_frozen(frozen, query_start, query_end, genome_start, genome_end):
+    """Whether a realignment candidate touches a masked-repeat window."""
+    return any(
+        (query_start < q1 and query_end > q0)
+        or (genome_start < g1 and genome_end > g0)
+        for q0, q1, g0, g1 in frozen
+    )
+
+
+def _column_at_offsets(ops, columns, ref_offsets, qry_offsets, r, q):
+    """First alignment column whose reference/query offsets are ``(r, q)``."""
+    for index, (n, op, _payload) in enumerate(ops):
+        dr, dq = r - ref_offsets[index], q - qry_offsets[index]
+        if op in 'M=X' and dr == dq and 0 <= dr <= n:
+            return columns[index] + dr
+        if op == 'I' and dr == 0 and 0 <= dq <= n:
+            return columns[index] + dq
+        if op == 'D' and dq == 0 and 0 <= dr <= n:
+            return columns[index] + dr
+    return None
+
+
+# Final stage-4 polish: gaps linked through repeat sequence become one event.
+_GAP_MERGE_MIN_SV = 50
+_GAP_MERGE_MAX_RUN_COST = 200
+_GAP_MERGE_PURE_MASKED_COST = 0.5
+_GAP_MERGE_MASKED_COST = 1
+_GAP_MERGE_UNMASKED_COST = 4
+_DELETE_LOWERCASE = str.maketrans('', '', _LOWERCASE)
+
+
+def _gap_merge_run_cost(reference_run):
+    """Cost of the aligned bases between two gaps (reference-side masking).
+
+    Purely masked runs cost 0.5 per base; a run mixing masked and unmasked
+    bases costs 1 per masked and 4 per unmasked base; purely unmasked runs
+    cost 4 per base.
+    """
+    unmasked = len(reference_run.translate(_DELETE_LOWERCASE))
+    masked = len(reference_run) - unmasked
+    if not unmasked:
+        return _GAP_MERGE_PURE_MASKED_COST * masked
+    return _GAP_MERGE_MASKED_COST * masked + _GAP_MERGE_UNMASKED_COST * unmasked
+
+
+def _merge_masked_repeat_gaps(ops, reference, query):
+    """Merge gaps linked through repeat sequence into one D + I event.
+
+    Gaps are I, D and X (mismatch) runs. From the first gap to the last, a
+    gap adds its size and the matched bases between two gaps subtract
+    _gap_merge_run_cost. A break is placed where the
+    score drops below 0 or where one run alone costs more than 200; breaks of
+    the left-to-right and right-to-left sweeps are united. Each unbroken group
+    of two or more gaps that contains an SV (>= 50 bp) becomes one D spanning
+    its reference bases followed by one I spanning its query bases. Returns
+    the input unchanged when nothing merges.
+    """
+    if sum(n for n, op, _ in ops if op in 'M=XD') != len(reference) or sum(
+            n for n, op, _ in ops if op in 'M=XI') != len(query):
+        return ops
+    gaps = [i for i, (_n, op, _p) in enumerate(ops) if op in 'IDX']
+    if len(gaps) < 2 or not any(
+            ops[i][1] in 'ID' and ops[i][0] >= _GAP_MERGE_MIN_SV for i in gaps):
+        return ops
+    ref_offsets = [0]
+    qry_offsets = [0]
+    for n, op, _payload in ops:
+        ref_offsets.append(ref_offsets[-1] + (n if op in 'M=XD' else 0))
+        qry_offsets.append(qry_offsets[-1] + (n if op in 'M=XI' else 0))
+    run_costs = []
+    for left, right in zip(gaps, gaps[1:]):
+        r0, r1 = ref_offsets[left + 1], ref_offsets[right]
+        # A run over 400 bp costs > 200 even when fully masked.
+        if r1 - r0 > _GAP_MERGE_MAX_RUN_COST / _GAP_MERGE_PURE_MASKED_COST:
+            run_costs.append(float('inf'))
+        else:
+            run_costs.append(_gap_merge_run_cost(reference[r0:r1]))
+
+    breaks = set()
+
+    def sweep(order):
+        score = 0.0
+        previous = None
+        for k in order:
+            if previous is not None:
+                boundary = min(previous, k)
+                cost = run_costs[boundary]
+                if cost > _GAP_MERGE_MAX_RUN_COST:
+                    breaks.add(boundary)
+                    score = 0.0
+                else:
+                    score -= cost
+                    if score < 0:
+                        breaks.add(boundary)
+                        score = 0.0
+            score += ops[gaps[k]][0]
+            previous = k
+
+    sweep(range(len(gaps)))
+    sweep(range(len(gaps) - 1, -1, -1))
+
+    groups = []
+    start = 0
+    for k in range(len(gaps) - 1):
+        if k in breaks:
+            groups.append((start, k))
+            start = k + 1
+    groups.append((start, len(gaps) - 1))
+    # A group needs an SV (I/D >= 50 bp) and aligned bases (match or
+    # mismatch) inside it: directly adjacent D/I already form one event and
+    # are left to the D/I rescue's representation.
+    merged = [
+        (gaps[first], gaps[last]) for first, last in groups
+        if last > first
+        and any(ops[gaps[k]][1] in 'ID' and ops[gaps[k]][0] >= _GAP_MERGE_MIN_SV
+                for k in range(first, last + 1))
+        and any(op in 'M=X' for _n, op, _p in ops[gaps[first]:gaps[last] + 1])
+    ]
+    if not merged:
+        return ops
+    out = []
+    cursor = 0
+    for first_op, last_op in merged:
+        for n, op, payload in ops[cursor:first_op]:
+            _tm_add_op(out, n, op, payload)
+        r0, r1 = ref_offsets[first_op], ref_offsets[last_op + 1]
+        q0, q1 = qry_offsets[first_op], qry_offsets[last_op + 1]
+        _tm_add_op(out, r1 - r0, 'D', '')
+        _tm_add_op(out, q1 - q0, 'I', query[q0:q1])
+        cursor = last_op + 1
+    for n, op, payload in ops[cursor:]:
+        _tm_add_op(out, n, op, payload)
+    return out
+
+
+def _merge_masked_repeat_gaps_linear_piece(piece, linear, query_offset, query_sequence, ref_reader):
+    """Stage-4 polish: apply _merge_masked_repeat_gaps to one linear piece."""
+    if not _SV_REALIGNMENT_ENABLED or query_sequence is None or ref_reader is None:
+        return piece, linear
+    tokens = parse_cigar_ops(piece.cigar)
+    if (sum(tok.op in 'IDX' for tok in tokens) < 2
+            or not any(tok.op in 'ID' and tok.n >= _GAP_MERGE_MIN_SV for tok in tokens)):
+        return piece, linear
+    try:
+        reference = ref_reader.fetch(linear.chrom, linear.genome_start,
+                                     linear.genome_end, linear.strand)
+    except (KeyError, ValueError, OSError):
+        return piece, linear
+    query = query_sequence[query_offset:query_offset + pairwise_query_span(piece.cigar)]
+    if len(reference) != pairwise_ref_span(piece.cigar) or len(query) != pairwise_query_span(piece.cigar):
+        return piece, linear
+    original = [(tok.n, tok.op, tok.payload) for tok in tokens]
+    candidate = _merge_masked_repeat_gaps(original, reference, query)
+    if candidate is original:
+        return piece, linear
+    body = []
+    for n, op, payload in candidate:
+        _append_recanonicalized_op(body, '=' if op == 'M' else op, n, payload)
+    cigar = ''.join(_op_to_cigar(tok) for tok in body)
+    if cigar == piece.cigar:
+        return piece, linear
+    repaired = replace(piece, cigar=cigar)
+    return repaired, replace(linear, piece=repaired, cigar=cigar)
+
+
+def _frozen_local_windows(frozen, linear, query_offset, ref_length, qry_length):
+    """Frozen windows inside this piece as local ``(r0, r1, q0, q1)`` offsets."""
+    windows = []
+    for q0, q1, g0, g1 in frozen:
+        if linear.strand == '-':
+            r0, r1 = linear.genome_end - g1, linear.genome_end - g0
+        else:
+            r0, r1 = g0 - linear.genome_start, g1 - linear.genome_start
+        q0, q1 = q0 - query_offset, q1 - query_offset
+        if 0 <= r0 <= r1 <= ref_length and 0 <= q0 <= q1 <= qry_length:
+            windows.append((r0, r1, q0, q1))
+    return sorted(windows, key=lambda window: (window[2], window[0]))
+
+
+def _consolidate_between_frozen_windows(ops, reference, query, windows, *, reverse):
+    """Consolidate each segment between frozen windows; keep windows as-is.
+
+    Returns None when a window boundary cannot be located, so the caller keeps
+    the piece unchanged rather than risk realigning inside a frozen window.
+    """
+    ops = [(n, 'M' if op == '=' else op, payload) for n, op, payload in ops]
+    columns, ref_offsets, qry_offsets = _tm_alignment_offsets(ops)
+    cuts = []
+    for r0, r1, q0, q1 in windows:
+        left = _column_at_offsets(ops, columns, ref_offsets, qry_offsets, r0, q0)
+        right = _column_at_offsets(ops, columns, ref_offsets, qry_offsets, r1, q1)
+        if left is None or right is None or right < left or (
+                cuts and left < cuts[-1][1]):
+            return None
+        cuts.append((left, right))
+
+    def consolidate(start, end):
+        segment = _tm_slice_ops_by_columns(ops, columns, start, end)
+        if not segment:
+            return []
+        r0, q0 = _tm_axis_offset_at_column(
+            ops, columns, ref_offsets, qry_offsets, start)
+        r1, q1 = _tm_axis_offset_at_column(
+            ops, columns, ref_offsets, qry_offsets, end)
+        ref_segment, qry_segment = reference[r0:r1], query[q0:q1]
+        result = segment
+        if (sum(op in 'ID' for _n, op, _p in segment) >= 2
+                or any(op in 'ID' and n >= 50 for n, op, _p in segment)):
+            result = _tm_consolidate_sv_ops(segment, ref_segment, qry_segment)
+            tokens = [CigarOp(n, '=' if op == 'M' else op, payload)
+                      for n, op, payload in segment]
+            if not _sv_replacement_is_valid(
+                    tokens, result, ref_segment, qry_segment):
+                result = segment
+        return _normalize_repeat_indels(
+            result, ref_segment, qry_segment, reverse=reverse)
+
+    candidate = []
+    cursor = 0
+    for left, right in cuts:
+        for piece in consolidate(cursor, left):
+            _tm_add_op(candidate, *piece)
+        for piece in _tm_slice_ops_by_columns(ops, columns, left, right):
+            _tm_add_op(candidate, *piece)
+        cursor = right
+    for piece in consolidate(cursor, columns[-1]):
+        _tm_add_op(candidate, *piece)
+    return candidate
+
+
+def _consolidate_linear_piece(piece, linear, query_offset, query_sequence, ref_reader, frozen=()):
+    """Consolidate either indel direction before large-insertion encoding.
+
+    ``frozen`` masked-repeat windows (see _masked_repeat_realign_linear_piece)
+    are already realigned: only the segments between them are consolidated.
+    """
     if not _SV_REALIGNMENT_ENABLED or query_sequence is None or ref_reader is None:
         return piece, linear
     tokens = parse_cigar_ops(piece.cigar)
@@ -5029,14 +5547,22 @@ def _consolidate_linear_piece(piece, linear, query_offset, query_sequence, ref_r
     if len(reference) != pairwise_ref_span(piece.cigar) or len(query) != pairwise_query_span(piece.cigar):
         return piece, linear
     original = [(tok.n, tok.op, tok.payload) for tok in tokens]
-    candidate = _tm_consolidate_sv_ops(original, reference, query)
-    if not _sv_replacement_is_valid(tokens, candidate, reference, query):
-        candidate = original
-    # A single already-consolidated gap may still need canonical placement.
-    # Equivalent shifts do not need a strict improvement; actual realignment
-    # still passes the gate above. Reverse pieces use genomic left alignment.
-    candidate = _normalize_repeat_indels(
-        candidate, reference, query, reverse=linear.strand == '-')
+    windows = _frozen_local_windows(frozen, linear, query_offset,
+                                    len(reference), len(query))
+    if windows:
+        candidate = _consolidate_between_frozen_windows(
+            original, reference, query, windows, reverse=linear.strand == '-')
+        if candidate is None:
+            return piece, linear
+    else:
+        candidate = _tm_consolidate_sv_ops(original, reference, query)
+        if not _sv_replacement_is_valid(tokens, candidate, reference, query):
+            candidate = original
+        # A single already-consolidated gap may still need canonical placement.
+        # Equivalent shifts do not need a strict improvement; actual realignment
+        # still passes the gate above. Reverse pieces use genomic left alignment.
+        candidate = _normalize_repeat_indels(
+            candidate, reference, query, reverse=linear.strand == '-')
     body = []
     for n, op, payload in candidate:
         _append_recanonicalized_op(body, '=' if op == 'M' else op, n, payload)
@@ -5077,11 +5603,16 @@ def build_stage4_linear(stage1: Stage1Result, stage3: Stage3PolishResult, graph_
         main_linear = project_linear_piece_on_reference_backbone(main_piece, ref_backbone_coord, main_ref_path_start)
         if main_linear is None:
             return Stage3Result([])
+        main_piece, main_linear, frozen = _masked_repeat_realign_linear_piece(
+            main_piece, main_linear, 0, query_sequence, ref_reader)
+        skip = {'frozen': frozen} if frozen else {}
         main_piece, main_linear = _rescue_internal_di_windows_multiscale(
-            main_piece, main_linear, 0, query_sequence, ref_reader)
+            main_piece, main_linear, 0, query_sequence, ref_reader, **skip)
         main_piece, main_linear = _rescue_long_di_pairs_in_linear_piece(
-            main_piece, main_linear, 0, query_sequence, ref_reader)
+            main_piece, main_linear, 0, query_sequence, ref_reader, **skip)
         main_piece, main_linear = _consolidate_linear_piece(
+            main_piece, main_linear, 0, query_sequence, ref_reader, **skip)
+        main_piece, main_linear = _merge_masked_repeat_gaps_linear_piece(
             main_piece, main_linear, 0, query_sequence, ref_reader)
         encoded_linear = encode_large_insertions_in_piece(main_piece, 0, main_linear, query_sequence, stage1, graph_sequences, graph_mappings, ref_reader, min_encode_query_span, local_duplicate_pieces, query_coverages)
         assign_global_piece_metadata(encoded_linear)
@@ -5114,11 +5645,16 @@ def build_stage4_linear(stage1: Stage1Result, stage3: Stage3PolishResult, graph_
             linear = project_linear_piece(piece, path_coords)
         if linear is None:
             continue
+        piece, linear, frozen = _masked_repeat_realign_linear_piece(
+            piece, linear, piece_q0, query_sequence, ref_reader)
+        skip = {'frozen': frozen} if frozen else {}
         piece, linear = _rescue_internal_di_windows_multiscale(
-            piece, linear, piece_q0, query_sequence, ref_reader)
+            piece, linear, piece_q0, query_sequence, ref_reader, **skip)
         piece, linear = _rescue_long_di_pairs_in_linear_piece(
-            piece, linear, piece_q0, query_sequence, ref_reader)
+            piece, linear, piece_q0, query_sequence, ref_reader, **skip)
         piece, linear = _consolidate_linear_piece(
+            piece, linear, piece_q0, query_sequence, ref_reader, **skip)
+        piece, linear = _merge_masked_repeat_gaps_linear_piece(
             piece, linear, piece_q0, query_sequence, ref_reader)
         linear_pieces.extend(encode_large_insertions_in_piece(piece, piece_q0, linear, query_sequence, stage1, graph_sequences, graph_mappings, ref_reader, min_encode_query_span, local_duplicate_pieces, query_coverages))
     assign_global_piece_metadata(linear_pieces)
@@ -6311,6 +6847,7 @@ def _rescue_internal_di_windows_in_linear_piece(
     query_sequence: Optional[str],
     ref_reader: Optional[FastaRegionReader],
     strong_exact_min: int = 31,
+    frozen=(),
 ) -> Tuple[PairwisePiece, LinearPiece]:
     """Realign a composite D/I window bounded by strong exact anchors.
 
@@ -6378,6 +6915,11 @@ def _rescue_internal_di_windows_in_linear_piece(
             and rpos >= 0
             and qpos >= 0
             and qpos + qry_len <= len(query_sequence)
+            # Masked-repeat windows are already realigned.
+            and not _overlaps_frozen(
+                frozen, qpos, qpos + qry_len,
+                *((rpos, rpos + ref_len) if linear.strand == '+'
+                  else (rpos - ref_len, rpos)))
         ):
             try:
                 ref_seq = _fetch_linear_piece_ref_chunk(
@@ -6454,6 +6996,7 @@ def _rescue_internal_di_windows_multiscale(
     piece_q0: int,
     query_sequence: Optional[str],
     ref_reader: Optional[FastaRegionReader],
+    frozen=(),
 ) -> Tuple[PairwisePiece, LinearPiece]:
     """Rescue broad repeat replacements before considering local windows.
 
@@ -6474,6 +7017,7 @@ def _rescue_internal_di_windows_multiscale(
             query_sequence,
             ref_reader,
             strong_exact_min=minimum_exact,
+            frozen=frozen,
         )
     return (piece, linear)
 
@@ -6484,6 +7028,7 @@ def _rescue_long_di_pairs_in_linear_piece(
     piece_q0: int,
     query_sequence: Optional[str],
     ref_reader: Optional[FastaRegionReader],
+    frozen=(),
 ) -> Tuple[PairwisePiece, LinearPiece]:
     """Replace an eligible adjacent D/I pair with a sequence alignment.
 
@@ -6549,6 +7094,14 @@ def _rescue_long_di_pairs_in_linear_piece(
             or max(ref_len, qry_len) < _LONG_DI_REALIGN_THRESHOLD
         )
         if not is_small_pair and not is_supported_long_pair:
+            append_and_advance(first)
+            i += 1
+            continue
+        # Masked-repeat windows are already realigned.
+        if frozen and _overlaps_frozen(
+                frozen, qpos, qpos + qry_len,
+                *((rpos, rpos + ref_len) if linear.strand == '+'
+                  else (rpos - ref_len, rpos))):
             append_and_advance(first)
             i += 1
             continue
@@ -7354,12 +7907,17 @@ def _rescue_serialized_di_pairs(
             genome_end=segment.end,
             cigar=body_cigar,
         )
+        pairwise, linear, frozen = _masked_repeat_realign_linear_piece(
+            pairwise, linear, query_offset, query_sequence, ref_reader)
+        # Masked-repeat windows are already realigned; skip them below.
+        skip = {'frozen': frozen} if frozen else {}
         rescued, rescued_linear = _rescue_internal_di_windows_multiscale(
             pairwise,
             linear,
             query_offset,
             query_sequence,
             ref_reader,
+            **skip,
         )
         rescued, _rescued_linear = _rescue_long_di_pairs_in_linear_piece(
             rescued,
@@ -7367,9 +7925,13 @@ def _rescue_serialized_di_pairs(
             query_offset,
             query_sequence,
             ref_reader,
+            **skip,
         )
         rescued, rescued_linear = _consolidate_linear_piece(
-            rescued, _rescued_linear, query_offset, query_sequence, ref_reader)
+            rescued, _rescued_linear, query_offset, query_sequence, ref_reader,
+            **skip)
+        rescued, rescued_linear = _merge_masked_repeat_gaps_linear_piece(
+            rescued, rescued_linear, query_offset, query_sequence, ref_reader)
         if rescued.cigar != body_cigar:
             changed = True
         if (segment.is_main and rescued.cigar != body_cigar and stage1 is not None

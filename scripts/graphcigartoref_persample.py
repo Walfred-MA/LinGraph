@@ -59,6 +59,17 @@ MIN_LAST_RESORT_SIMILARITY_ALIGNED_BASES = 2_000
 
 
 @dataclasses.dataclass(frozen=True)
+class FinalLiftMapping:
+    kind: str
+    stage: int
+    tier: str
+    references: Tuple[str, ...]
+    interval_text: str
+    interval: Optional[core.Coord]
+    score: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
 class GenomeLiftRow:
     allele: str
     locus: core.Coord
@@ -74,6 +85,16 @@ class GenomeLiftRow:
     group_token: str = ""
     left_extension: str = "0"
     right_extension: str = "0"
+    assignment_stage: int = 0
+    assignment_tier: str = ""
+    source_class: str = ""
+    final_stage_present: bool = False
+    location_mapping: Optional[FinalLiftMapping] = None
+    sequence_mapping: Optional[FinalLiftMapping] = None
+    mapping_columns_present: bool = False
+    lift_kind: str = ""
+    lift_role: str = ""
+    alignment_allele: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -232,6 +253,118 @@ def read_graph_entries(graph_list: str, graph_folder: str) -> List[GraphEntry]:
     return entries
 
 
+def _summary_graph_prefixes(summary_dir: str) -> Set[str]:
+    """Return graph prefixes represented by a consolidated graph summary."""
+    if not summary_dir:
+        return set()
+    summary_path = os.path.join(
+        os.path.abspath(os.path.expanduser(summary_dir)), "local_graphs.tsv",
+    )
+    if not os.path.isfile(summary_path):
+        return set()
+    prefixes = set()
+    with open(summary_path, "rt", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames is None or "partition" not in reader.fieldnames:
+            raise ValueError(
+                f"{summary_path}: expected a partition column"
+            )
+        for row in reader:
+            partition = (row.get("partition") or "").strip()
+            if partition and partition != ".":
+                prefixes.add(sanitize_id(graph_prefix(partition)))
+    return prefixes
+
+
+def unavailable_graph_prefixes(
+    graph_entries: Sequence[GraphEntry], summary_dir: str = "",
+) -> Set[str]:
+    """Return listed graph prefixes absent from folders and the summary."""
+    summary_prefixes = _summary_graph_prefixes(summary_dir)
+    return {
+        entry.graph_prefix for entry in graph_entries
+        if not os.path.isfile(entry.fasta_path)
+        and entry.graph_prefix not in summary_prefixes
+    }
+
+
+
+def _effective_stage_tier(fields):
+    """Columns 15/16 as (stage text, tier): GenomeLift joins its location and
+    sequence mappings with ";" (``2;3`` / ``primary;secondary``); the primary
+    one is effective, else the first."""
+    stages = (fields[14] if len(fields) > 14 else "").strip().split(";")
+    tiers = (fields[15] if len(fields) > 15 else "").strip().lower().split(";")
+    index = tiers.index("primary") if "primary" in tiers else 0
+    return (
+        stages[index] if index < len(stages) else stages[0],
+        tiers[index] if index < len(tiers) else "",
+    )
+
+
+def _final_lift_mappings(fields) -> Tuple[
+    Optional[FinalLiftMapping], Optional[FinalLiftMapping]
+]:
+    """Parse GenomeLift columns 15-18 into fixed mapping-source records."""
+    if len(fields) < 18:
+        return None, None
+    stages = [
+        value.strip() for value in fields[14].strip().split(";")
+        if value.strip()
+    ]
+    parsed = []
+    present_index = 0
+    for kind, value in zip(("location", "sequence"), fields[16:18]):
+        value = value.strip()
+        if value in {"", "."}:
+            parsed.append(None)
+            continue
+        parts = value.split("|", 3)
+        if len(parts) != 4:
+            raise ValueError(
+                f"malformed {kind} mapping {value!r}; expected "
+                "tier|references|interval|score"
+            )
+        tier, references_text, interval_text, score = parts
+        tier = tier.strip().lower()
+        stage_text = (
+            stages[present_index]
+            if present_index < len(stages) else ""
+        )
+        # Stage 1 writes one shared stage value while both fixed mapping
+        # columns contain the same high-confidence placement.
+        if not stage_text and stages == ["1"]:
+            stage_text = "1"
+        if present_index and stages == ["1"]:
+            stage_text = "1"
+        present_index += 1
+        if not stage_text.isdigit() or tier not in {"primary", "secondary"}:
+            raise ValueError(
+                f"{kind} mapping lacks a numeric stage/valid tier: {value!r}"
+            )
+        references = tuple(
+            reference.strip() for reference in references_text.split(";")
+            if reference.strip() not in {"", "."}
+        )
+        interval_text = interval_text.strip()
+        interval = (
+            core.parse_coord(interval_text)
+            if interval_text not in {"", "."} else None
+        )
+        if interval is None and interval_text not in {"", "."}:
+            interval = core.parse_coord(interval_text + "+")
+        parsed.append(FinalLiftMapping(
+            kind=kind,
+            stage=int(stage_text),
+            tier=tier,
+            references=references,
+            interval_text=interval_text,
+            interval=interval,
+            score=score,
+        ))
+    return parsed[0], parsed[1]
+
+
 def read_genomelift(path: str) -> List[GenomeLiftRow]:
     rows: List[GenomeLiftRow] = []
     with open(path, "rt") as handle:
@@ -315,6 +448,8 @@ def read_genomelift(path: str) -> List[GenomeLiftRow]:
                     merged_ref_locus_text,
                     fields[2].strip() if ";" in fields[2] else "",
                 ))
+            stage_text, assignment_tier = _effective_stage_tier(fields)
+            location_mapping, sequence_mapping = _final_lift_mappings(fields)
             rows.append(GenomeLiftRow(
                 allele=fields[0],
                 locus=locus,
@@ -330,6 +465,27 @@ def read_genomelift(path: str) -> List[GenomeLiftRow]:
                 group_token=group_token,
                 left_extension=part_value(fields[12]),
                 right_extension=part_value(fields[13]),
+                assignment_stage=(
+                    int(stage_text) if stage_text.isdigit() else 0
+                ),
+                assignment_tier=assignment_tier,
+                # 17-column files hold the source class in column 17;
+                # 18-column files hold GenomeLift's location/sequence
+                # mappings in 17/18. The class otherwise comes from column 7.
+                source_class=(
+                    fields[16].strip()
+                    if len(fields) == 17 and fields[16].strip()
+                    and "|" not in fields[16]
+                    else fields[6].strip()
+                ),
+                final_stage_present=(
+                    stage_text.isdigit()
+                    and assignment_tier in {"primary", "secondary"}
+                ),
+                location_mapping=location_mapping,
+                sequence_mapping=sequence_mapping,
+                mapping_columns_present=len(fields) >= 18,
+                alignment_allele=fields[0],
             ))
     return rows
 
@@ -339,13 +495,15 @@ def select_effective_query_rows(
     query_genome: str,
     refhaplo: str,
 ) -> Tuple[List[GenomeLiftRow], int, Dict[str, int]]:
-    """Select rows participating in the three-tier reference cascade.
+    """Select final GenomeLift mappings, with legacy cascade compatibility.
 
-    Priority 0 is a high-coverage same-graph column-2 match, priority 1 is one
-    unmerged reference allele in column 9, priority 2 retries the column-2
-    result at the ordinary threshold, and priority 3 is the coordinate in
-    column 10. Candidate construction later verifies the named reference rows
-    and their actual ``_align.txt`` intervals.
+    New GenomeLift rows carry independent location and sequence mappings in
+    columns 17/18.  Materialize those as separate internal rows.  Location is
+    the main placement.  A different sequence placement is an alternative
+    duplication source; a primary sequence-only placement remains main (the
+    promoted translocation case), while a secondary sequence-only placement
+    remains alternative.
+    The internal suffix never appears in graph-CIGAR output.
     """
     selected: List[GenomeLiftRow] = []
     query_row_count = 0
@@ -353,7 +511,63 @@ def select_effective_query_rows(
         "column9_single": 0,
         "bestref_similarity": 0,
         "column10": 0,
+        "final_location": 0,
+        "final_sequence_main": 0,
+        "final_sequence_alternative": 0,
     }
+
+    def mapping_identity(mapping: FinalLiftMapping) -> tuple:
+        interval = mapping.interval
+        interval_key = (
+            (interval.chrom, interval.start, interval.end, interval.strand)
+            if interval is not None else mapping.interval_text
+        )
+        return mapping.references, interval_key
+
+    def materialize_mapping(
+        row: GenomeLiftRow,
+        mapping: FinalLiftMapping,
+        role: str,
+    ) -> GenomeLiftRow:
+        alias = row.allele
+        if mapping.kind == "sequence" and row.location_mapping is not None:
+            alias += "\x1elift_sequence"
+        group_token = row.group_token
+        if row.part_index:
+            grouped_query_loci = (
+                row.group_token.rsplit("\x1f", 1)[-1]
+                if row.group_token else ""
+            )
+            group_token = "\x1f".join((
+                allele_matrix_name(row.alignment_allele or row.allele),
+                row.locus.chrom,
+                mapping.interval_text,
+                grouped_query_loci,
+            ))
+        # Location and sequence mappings of the same grouped PA must never be
+        # rejoined into one comparison group.
+        group_token = (
+            group_token + "\x1e" + mapping.kind if group_token else ""
+        )
+        return dataclasses.replace(
+            row,
+            allele=alias,
+            assigned_ref="",
+            assigned_refs=mapping.references,
+            best_ref=";".join(mapping.references),
+            merged_ref_locus=mapping.interval,
+            merged_ref_locus_text=mapping.interval_text,
+            assignment_source=f"final_{mapping.kind}",
+            assignment_stage=mapping.stage,
+            assignment_tier=mapping.tier,
+            final_stage_present=True,
+            lift_kind=mapping.kind,
+            lift_role=role,
+            group_token=group_token,
+            # Sequence lift uses exactly its PA interval from _align.txt.
+            left_extension=("0" if mapping.kind == "sequence" else row.left_extension),
+            right_extension=("0" if mapping.kind == "sequence" else row.right_extension),
+        )
 
     for row in lift_rows:
         try:
@@ -365,6 +579,30 @@ def select_effective_query_rows(
         if row.class_type.lower() == "del":
             continue
         query_row_count += 1
+        if row.mapping_columns_present:
+            location = row.location_mapping
+            sequence = row.sequence_mapping
+            if location is not None:
+                selected.append(materialize_mapping(row, location, "main"))
+                assignment_counts["final_location"] += 1
+            if (
+                sequence is not None
+                and (
+                    location is None
+                    or mapping_identity(sequence) != mapping_identity(location)
+                )
+            ):
+                role = (
+                    "main"
+                    if location is None and sequence.tier == "primary"
+                    else "alternative"
+                )
+                selected.append(materialize_mapping(row, sequence, role))
+                assignment_counts[
+                    "final_sequence_main"
+                    if role == "main" else "final_sequence_alternative"
+                ] += 1
+            continue
         matrix = allele_matrix_name(row.allele)
 
         def valid_named_reference(value: str) -> bool:
@@ -384,7 +622,20 @@ def select_effective_query_rows(
             valid_named_reference(value)
             for value in row.best_ref.split(";")
         )
-        if has_bestref:
+        if row.final_stage_present:
+            # GenomeLift's final election is authoritative.  Do not rerun the
+            # historical best-ref/coverage cascade here: doing so can align a
+            # stage/tier annotation to a different reference than the one it
+            # describes.  Multi-reference placements are materialized from
+            # their elected column-10 interval below.
+            if (
+                row.assignment_stage <= 0
+                or row.assignment_tier not in {"primary", "secondary"}
+                or not row.assigned_refs
+            ):
+                continue
+            assignment_source = "final_lift"
+        elif has_bestref:
             assignment_source = "bestref_similarity"
         elif single_column9:
             assignment_source = "column9_single"
@@ -405,14 +656,16 @@ def select_effective_query_rows(
                 row.merged_ref_locus_text,
                 grouped_query_loci,
             ))
+        # Keep assigned_refs: the tier-1 (single column-9) candidate below
+        # reads it.
         selected_row = dataclasses.replace(
             row,
             assigned_ref="",
-            assigned_refs=(),
             assignment_source=assignment_source,
             group_token=group_token,
         )
         selected.append(selected_row)
+        assignment_counts.setdefault(assignment_source, 0)
         assignment_counts[assignment_source] += 1
     return selected, query_row_count, assignment_counts
 
@@ -819,8 +1072,14 @@ def prepare_input_record(
     # graphreftovcf.py resolves the overlap per aligned base after every row is
     # available.
     core_locus = row.locus
+    alignment_allele = row.alignment_allele or row.allele
     # Preserve the complete graph CIGAR represented by the selected interval.
-    if symmetric_extension is None:
+    if row.lift_kind == "sequence":
+        # A sequence lift is evidence supplied by the existing _align.txt PA,
+        # not permission to infer more query coverage around it.
+        cigar_locus = row.locus
+        cross_validation_extension = 0
+    elif symmetric_extension is None:
         cigar_locus = apply_alignment_locus_extensions(row, max_extension)
     else:
         symmetric_extension = int(symmetric_extension)
@@ -834,7 +1093,7 @@ def prepare_input_record(
         )
     try:
         alignment = locate_alignment_row(
-            row.allele, cigar_locus, alignment_index,
+            alignment_allele, cigar_locus, alignment_index,
         )
     except ValueError as extended_error:
         # Extensions are optional context.  A block can be valid while the
@@ -843,7 +1102,7 @@ def prepare_input_record(
         # to the alignment containing the original, unextended block.
         try:
             alignment = locate_alignment_row(
-                row.allele, row.locus, alignment_index,
+                alignment_allele, row.locus, alignment_index,
             )
         except ValueError:
             raise extended_error
@@ -1356,7 +1615,7 @@ def add_local_template_groups(
         for alignment in query_alignments
     }
     used_output_query_names = {
-        row.allele
+        row.alignment_allele or row.allele
         for specification in group_specs
         for row in specification[0]
     }
@@ -1399,8 +1658,20 @@ def add_local_template_groups(
                 return candidate
 
     added = 0
+    skipped_missing_graphs: Dict[str, List[str]] = {}
     for index, template in enumerate(templates, 1):
         entry = entry_by_prefix.get(template.graph_prefix)
+        graph_folder_missing = (
+            entry is None or not os.path.isfile(entry.fasta_path)
+        )
+        if (
+            graph_folder_missing
+            and getattr(args, "skip_missing_graph_folders", False)
+        ):
+            skipped_missing_graphs.setdefault(
+                template.graph_prefix, [],
+            ).append(template.name)
+            continue
         if entry is None:
             raise ValueError(
                 f"local template {template.name!r} refers to unknown graph "
@@ -1490,6 +1761,19 @@ def add_local_template_groups(
             ((query_row.allele, template.name),),
         ))
         added += 1
+    if skipped_missing_graphs:
+        template_count = sum(map(len, skipped_missing_graphs.values()))
+        examples = ", ".join(sorted(skipped_missing_graphs)[:5])
+        suffix = (
+            f" (and {len(skipped_missing_graphs) - 5} more)"
+            if len(skipped_missing_graphs) > 5 else ""
+        )
+        sys.stderr.write(
+            "[graphcigartoref_persample] warning: "
+            f"--skip-missing-graph-folders skipped {template_count} local "
+            f"template(s) from {len(skipped_missing_graphs)} unavailable "
+            f"graph partition(s): {examples}{suffix}\n"
+        )
     return added
 
 
@@ -1521,11 +1805,75 @@ def build_direct_inputs(
         query_row_count,
         assignment_counts,
     ) = select_effective_query_rows(lift_rows, query_genome, args.refhaplo)
-    missing_reference_rows = query_row_count - len(selected_query_rows)
+    final_lift_row_count = sum(
+        row.final_stage_present for row in selected_query_rows
+    )
+    selected_source_rows = {
+        row.alignment_allele or row.allele for row in selected_query_rows
+    }
+    missing_reference_rows = max(0, query_row_count - len(selected_source_rows))
     if not selected_query_rows and not local_templates:
         raise ValueError(
             f"no assigned GenomeLift rows found for query genome {query_genome!r}"
         )
+
+    # Reject rows whose graph data cannot be materialized before looking up
+    # their alignment coordinates. Missing graph directories are expected in
+    # filtered graph sets, and their alignment rows may no longer satisfy the
+    # containment checks used for graphs that are still present. A graph
+    # summary is a complete replacement for its per-partition FASTA unless the
+    # caller explicitly requests the legacy folder-only policy.
+    entry_by_prefix = {entry.graph_prefix: entry for entry in graph_entries}
+    summary_prefixes = _summary_graph_prefixes(
+        getattr(args, "graph_summary", ""),
+    )
+    require_graph_folders = getattr(
+        args, "skip_missing_graph_folders", False,
+    )
+
+    def graph_folder_exists(prefix: str) -> bool:
+        entry = entry_by_prefix.get(prefix)
+        if entry is not None:
+            return os.path.isfile(entry.fasta_path)
+        # Keep the availability check useful when a filtered -L omits a graph
+        # that is nevertheless still present under -G.
+        graph_root = os.path.abspath(os.path.expanduser(args.graph_folder))
+        return os.path.isfile(os.path.join(
+            graph_root, prefix, prefix + ".FA",
+        ))
+
+    unavailable_prefixes = {
+        sanitize_id(allele_matrix_name(row.alignment_allele or row.allele))
+        for row in selected_query_rows
+        if not graph_folder_exists(
+            sanitize_id(allele_matrix_name(row.alignment_allele or row.allele)),
+        ) and (
+            require_graph_folders
+            or sanitize_id(allele_matrix_name(row.alignment_allele or row.allele))
+            not in summary_prefixes
+        )
+    }
+    if unavailable_prefixes:
+        original_count = len(selected_query_rows)
+        selected_query_rows = [
+            row for row in selected_query_rows
+            if sanitize_id(allele_matrix_name(row.alignment_allele or row.allele))
+            not in unavailable_prefixes
+        ]
+        examples = ", ".join(sorted(unavailable_prefixes)[:5])
+        suffix = (
+            f" (and {len(unavailable_prefixes) - 5} more)"
+            if len(unavailable_prefixes) > 5 else ""
+        )
+        sys.stderr.write(
+            "[graphcigartoref_persample] warning: skipped "
+            f"{original_count - len(selected_query_rows)} GenomeLift row(s) "
+            f"from {len(unavailable_prefixes)} unavailable graph "
+            "partition(s) before alignment-coordinate validation: "
+            f"{examples}{suffix}\n"
+        )
+        if not selected_query_rows and not local_templates:
+            return [], {}
 
     query_alignments = read_alignment_output(args.align_query)
     reference_alignments = read_alignment_output(reference_alignment)
@@ -1533,7 +1881,9 @@ def build_direct_inputs(
     reference_index = build_alignment_index(reference_alignments, graph_entries)
     usable_query_rows: List[GenomeLiftRow] = []
     for row in selected_query_rows:
-        locate_alignment_row(row.allele, row.locus, query_index)
+        locate_alignment_row(
+            row.alignment_allele or row.allele, row.locus, query_index,
+        )
         usable_query_rows.append(row)
     selected_query_rows = usable_query_rows
     if not selected_query_rows and not local_templates:
@@ -1599,7 +1949,8 @@ def build_direct_inputs(
             if len(set(observed_parts)) != len(observed_parts):
                 raise ValueError(
                     f"{query_rows[0].allele}: duplicate grouped part indexes "
-                    f"within graph {allele_matrix_name(query_rows[0].allele)}: "
+                    "within graph "
+                    f"{allele_matrix_name(query_rows[0].alignment_allele or query_rows[0].allele)}: "
                     f"{observed_parts}"
                 )
             expected_parts = list(range(1, len(query_rows) + 1))
@@ -1623,7 +1974,10 @@ def build_direct_inputs(
                 f"{query_rows[0].allele}: grouped query parts disagree on "
                 "their column-10 reference interval"
             )
-        matrices = {allele_matrix_name(row.allele) for row in query_rows}
+        matrices = {
+            allele_matrix_name(row.alignment_allele or row.allele)
+            for row in query_rows
+        }
         if len(matrices) != 1:
             raise ValueError(
                 f"{query_rows[0].allele}: grouped query parts cross graphs"
@@ -1632,6 +1986,7 @@ def build_direct_inputs(
         candidate_group = (tuple(row.allele for row in query_rows),)
         candidate_specs = []
         seen_alignment_candidates = set()
+        final_lift_group = all(row.final_stage_present for row in query_rows)
 
         def add_seed_candidates(
             seed: core.Coord,
@@ -1687,46 +2042,67 @@ def build_direct_inputs(
                     priority, source, seed, alignment, start, end, output_name,
                 ))
 
-        # Priorities 0 and 2 share one column-2 alignment. It is accepted first
-        # above 90%; if not, the cached result is reconsidered above 50% only
-        # after the unmerged column-9 tier has had its chance.
-        for query_row in query_rows:
-            for best_ref in query_row.best_ref.split(";"):
-                best_ref = best_ref.strip()
-                if not best_ref or allele_matrix_name(best_ref) != matrix:
-                    continue
-                reference_row = reference_lift_by_allele.get(best_ref)
-                if reference_row is None:
-                    continue
-                before = len(candidate_specs)
+        placement = next(iter(placements)) if placements else None
+        if final_lift_group:
+            # The final GenomeLift stage has already selected this reference
+            # or reference run.  Materialize exactly that placement and accept
+            # the best usable containing reference alignment without applying
+            # graphcigartoref's historical coverage cascade a second time.
+            selected_names = tuple(dict.fromkeys(
+                reference
+                for query_row in query_rows
+                for reference in query_row.assigned_refs
+            ))
+            output_name = ";".join(selected_names)
+            if placement is not None:
                 add_seed_candidates(
-                    reference_row.locus,
-                    0,
-                    "bestref_similarity",
-                    preferred_output_name=best_ref,
+                    placement, -1, "final_lift",
+                    preferred_output_name=output_name,
                 )
-                bestref_similarity_candidates += len(candidate_specs) - before
-
-        # Priority 1: exactly one query row and one unmerged column-9
-        # reference. The named reference row supplies the seed and label.
-        if len(query_rows) == 1 and len(query_rows[0].assigned_refs) == 1:
-            assigned_ref = query_rows[0].assigned_refs[0]
-            if allele_matrix_name(assigned_ref) == matrix:
-                reference_row = reference_lift_by_allele.get(assigned_ref)
-                if reference_row is not None:
+            else:
+                for reference in selected_names:
+                    reference_row = reference_lift_by_allele.get(reference)
+                    if reference_row is not None:
+                        add_seed_candidates(
+                            reference_row.locus, -1, "final_lift",
+                            preferred_output_name=output_name,
+                        )
+        else:
+            # Legacy unstaged GenomeLift input retains the historical cascade.
+            # Priorities 0 and 2 share one column-2 alignment.
+            for query_row in query_rows:
+                for best_ref in query_row.best_ref.split(";"):
+                    best_ref = best_ref.strip()
+                    if not best_ref or allele_matrix_name(best_ref) != matrix:
+                        continue
+                    reference_row = reference_lift_by_allele.get(best_ref)
+                    if reference_row is None:
+                        continue
+                    before = len(candidate_specs)
                     add_seed_candidates(
                         reference_row.locus,
-                        1,
-                        "column9_single",
-                        preferred_output_name=assigned_ref,
+                        0,
+                        "bestref_similarity",
+                        preferred_output_name=best_ref,
+                    )
+                    bestref_similarity_candidates += (
+                        len(candidate_specs) - before
                     )
 
-        # Priority 3: the current column-10 coordinate-intersection behavior,
-        # including merged and unnamed placements. It runs only if tiers 1 and
-        # 2 fail their respective success rules.
-        placement = next(iter(placements)) if placements else None
-        if placement is not None:
-            add_seed_candidates(placement, 3, "column10")
+            if len(query_rows) == 1 and len(query_rows[0].assigned_refs) == 1:
+                assigned_ref = query_rows[0].assigned_refs[0]
+                if allele_matrix_name(assigned_ref) == matrix:
+                    reference_row = reference_lift_by_allele.get(assigned_ref)
+                    if reference_row is not None:
+                        add_seed_candidates(
+                            reference_row.locus,
+                            1,
+                            "column9_single",
+                            preferred_output_name=assigned_ref,
+                        )
+
+            if placement is not None:
+                add_seed_candidates(placement, 3, "column10")
 
         if not candidate_specs:
             groups_without_reference_candidate += 1
@@ -1741,6 +2117,7 @@ def build_direct_inputs(
         ) in candidate_specs:
             reference_slice_number += 1
             source_tag = {
+                -1: "finallift",
                 0: "bestref",
                 1: "col9",
                 3: "col10",
@@ -1867,15 +2244,23 @@ def build_direct_inputs(
         getattr(args, "reference_extension", DEFAULT_REFERENCE_EXTENSION),
     )
     prepared.update(preprepared)
-    sys.stderr.write(
-        "[graphcigartoref_persample] reference cascade: column-2 same-graph "
-        "similarity (>90% aligned query coverage), one unmerged column-9 "
-        "allele (any usable alignment), cached column-2 similarity (>50%), "
-        "column-10 coordinate candidates (any usable alignment), then cached "
-        "column-2 similarity (>=2000 aligned unmasked query bases) as a last "
-        "resort. Seeds "
-        "select complete graph rows and never hard-crop alignment to the seed\n"
-    )
+    if final_lift_row_count:
+        sys.stderr.write(
+            "[graphcigartoref_persample] materializing "
+            f"{final_lift_row_count} final GenomeLift mapping(s) from "
+            "the separate location/sequence columns 17/18 and carrying "
+            "their stage, tier, kind, and role; "
+            "the legacy graphcigartoref reference cascade is bypassed for "
+            "those rows\n"
+        )
+    else:
+        sys.stderr.write(
+            "[graphcigartoref_persample] reference cascade: column-2 "
+            "same-graph similarity (>90% aligned query coverage), one "
+            "unmerged column-9 allele, cached column-2 similarity (>50%), "
+            "column-10 coordinate candidates, then cached column-2 "
+            "similarity (>=2000 aligned unmasked query bases)\n"
+        )
     cross_validation_extension = getattr(args, "cross_validation_extension", 4000)
     if cross_validation_extension:
         sys.stderr.write(
@@ -2024,7 +2409,9 @@ def build_direct_inputs(
                 # These dynamic fields intentionally keep PairRow compatible
                 # with graphcigartoref.py while carrying the per-part output
                 # view used after the merged comparison is built.
-                pair.output_query_name = query_row.allele
+                pair.output_query_name = (
+                    query_row.alignment_allele or query_row.allele
+                )
                 pair.output_ref_name = output_ref_name
                 pair.output_query_coord = qcoord
                 pair.output_query_core_coord = (
@@ -2063,6 +2450,12 @@ def build_direct_inputs(
                         ref_name, "column10",
                     )
                 )
+                pair.lift_stage = query_row.assignment_stage
+                pair.lift_tier = query_row.assignment_tier
+                pair.lift_source_class = query_row.source_class
+                pair.lift_kind = query_row.lift_kind
+                pair.lift_role = query_row.lift_role
+                pair.final_lift_annotation = query_row.final_stage_present
                 pair.column10_intersection_span = (
                     reference_core_outer.end - reference_core_outer.start
                 )
@@ -2080,16 +2473,29 @@ def build_direct_inputs(
             "were retained separately"
             if local_group_count else ""
         )
+        final_mapping_count = sum(
+            assignment_counts.get(key, 0) for key in (
+                "final_lift", "final_location", "final_sequence_main",
+                "final_sequence_alternative",
+            )
+        )
+        if final_mapping_count:
+            detail = (
+                f"retained {final_mapping_count} final staged "
+                "mapping row(s)"
+            )
+        else:
+            detail = (
+                "after later ownership/alignment filters retained "
+                f"{assignment_counts['column9_single']} single-column-9 "
+                f"row(s), {assignment_counts['bestref_similarity']} "
+                f"column-2 row(s), and {assignment_counts['column10']} "
+                "column-10 row(s)"
+            )
         sys.stderr.write(
-            f"[graphcigartoref_persample] skipped "
-            f"{missing_reference_rows} query rows at reference selection "
-            "because columns 9, 2, and 10 supplied no usable reference "
-            "candidate; "
-            "after later ownership/alignment filters retained "
-            f"{assignment_counts['column9_single']} single-column-9 row(s), "
-            f"{assignment_counts['bestref_similarity']} column-2 row(s), and "
-            f"{assignment_counts['column10']} column-10 row(s)"
-            f"{local_note}\n"
+            f"[graphcigartoref_persample] skipped {missing_reference_rows} "
+            "query row(s) without an elected usable reference candidate; "
+            f"{detail}{local_note}\n"
         )
     if grouped_pair_count:
         sys.stderr.write(
@@ -3526,6 +3932,28 @@ def format_provisional_row(
     )), read_alternative_tag(fields))
 
 
+def append_final_lift_tags(row_text: str, pair: core.PairRow) -> str:
+    """Carry GenomeLift's final candidate annotation into graph-CIGAR TSV."""
+    if not getattr(pair, "final_lift_annotation", False):
+        return row_text
+    tier = str(getattr(pair, "lift_tier", "")).strip().lower()
+    if tier not in {"primary", "secondary"}:
+        return row_text
+    stage = int(getattr(pair, "lift_stage", 0) or 0)
+    source_class = str(getattr(pair, "lift_source_class", "")).strip()
+    source_class = source_class.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    tags = [f"LIFT_STAGE:Z:{stage}", f"LIFT_TIER:Z:{tier}"]
+    lift_kind = str(getattr(pair, "lift_kind", "")).strip().lower()
+    lift_role = str(getattr(pair, "lift_role", "")).strip().lower()
+    if lift_kind in {"location", "sequence"}:
+        tags.append(f"LIFT_KIND:Z:{lift_kind}")
+    if lift_role in {"main", "alternative"}:
+        tags.append(f"LIFT_ROLE:Z:{lift_role}")
+    if source_class:
+        tags.append(f"LIFT_SOURCE_CLASS:Z:{source_class}")
+    return row_text + "\t" + "\t".join(tags)
+
+
 def format_merged_comparison_row(
     row_text: str,
     base_pair: core.PairRow,
@@ -3587,8 +4015,12 @@ def format_merged_comparison_row(
         )
     )
     cigar = query_only_graph_cigar(cigar)
+    output_query_names = ";".join(
+        getattr(pair, "output_query_name", pair.label or "")
+        for pair in output_pairs
+    )
     return core.append_tag("\t".join((
-        base_pair.query_name,
+        output_query_names,
         getattr(base_pair, "output_ref_name", base_pair.ref_name),
         coord_text(query_coord),
         reference_coordinates,
@@ -3627,12 +4059,16 @@ def _build_row(
         coord_by_name,
         allowchroms=allowchroms,
     )
-    return format_provisional_row(
+    formatted = format_provisional_row(
         row_text,
         pair,
         record_sequences.get(pair.query_name or ""),
         ref_reader,
         reference_flank_rescue,
+    )
+    return (
+        append_final_lift_tags(formatted, pair)
+        if formatted is not None else None
     )
 
 
@@ -3688,6 +4124,7 @@ def _build_comparison_rows(
         formatted = core.append_tag(
             formatted, getattr(base_pair, 'alternative_intervals', None),
         )
+        formatted = append_final_lift_tags(formatted, base_pair)
     return [formatted] if formatted is not None else []
 
 
@@ -4086,6 +4523,13 @@ def _evaluate_column10_candidate_rows(
             continue
         tier_successful.sort(key=lambda value: value[:3])
 
+        if priority == -1:
+            # GenomeLift has already elected the reference and stage/tier.
+            # This pass chooses only among physical _align.txt rows capable of
+            # materializing that elected mapping.
+            selected = tier_successful[0]
+            break
+
         if priority == 0:
             passing_similarity = [
                 candidate for candidate in tier_successful
@@ -4224,7 +4668,10 @@ def comparison_finished_key(
     base_pair, output_pairs = comparison
     if is_grouped_pair(base_pair) or len(output_pairs) > 1:
         return (
-            base_pair.query_name or "",
+            ";".join(
+                getattr(pair, "output_query_name", pair.label or "")
+                for pair in output_pairs
+            ),
             getattr(base_pair, "output_ref_name", base_pair.ref_name or ""),
             ";".join(
                 getattr(
@@ -4504,6 +4951,11 @@ def _write_parallel(
         # Cyclic-GC passes write to object headers, which would otherwise
         # unshare copy-on-write pages in every worker; freezing keeps those
         # pages shared.  Collection behavior for new objects is unchanged.
+        slots = int(getattr(args, "large_align_slots", 4))
+        core._LARGE_ALIGN_GATE = (
+            context.BoundedSemaphore(slots)
+            if 0 < slots < args.processes else None
+        )
         gc.freeze()
         try:
             with context.Pool(
@@ -4641,6 +5093,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--skip-missing-graph-folders",
+        action="store_true",
+        help=(
+            "skip GenomeLift candidates whose individual GRAPH_NAME.FA "
+            "folder is missing before alignment validation, even when the "
+            "partition is represented in --graph-summary"
+        ),
+    )
+    parser.add_argument(
         "-L",
         "--graph-list",
         required=True,
@@ -4725,6 +5186,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "emit a waiting diagnostic when no comparison finishes within this "
             "many seconds; 0 disables the watchdog (default: 60)"
+        ),
+    )
+    parser.add_argument(
+        "--large-align-slots",
+        type=int,
+        default=4,
+        metavar="N",
+        help=(
+            "at most N workers run a traceback alignment of >=20M cells at "
+            "once, capping peak RAM without changing results; 0 disables "
+            "(default: 4)"
         ),
     )
     parser.add_argument(
@@ -4831,6 +5303,8 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("--progress-every must be >= 0")
     if getattr(args, "progress_seconds", 60.0) < 0:
         raise ValueError("--progress-seconds must be >= 0")
+    if getattr(args, "large_align_slots", 4) < 0:
+        raise ValueError("--large-align-slots must be >= 0")
     if getattr(args, "maxtasksperchild", 512) < 0:
         raise ValueError("--maxtasksperchild must be >= 0")
     if args.max_extension < 0:
