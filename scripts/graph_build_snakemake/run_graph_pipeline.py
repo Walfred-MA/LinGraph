@@ -127,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-j", "--cores", type=int, default=64)
     parser.add_argument("--script-folder", default=str(REPOSITORY))
     parser.add_argument("--preparation-folder",
-                        default=str(REPOSITORY.parent / "tools"))
+                        default=str(REPOSITORY / "preparation"))
     parser.add_argument("--large-novels",
                         help="optional established novel_loci.fa")
     parser.add_argument("--partition-batches", type=int, default=100)

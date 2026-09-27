@@ -67,7 +67,7 @@ GRAPH = Path(resolve_path(config.get("graph_folder", "graph_work")))
 # so this is the single canonical partition root.
 GRAPH_OUTPUTS = GRAPH / "Graphs"
 SCRIPT_DIR = Path(resolve_path(config.get("script_folder", "..")))
-PREPARATION_DIR = resolve_path(config.get("preparation_folder", "../../tools"))
+PREPARATION_DIR = resolve_path(config.get("preparation_folder", "../preparation"))
 BED = str(config.get("bed", "")).strip()
 BED = resolve_path(BED) if BED else ""
 ALTERNATIVE_CONFIG = str(config.get("alternative_fasta", "")).strip()

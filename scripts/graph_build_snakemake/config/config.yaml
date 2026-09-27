@@ -17,7 +17,7 @@ novel_locus_jobs: 4
 keep_novel_work: false
 graph_folder: graph_work
 script_folder: ..
-preparation_folder: ../../tools
+preparation_folder: ../tools
 large_novel_fasta: ""
 
 threads: 64

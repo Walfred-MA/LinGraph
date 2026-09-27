@@ -264,6 +264,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="remove final VCF ALLELENAME and LABEL_H provenance",
     )
+    locus_dup_group = parser.add_mutually_exclusive_group()
+    locus_dup_group.add_argument(
+        "--locus-dup-as-insert", "--gene-dup-as-insert",
+        dest="locus_dup_as_insert",
+        action="store_true",
+        default=True,
+        help=(
+            "emit the inserted-locus parent for elected duplications "
+            "(default; --gene-dup-as-insert is a compatibility alias)"
+        ),
+    )
+    locus_dup_group.add_argument(
+        "--no-locus-dup-as-insert", "--no-gene-dup-as-insert",
+        dest="locus_dup_as_insert",
+        action="store_false",
+        help="omit inserted-locus duplication parents during per-sample calling",
+    )
     conflict_group = parser.add_mutually_exclusive_group()
     conflict_group.add_argument(
         "--resolve-conflicts-by-alignment-score",
@@ -272,7 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "retain an otherwise rejected cross-graph SV only when its PA "
-            "has the uniquely best main-path affine alignment score (default)"
+            "has the uniquely best main-path standard alignment score (default)"
         ),
     )
     conflict_group.add_argument(
@@ -365,6 +382,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "retain merge intermediates after successful VCF publication "
             "(local and Slurm); failed merges retain their scratch directories"
+        ),
+    )
+    duplication_merge_group = parser.add_mutually_exclusive_group()
+    duplication_merge_group.add_argument(
+        "--keep-full-locus-dup-insertions",
+        dest="keep_full_locus_dup_insertions",
+        action="store_true",
+        default=False,
+        help="retain full-locus duplication parent records in the cohort VCF",
+    )
+    duplication_merge_group.add_argument(
+        "--ignore-full-locus-dup-insertions",
+        dest="keep_full_locus_dup_insertions",
+        action="store_false",
+        help=(
+            "omit full-locus duplication parents while retaining calls on "
+            "their alternative source paths (default)"
         ),
     )
     parser.add_argument("--max-extension", type=int, default=10_000)
@@ -517,7 +551,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from cohort_vcf_recall import run as recall
         recall(absolute(args.output_folder), args.merge_mode, graph=absolute(args.graph_folder),
                reference=args.reference, samples=read_sample_selection(args.samples) if args.samples else None,
-               processes=args.cores, cutoff=args.sv_only_size or args.minsvsize, dry_run=args.dry_run)
+               processes=args.cores, cutoff=args.sv_only_size or args.minsvsize,
+               dry_run=args.dry_run,
+               caller_settings={
+                   "locus_dup_as_insert": args.locus_dup_as_insert,
+               },
+               merge_settings={
+                   "keep_full_locus_dup_insertions": (
+                       args.keep_full_locus_dup_insertions
+                   ),
+               })
         return 0
     check_snakemake(args.snakemake, args.skip_version_check)
 
@@ -544,7 +587,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          cutoff=args.sv_only_size or args.minsvsize, merge_distance=args.merge_distance,
                          size_similarity=args.size_similarity, sequence_similarity=args.sequence_similarity,
                          var_in_insert=args.var_in_insert, kmermatch=args.kmermatch, dry_run=args.dry_run,
-                         keep_merge_tmpdir=args.keep_merge_tmpdir)
+                         keep_merge_tmpdir=args.keep_merge_tmpdir,
+                         ignore_full_locus_dup_insertions=(
+                             not args.keep_full_locus_dup_insertions
+                         ))
         return 0
 
     graph = Path(absolute(args.graph_folder))
@@ -634,6 +680,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     required_scripts = (
         "match_partition_blocks.py", "GenomeLift.py",
         "graphcigartoref_persample.py", "fill_graphcigartoref_gaps.py",
+        "pseudolinear_assignments.py",
         "alternative_intervals.py",
         "graphreftovcf_persample.py", "local_reference_templates.py", "lift_local_templates.py",
         "assembly_contigs.py", "fixed_alternatives.py", "minsetref_localize.py", "minsetref_align.py",
@@ -756,6 +803,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
             "seqcompress": args.seqcompress,
             "pa_tag": args.pa_tag,
+            "locus_dup_as_insert": args.locus_dup_as_insert,
             "resolve_conflicts_by_alignment_score": (
                 args.resolve_conflicts_by_alignment_score
             ),
@@ -774,6 +822,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "minsvsize": final_minsvsize, "merge_distance": args.merge_distance,
         "size_similarity": args.size_similarity, "sequence_similarity": args.sequence_similarity,
         "var_in_insert": args.var_in_insert, "emit_small": args.merge_mode in ('all', 'svindel'),
+        "keep_full_locus_dup_insertions": args.keep_full_locus_dup_insertions,
     }
     merge_signature = hashlib.sha256(json.dumps([merge_settings, args.merge_mode == "all", "worker-snp-v3"], sort_keys=True).encode()).hexdigest()[:16]
     merge_tmpdir = Path(absolute(
