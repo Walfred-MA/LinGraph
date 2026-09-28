@@ -16,7 +16,7 @@ import graphvcfmerge_snp as snp
 def add_modes(parser):
     group = parser.add_mutually_exclusive_group()
     for name, help_text in (
-        ('all', 'merge into separate cohort.sv.vcf, cohort.indel.vcf and cohort.snp.vcf'),
+        ('all', 'merge into separate cohort.sv.vcf, cohort.indel.vcf and cohort.snp.vcf (default)'),
         ('svonly', 'merge SVs at or above --svcutoff into cohort.sv.vcf'),
         ('snp', 'merge only SNPs into cohort.snp.vcf'),
         ('svindel', 'merge SVs and split by size into cohort.sv.vcf and cohort.indel.vcf'),
@@ -26,7 +26,7 @@ def add_modes(parser):
 
 
 def resolve_mode(args):
-    return getattr(args, 'merge_mode', None) or ('all' if getattr(args, 'mc_graph', False) else 'svonly')
+    return getattr(args, 'merge_mode', None) or 'all'
 
 
 def output_paths(output, mode):
@@ -70,6 +70,8 @@ def combine(paths, output):
                 samples.append(name)
         for line in meta:
             if line.startswith('##source=merge_locus_vcfs_'):
+                continue
+            if line.startswith('##pseudoLinearMapping'):
                 continue
             if line.startswith('##contig=<'):
                 values = sv._parse_structured_meta(line, 'contig')
@@ -150,7 +152,8 @@ def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
 
 def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=20,
         merge_distance=500, size_similarity=.7, sequence_similarity=.7, var_in_insert=100,
-        kmermatch=sv.DEFAULT_KMERMATCH, dry_run=False, keep_merge_tmpdir=False):
+        kmermatch=sv.DEFAULT_KMERMATCH, dry_run=False, keep_merge_tmpdir=False,
+        ignore_full_locus_dup_insertions=True):
     paths = list(paths) if paths is not None else input_paths(output, listing)
     if not paths or processes < 1 or cutoff < 1:
         raise ValueError('merge requires input VCFs and positive process count/cutoff')
@@ -162,7 +165,13 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
     settings = dict(minsvsize=cutoff, merge_distance=merge_distance, size_similarity=size_similarity,
                     sequence_similarity=sequence_similarity, var_in_insert=var_in_insert,
                     emit_small=mode in ('all', 'svindel'))
-    identity = hashlib.sha256(json.dumps([stamps, settings, mode == "all", "worker-snp-v3"]).encode()).hexdigest()[:20]
+    identity_settings = dict(
+        settings,
+        ignore_full_locus_dup_insertions=bool(
+            ignore_full_locus_dup_insertions
+        ),
+    )
+    identity = hashlib.sha256(json.dumps([stamps, identity_settings, mode == "all", "worker-snp-v3"]).encode()).hexdigest()[:20]
     root = Path(output)/'tmp'/'merge_only'/identity
     root.mkdir(parents=True, exist_ok=True)
     sv_output, snp_output = root/'sv.vcf', root/'snp.vcf'
@@ -171,7 +180,13 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
     if mode != 'snp':
         shards = str(root/'sv_shards')
         if not (Path(shards)/'chroms.txt').is_file():
-            sv._fast_stage_scan(paths, shards, processes, snp_root if mode == 'all' else None)
+            sv._fast_stage_scan(
+                paths, shards, processes,
+                snp_root if mode == 'all' else None,
+                ignore_full_locus_dup_insertions=(
+                    ignore_full_locus_dup_insertions
+                ),
+            )
         with open(Path(shards)/'manifest.pkl', 'rb') as handle:
             manifest = pickle.load(handle)
         sv._fast_stage_chrom(shards, sorted(manifest['chrom_sections']), processes=processes,
@@ -216,6 +231,18 @@ def main(argv=None):
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--keep-merge-tmpdir', action='store_true',
                         help='retain merge intermediates after successful publication')
+    locus_dup = parser.add_mutually_exclusive_group()
+    locus_dup.add_argument(
+        '--ignore-full-locus-dup-insertions',
+        dest='ignore_full_locus_dup_insertions', action='store_true',
+        default=True,
+        help='exclude redundant full-locus duplication parent insertions (default)',
+    )
+    locus_dup.add_argument(
+        '--keep-full-locus-dup-insertions',
+        dest='ignore_full_locus_dup_insertions', action='store_false',
+        help='retain full-locus duplication parent insertions',
+    )
     parser.add_argument('--cleanup-tmpdir', action='append', default=[],
                         help='publish: remove this merge directory after all final VCFs are written')
     args = parser.parse_args(argv)
@@ -227,7 +254,11 @@ def main(argv=None):
         run(args.output, mode, listing=args.vcf_list, processes=args.processes, cutoff=args.svcutoff,
             merge_distance=args.merge_distance, size_similarity=args.size_similarity,
             sequence_similarity=args.sequence_similarity, var_in_insert=args.var_in_insert,
-            kmermatch=args.kmermatch, dry_run=args.dry_run, keep_merge_tmpdir=args.keep_merge_tmpdir)
+            kmermatch=args.kmermatch, dry_run=args.dry_run,
+            keep_merge_tmpdir=args.keep_merge_tmpdir,
+            ignore_full_locus_dup_insertions=(
+                args.ignore_full_locus_dup_insertions
+            ))
     return 0
 
 

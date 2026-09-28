@@ -5039,7 +5039,9 @@ _MASKED_REPEAT_MIN_EDGE = 50
 _MASKED_REPEAT_MERGE_GAP = 100
 _MASKED_REPEAT_ANCHOR = 500
 _MASKED_REPEAT_CELLS_PER_SV = 100_000_000
-_MASKED_REPEAT_MAX_CELLS = 400_000_000
+# Parasail traceback needs 2-4 bytes/cell; 100M cells keeps one window
+# at <=~400 MB per worker (400M cells could exceed 1.5 GB).
+_MASKED_REPEAT_MAX_CELLS = 100_000_000
 # alignment_scoring units (match 4, mismatch -8). With the final gap merge,
 # a gap open of 24 gives the best agreement between haplotypes that differ by
 # one SNP/1-bp indel (slop-0 124/150 vs 109/150 at 60) while keeping one SV
@@ -5178,7 +5180,7 @@ def _realign_masked_repeat_windows(ops, reference, query, *, reverse=False):
     """Canonically realign masked-repeat SV windows (see _masked_repeat_plan).
 
     Each window is realigned once by global affine parasail when reference x
-    query < min(sv_count x 100M, 400M) cells, left-normalized, and replaces
+    query < min(sv_count x 100M, 100M) cells, left-normalized, and replaces
     the window unconditionally: in a diverged repeat many placements score
     alike, and a strict-improvement rule would keep each haplotype's arbitrary
     input placement. Planning runs in forward genomic orientation so both

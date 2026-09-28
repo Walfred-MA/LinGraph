@@ -22,7 +22,6 @@ import lingraph_options as cli_options
 from graph_list_cache import graph_list_path, template_list_path
 
 ROOT = Path(__file__).resolve().parent
-TOOLS = ROOT.parent / "tools"
 SAMPLE = re.compile(r"^[A-Za-z0-9.-]+_h[1-9][0-9]*$")
 
 
@@ -47,8 +46,8 @@ def parser(show_advanced=False):
   -t/--threads INT        CPU budget (default: up to 16)
   --rigorous             Run both aligners; singular always uses this mode
   --all / --svonly / --svindel / --snp
-                         Variant selection (default: --svonly, or --all
-                         with --mc-graph); --svcutoff defaults to 20 bp
+                         Variant selection (default: --all);
+                         --svcutoff defaults to 20 bp
   --merge-only           Merge existing per-sample VCFs
   --slurm                Submit work through SLURM
   --slurm-args TEXT      Quoted sbatch options
@@ -84,15 +83,14 @@ Examples:
         q = modes.add_parser(mode, formatter_class=argparse.RawDescriptionHelpFormatter,
             help=("build/resume a graph, call cohort samples, and merge VCFs (default: --fast)"
                   if mode == "graph" else
-                  "call one or many samples independently against an existing graph (rigorous alignment only)"),
+                  "call new samples against an existing graph (rigorous alignment only)"),
             description=("Build/resume a graph, call every cohort sample, and merge VCFs." if mode == "graph"
-                         else "Call one or many sample/haplotype assemblies independently against an existing graph; write one VCF and coverage report per input."),
+                         else "Call new assemblies against an existing graph; report coverage per sample."),
             epilog=("Examples:\n  python LinGraph.py graph -I cohort.list -G savegraph -O calls\n"
                     "  python LinGraph.py graph -I cohort.list -r CHM13_h1 -G savegraph -O calls --MC-graph"
                     if mode == "graph" else
                     "Examples:\n  python LinGraph.py singular -i query.fa --sample HG002_h1 -G graph -O calls\n"
-                    "  python LinGraph.py singular -I samples.list -G graph -r reference.fa -O calls\n"
-                    "\nEach input is called independently. Add --merge to also merge the resulting VCFs.")
+                    "  python LinGraph.py singular -I samples.list -G graph -r reference.fa -O calls --merge")
                     + "\n\nLists: NAME FASTA, one sample/haplotype per row; index: FASTA.fai.\n"
                     "Prepare assemblies separately with LinGraph.py prepare.\n"
                     "LinGraph checks the first sequence and adjacent index; it never prepares inputs.\n"
@@ -103,23 +101,21 @@ Examples:
                             "existing compact summary/graph directory")
         q.add_argument("-O", "--output", "--output-folder", required=True, help="output directory for VCFs, logs, and run metadata")
         inputs = q.add_mutually_exclusive_group()
-        inputs.add_argument("-I", "--input-list", help=(
-            "NAME FASTA list for one or many samples; each input is called independently"
-            if mode == "singular" else "NAME FASTA list; graph defaults to its saved cohort list"))
+        inputs.add_argument("-I", "--input-list", help="NAME FASTA list; graph defaults to its saved cohort list")
         if mode == "singular":
             q.set_defaults(mc_graph=False, gfa_only=False, insertion_only=None, alternative=[])
             inputs.add_argument("-i", "--input", help="one query FASTA (requires --sample)")
             q.add_argument("--sample", help="query name, e.g. HG002_h1, for -i")
             q.add_argument("--reference-caches", metavar="DIR",
                            help="use supplied reference alignment and blocks without cache validation; default: GRAPH/references/NAME_rig")
-            q.add_argument("--merge", action="store_true", help="also merge independent calls from multiple inputs; explicit variant-selection options also enable merging")
+            q.add_argument("--merge", action="store_true", help="also write cohort SNP/indel/SV VCFs when calling multiple samples (off by default)")
         q.add_argument("-r", "--reference", help="reference NAME or FASTA; default: first saved cohort assembly")
         q.add_argument("-L", "--graph-list", help="partition names or paths, one per row; default: all")
         q.add_argument("-t", "-j", "--threads", "--cores", type=int,
                        default=max(4 if mode == "graph" else 1, min(16, os.cpu_count() or 1)),
                        help="local CPU budget / calling worker CPUs with SLURM; graph requires >=4 (default: %(default)s)")
         if mode == "graph":
-            q.add_argument("--MC-graph", "--mc-graph", dest="mc_graph", action="store_true", help="convert merged VCF to cohort.gfa; defaults to --all, otherwise --svonly")
+            q.add_argument("--MC-graph", "--mc-graph", dest="mc_graph", action="store_true", help="convert merged VCF to cohort.gfa")
         alignment = q.add_mutually_exclusive_group()
         if mode == "graph":
             alignment.add_argument("--fast", "--fast-mode", dest="alignment_mode", action="store_const", const="fast",
@@ -209,7 +205,7 @@ def check_fasta(path):
     if any(c.isspace() for c in str(path)):
         raise ValueError(f"FASTA paths cannot contain whitespace: {path}")
     if path.suffix.lower() in {".gz", ".bgz", ".bgzf"}:
-        raise ValueError(f"Use an uncompressed assembly FASTA: {path}; run tools/prepare_assemblies.py separately")
+        raise ValueError(f"Use an uncompressed assembly FASTA: {path}; run preparation/prepare_assemblies.py separately")
 
 
 def check_prepared(name, fasta):
@@ -224,11 +220,11 @@ def check_prepared(name, fasta):
                 "Regenerate the adjacent index with: "
                 + shlex.join(["samtools", "faidx", str(fasta)])
             )
-        command = [sys.executable, str(TOOLS / "prepare_assemblies.py"),
+        command = [sys.executable, str(ROOT / "preparation" / "prepare_assemblies.py"),
                    "-i", str(fasta), "--name", name, "-O", "prepared_assemblies",
                    "--remask", "--contignamefix"]
         raise ValueError(f"Assembly {name} is not ready: {reason}.\n"
-                         "Please mask/format/index it separately with tools/prepare_assemblies.py, for example:\n"
+                         "Please mask/format/index it separately with preparation/prepare_assemblies.py, for example:\n"
                          + shlex.join(command) + "\nThen use prepared_assemblies/query_paths.prepared.txt with -I. "
                          "LinGraph has not modified this assembly.")
 
@@ -411,7 +407,7 @@ def reference(args, cohort, samples):
         with fasta.open() as handle:
             first_fields = handle.readline().lstrip(">").split()
         if not first_fields:
-            raise ValueError(f"Empty reference FASTA header: {fasta}; run tools/prepare_assemblies.py separately")
+            raise ValueError(f"Empty reference FASTA header: {fasta}; run preparation/prepare_assemblies.py separately")
         first = first_fields[0]
         prefix = first.split("#")
         inferred = prefix[0] + "_h" + prefix[1] if len(prefix) >= 2 else sample_pipeline.fasta_stem(fasta)
@@ -852,7 +848,7 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
 
 RECALL_SETTINGS = {'format_processes', 'edge_blackregion', 'max_extension', 'realignment',
                    'resolve_conflicts_by_alignment_score', 'pa_tag', 'separate_adjacent_indels',
-                   'seqcompress'}
+                   'seqcompress', 'locus_dup_as_insert'}
 
 
 def recall_settings(args):
@@ -913,7 +909,7 @@ def submit(args, argv):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == 'prepare':
-        return subprocess.call([sys.executable, str(TOOLS / 'prepare_assemblies.py'), *argv[1:]])
+        return subprocess.call([sys.executable, str(ROOT / 'preparation/prepare_assemblies.py'), *argv[1:]])
     p = parser(show_advanced="--help-all" in argv)
     args = p.parse_args(argv)
     if args.unlock:
