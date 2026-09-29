@@ -1533,9 +1533,55 @@ def _prepare_input_records(
         initializer=initializer,
         initargs=initargs,
     ) as pool:
-        for record in pool.imap(_prepare_input_worker, tasks, actual_chunksize):
+        result_iter = pool.imap(_prepare_input_worker, tasks, actual_chunksize)
+        seen: Dict[int, object] = {}
+        for _task in tasks:
+            record = _next_result(result_iter, pool, seen, None)
             records[record.allele] = record
     return records
+
+
+_WORKER_CHECK_SECONDS = 5.0
+
+
+def _check_pool_workers(pool, seen: Dict[int, object]) -> None:
+    """Stop if a pool worker died abnormally.
+
+    multiprocessing.Pool silently replaces a killed worker (for example by the
+    out-of-memory killer) but never re-runs its task, so the parent would wait
+    forever. Workers recycled by maxtasksperchild exit with code 0.
+    """
+    for process in list(getattr(pool, "_pool", None) or ()):
+        seen.setdefault(process.pid, process)
+    for pid in list(seen):
+        code = seen[pid].exitcode
+        if code is None:
+            continue
+        if code == 0:
+            del seen[pid]
+            continue
+        detail = ""
+        if code < 0:
+            detail = f" (signal {-code}" + ("; likely out of memory" if -code == 9 else "") + ")"
+        raise RuntimeError(
+            f"worker process {pid} died with exit code {code}{detail}; its task "
+            "is lost, so the run stops instead of waiting forever"
+        )
+
+
+def _next_result(result_iter, pool, seen: Dict[int, object], timeout: Optional[float]):
+    """``result_iter.next(timeout)`` in short waits, checking workers between."""
+    waited = 0.0
+    while True:
+        _check_pool_workers(pool, seen)
+        step = (_WORKER_CHECK_SECONDS if timeout is None
+                else max(0.0, min(_WORKER_CHECK_SECONDS, timeout - waited)))
+        try:
+            return result_iter.next(timeout=step)
+        except mp.TimeoutError:
+            waited += step
+            if timeout is not None and waited >= timeout:
+                raise
 
 
 def complete_alignment_record(alignment) -> PreparedInputRecord:
@@ -4973,10 +5019,12 @@ def _write_parallel(
                     enumerate(candidate_groups),
                     1,
                 )
+                seen_workers: Dict[int, object] = {}
                 while completed < len(candidate_groups):
                     try:
-                        _index, rows, stats, error = result_iter.next(
-                            timeout=(progress_seconds if progress_seconds > 0 else None)
+                        _index, rows, stats, error = _next_result(
+                            result_iter, pool, seen_workers,
+                            progress_seconds if progress_seconds > 0 else None,
                         )
                     except mp.TimeoutError:
                         elapsed = max(1e-6, time.monotonic() - started)

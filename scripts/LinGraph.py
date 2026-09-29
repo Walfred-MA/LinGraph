@@ -444,6 +444,10 @@ def partition_names(path):
     return names
 
 
+PARTITION_INTEGRITY_FILES = (".FA", "_align.txt", "_breakpoint_consistency.bed", "cache.json")
+_REPORTED_SKIPS = set()
+
+
 def graph_complete(graph):
     listing = graph_list_path(graph / "Graphs")
     if (
@@ -451,10 +455,23 @@ def graph_complete(graph):
         or not listing.is_file() or not listing.stat().st_size
     ):
         return False
-    return all((graph / "Graphs" / name / (name + suffix)).is_file()
-               and (graph / "Graphs" / name / (name + suffix)).stat().st_size > 0
-               for name in partition_names(listing)
-               for suffix in (".FA", "_align.txt", "_breakpoint_consistency.bed", "cache.json"))
+    # The build legitimately finishes some partitions without these files
+    # (e.g. breakpoint consistency skips partitions without rows), so such
+    # folders are skipped rather than marking the whole graph incomplete.
+    # Calling lists are unchanged: their order defines hotspot indices, and
+    # block partitioning already skips rows of partitions without a cache.
+    names = partition_names(listing)
+    intact = sum(
+        all((graph / "Graphs" / name / (name + suffix)).is_file()
+            and (graph / "Graphs" / name / (name + suffix)).stat().st_size > 0
+            for suffix in PARTITION_INTEGRITY_FILES)
+        for name in names)
+    skipped = len(names) - intact
+    if skipped and (str(graph), skipped) not in _REPORTED_SKIPS:
+        _REPORTED_SKIPS.add((str(graph), skipped))
+        say(f"{skipped} of {len(names)} partitions lack "
+            f"{'/'.join(PARTITION_INTEGRITY_FILES)} and are skipped")
+    return intact > 0
 
 
 def graph_mode(args, runner, graph, output, samples, ref):
@@ -515,7 +532,13 @@ def graph_mode(args, runner, graph, output, samples, ref):
     summary_targets = graph / "summary" / "Graphs.list"
     say(f"Copy valid partition list: {targets} -> {summary_targets}")
     if not args.dry_run:
-        write_text(summary_targets, targets.read_text())
+        try:
+            write_text(summary_targets, targets.read_text())
+        except PermissionError as error:
+            raise RuntimeError(
+                f"{summary_targets} differs from {targets}, but {summary_targets.parent} "
+                "is a read-only view of the original package (a reconstructed graph); "
+                "update the package itself or reconstruct again") from error
     runner.script("call-cohort", "cohort_call_snakemake/run_cohort_call_pipeline.py", common,
                   outputs=cohort_merge.output_paths(output, cohort_merge.resolve_mode(args)), force=True)
     if getattr(args, 'samples', ''):

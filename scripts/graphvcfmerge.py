@@ -33,6 +33,7 @@ Path coordination stays outside that pool; results retain stable path order.
 from __future__ import annotations
 
 import argparse
+from alignment_scoring import scoring_runs, run_score, cigar_score
 import bisect
 import ctypes
 import functools
@@ -87,19 +88,21 @@ SV_EVENT_FIELDS_LEGACY = (
 # Keep the internal allele fields in their historical order so the many
 # coordinate/source consumers retain stable indexes.  TEMPLATEOFFSET is the
 # signed observation-start displacement from the VCF row/template POS.
-SV_EVENT_FIELDS = SV_EVENT_FIELDS_LEGACY + ("TEMPLATEOFFSET",)
+SV_EVENT_FIELDS = SV_EVENT_FIELDS_LEGACY + (
+    "TEMPLATEOFFSET", "LIFTCATEGORY",
+)
 SNP_EVENT_FIELDS = (
     "GT", "TYPE", "SIZE", "BASE", "ASSEMBLYCONTIG", "QUERYCOORD",
     "ALLELENAME", "LABEL_H",
 )
 SV_FORMAT_FIELDS = (
-    *SV_EVENT_FIELDS_LEGACY[:6], "TEMPLATEOFFSET",
+    *SV_EVENT_FIELDS_LEGACY[:6], "TEMPLATEOFFSET", "LIFTCATEGORY",
     *SV_EVENT_FIELDS_LEGACY[6:],
 )
 SNP_FORMAT_FIELDS = SNP_EVENT_FIELDS
 SV_FORMAT = ":".join(SV_FORMAT_FIELDS)
 SNP_FORMAT = ":".join(SNP_FORMAT_FIELDS)
-SV_FORMAT_BASE_FIELDS = SV_FORMAT_FIELDS[:7]
+SV_FORMAT_BASE_FIELDS = SV_FORMAT_FIELDS[:-2]
 SNP_FORMAT_BASE_FIELDS = SNP_FORMAT_FIELDS[:-2]
 SV_FORMAT_BASE = ":".join(SV_FORMAT_BASE_FIELDS)
 SNP_FORMAT_BASE = ":".join(SNP_FORMAT_BASE_FIELDS)
@@ -696,6 +699,15 @@ def sv_row_passes_cutoff(raw: str, cutoff: int) -> bool:
     return maxsize > int(cutoff)
 
 
+def is_full_locus_dup_parent_row(raw: str) -> bool:
+    """Return true for a redundant full-locus duplication parent record."""
+    cols = raw.rstrip("\n").split("\t", 9)
+    if len(cols) < 9 or not is_sv_format(cols[8]):
+        return False
+    info = parse_info_field(cols[7])
+    return info.get("PACLASS") == "fulllocusdup"
+
+
 def format_info_field(info: Dict[str, str], order: Optional[List[str]] = None) -> str:
     if order is None:
         order = list(info.keys())
@@ -826,10 +838,16 @@ def iter_vcf_lines_keep_first_header(path: str, keep_header: bool = True) -> Ite
 def iter_vcf_data_lines(
     path: str,
     svcutoff: Optional[int] = None,
+    ignore_full_locus_dup_insertions: bool = False,
 ) -> Iterator[Tuple[int, int, str]]:
     """Yield (data-row-index, original-line-number, raw line) for non-header rows."""
     idx = 0
     for line_no, raw in iter_vcf_lines_keep_first_header(path, keep_header=False):
+        if (
+            ignore_full_locus_dup_insertions
+            and is_full_locus_dup_parent_row(raw)
+        ):
+            continue
         if svcutoff is not None and not sv_row_passes_cutoff(raw, svcutoff):
             continue
         yield idx, line_no, raw
@@ -931,6 +949,11 @@ def write_vcf_header(handle, meta_lines: Sequence[str], sample_names: Sequence[s
                 "Per-observation signed start displacement from the VCF "
                 "row/template POS; positive is right and negative is left",
             ),
+            "LIFTCATEGORY": (
+                ".", "String",
+                "Per-observation GenomeLift category: Pri (types 1/2), "
+                "Dup (type 3), DivergeDup (type 4), or .",
+            ),
             "ALLELENAME": (".", "String", "Per-observation allele name"),
             "LABEL_H": (
                 ".", "String", "Per-observation PA-relative label coordinate",
@@ -954,6 +977,16 @@ def write_vcf_header(handle, meta_lines: Sequence[str], sample_names: Sequence[s
             "SEQ": ("1", "String", "Representative plain insertion sequence"),
             "EXTENDGRAPHCIGAR": (
                 "1", "String", "Representative extended graph CIGAR",
+            ),
+            "PACLASS": (
+                "1", "String",
+                "Pseudo-linear assignment class of the representative "
+                "observation: primary or fulllocusdup",
+            ),
+            "ALTERNATIVECIGAR": (
+                "1", "String",
+                "Query-to-source-locus alignment CIGAR for a full-locus "
+                "duplication insertion",
             ),
         }
         for identifier, (number, field_type, description) in required_info.items():
@@ -1055,7 +1088,8 @@ def parse_hsv_allele(allele: str) -> Optional[List[str]]:
     """Parse HSV/HSNP allele preserving ':' inside EXTENDGRAPHCIGAR.
 
     Internal SV format:
-        GT:TYPE:SIZE:CIGAR:assemblycontig:query_range:allelename:label_H:offset
+        GT:TYPE:SIZE:CIGAR:assemblycontig:query_range:allelename:label_H:
+        offset:liftover_category
     Legacy eight- and seven-field alleles are accepted and receive a missing
     TEMPLATEOFFSET (and, for seven fields, a missing LABEL_H).
     """
@@ -1065,19 +1099,27 @@ def parse_hsv_allele(allele: str) -> Optional[List[str]]:
     if len(first) != 4:
         return None
     rest = first[3]
+    last_category = rest.rsplit(":", 6)
+    if (
+        len(last_category) == 7
+        and _looks_like_label_h_coord(last_category[-3])
+        and re.fullmatch(r"[+-]?\d+|\.", last_category[-2] or "")
+        and last_category[-1] in {"Pri", "Dup", "DivergeDup", "."}
+    ):
+        return first[:3] + last_category
     last_offset = rest.rsplit(":", 5)
     if (
         len(last_offset) == 6
         and _looks_like_label_h_coord(last_offset[-2])
         and re.fullmatch(r"[+-]?\d+|\.", last_offset[-1] or "")
     ):
-        return first[:3] + last_offset
+        return first[:3] + last_offset + ["."]
     last_new = rest.rsplit(":", 4)
     if len(last_new) == 5 and _looks_like_label_h_coord(last_new[-1]):
-        return first[:3] + last_new + ["."]
+        return first[:3] + last_new + [".", "."]
     last_old = rest.rsplit(":", 3)
     if len(last_old) == 4:
-        return first[:3] + last_old + [".", "."]
+        return first[:3] + last_old + [".", ".", "."]
     return None
 
 
@@ -1674,11 +1716,15 @@ def _iter_sv_star_chunks(
     chunk_size: int,
     svcutoff: Optional[int] = None,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    ignore_full_locus_dup_insertions: bool = False,
 ) -> Iterator[List[Tuple[int, int, str]]]:
     chunk: List[Tuple[int, int, str]] = []
     buffered_bytes = 0
     for line_index, line_no, raw in iter_vcf_data_lines(
         input_path, svcutoff=svcutoff,
+        ignore_full_locus_dup_insertions=(
+            ignore_full_locus_dup_insertions
+        ),
     ):
         if "*" not in raw:
             continue
@@ -1910,11 +1956,15 @@ def _iter_vcf_data_chunks(
     chunk_size: int,
     svcutoff: Optional[int] = None,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    ignore_full_locus_dup_insertions: bool = False,
 ) -> Iterator[List[Tuple[int, str]]]:
     chunk: List[Tuple[int, str]] = []
     buffered_bytes = 0
     for line_index, _line_no, raw in iter_vcf_data_lines(
         input_path, svcutoff=svcutoff,
+        ignore_full_locus_dup_insertions=(
+            ignore_full_locus_dup_insertions
+        ),
     ):
         row = raw.rstrip("\n")
         chunk.append((line_index, row))
@@ -1942,6 +1992,7 @@ def merge_locus_vcfs_sv(
     chunk_size: int,
     svcutoff: Optional[int] = None,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    ignore_full_locus_dup_insertions: bool = True,
 ) -> None:
     sample_count = len(sample_names)
     nproc = max(1, int(processes))
@@ -1968,6 +2019,9 @@ def merge_locus_vcfs_sv(
             chunk_size,
             svcutoff=svcutoff,
             chunk_bytes=chunk_bytes,
+            ignore_full_locus_dup_insertions=(
+                ignore_full_locus_dup_insertions
+            ),
         )
     )
     if nproc > 1:
@@ -1989,6 +2043,9 @@ def merge_locus_vcfs_sv(
             chunk_size,
             svcutoff=svcutoff,
             chunk_bytes=chunk_bytes,
+            ignore_full_locus_dup_insertions=(
+                ignore_full_locus_dup_insertions
+            ),
         ):
             events, line_ids, scanned, bad = _process_sv_star_chunk((chunk, sample_count))
             chunks_seen += 1
@@ -2030,6 +2087,9 @@ def merge_locus_vcfs_sv(
             chunk_size,
             svcutoff=svcutoff,
             chunk_bytes=chunk_bytes,
+            ignore_full_locus_dup_insertions=(
+                ignore_full_locus_dup_insertions
+            ),
         )
         if nproc > 1:
             with mp_context().Pool(
@@ -2082,6 +2142,8 @@ class ShardedSvObservation:
     label_h: str
     source_row_id: str
     uncertain: bool = False
+    pa_class: str = "primary"
+    liftover_category: str = "."
 
     @property
     def max_size(self) -> int:
@@ -2284,7 +2346,13 @@ def _observations_from_row(
     global_sample_indexes: Sequence[int],
     global_sample_names: Sequence[str],
     next_id: int,
+    ignore_full_locus_dup_insertions: bool = False,
 ) -> Tuple[List[ShardedSvObservation], int]:
+    if (
+        ignore_full_locus_dup_insertions
+        and is_full_locus_dup_parent_row(raw)
+    ):
+        return [], next_id
     rec = parse_vcf_record(raw, order=next_id)
     if not is_sv_format(rec.fmt):
         return [], next_id
@@ -2439,6 +2507,11 @@ def _observations_from_row(
                     label_h=vcf_unescape(representative[7]),
                     source_row_id=source_id,
                     uncertain=rec.filt not in {".", "PASS"},
+                    pa_class=info.get("PACLASS", "primary") or "primary",
+                    liftover_category=(
+                        representative[9]
+                        if len(representative) > 9 else "."
+                    ),
                 ))
     return output, next_id
 
@@ -2587,6 +2660,7 @@ def _observation_event_values(
             (observation.label_h if label_h is None else label_h) or ".",
         ),
         str(template_offset),
+        getattr(observation, "liftover_category", ".") or ".",
     ]
 
 
@@ -2629,6 +2703,7 @@ def _base_info(
         if key in {
             "SVTYPE", "END", "NSUP", "SVLEN", "MAXSIZE", "SEQ",
             "SVINSSEQ", "EXTENDGRAPHCIGAR", "CIGAR",
+            "PACLASS",
         }:
             del info[key]
     ordered = {
@@ -2637,6 +2712,7 @@ def _base_info(
         "NSUP": str(support),
         "SVLEN": str(size if svtype == "INS" else -size),
         "MAXSIZE": str(size),
+        "PACLASS": getattr(representative, "pa_class", "primary") or "primary",
     }
     ordered.update(info)
     if svtype == "INS":
@@ -2658,41 +2734,29 @@ def _cluster_representative(
 
 
 def _scored_alignment_middle(body: str, core):
-    """Trim a local alignment to the middle selected by the graph score.
-
-    A matching run extends a non-negative score, while every other operation
-    costs four points per base.  Independent left-to-right and right-to-left
-    scans select the two boundary operations.  Everything between them is
-    retained in the returned CIGAR, including mismatches and indels.
-    """
+    """Trim to the boundaries selected by the standard alignment score."""
     operations = core.parse_pairwise_ops(body)
     if not operations:
         return None
+    runs = list(scoring_runs(operations))
 
-    def best_index(indexes) -> Tuple[float, int]:
+    def best_index(scan, reverse=False) -> Tuple[float, int]:
         score = 0.0
         highest = float("-inf")
         highest_index = -1
-        for index in indexes:
-            operation = operations[index]
-            if operation.op == "=":
-                score = max(0.0, score) + operation.n
-            else:
-                score -= 4.0 * operation.n
-            # Retain the first highest-scoring boundary in scan order.
+        for first, end, size, op in scan:
+            if op == '=':
+                score = max(0.0, score)
+            score += run_score(size, op)
             if score > highest:
                 highest = score
-                highest_index = index
+                highest_index = first if reverse else end - 1
         return highest, highest_index
 
-    right_score, right_index = best_index(range(len(operations)))
-    left_score, left_index = best_index(range(len(operations) - 1, -1, -1))
-    if (
-        right_score < 50
-        or left_score < 50
-        or left_index < 0
-        or right_index < left_index
-    ):
+    right_score, right_index = best_index(runs)
+    left_score, left_index = best_index(reversed(runs), reverse=True)
+    if (right_score < 50 or left_score < 50 or left_index < 0
+            or right_index < left_index):
         return None
 
     query_start = sum(
@@ -2970,7 +3034,12 @@ def _fast_scan_input_task(
             offset += length
             if raw.startswith(b"#"):
                 line = raw.decode("utf-8", "replace").rstrip("\n")
-                if snp_writer is not None and line.startswith("##") and not line.startswith("##referenceCoverage=<"):
+                if (
+                    snp_writer is not None
+                    and line.startswith("##")
+                    and not line.startswith("##referenceCoverage=<")
+                    and not line.startswith("##pseudoLinearMapping")
+                ):
                     snp_writer.metadata[line] = None
                 if line.startswith("##referenceCoverage=<"):
                     values = _parse_structured_meta(
@@ -2987,9 +3056,9 @@ def _fast_scan_input_task(
                         _parse_int(values.get("Start", ""), 0),
                         _parse_int(values.get("End", ""), 0),
                     ))
-                elif line.startswith(
-                    ("##contig=<", "##alternativeLocus=<"),
-                ):
+                elif line.startswith((
+                    "##contig=<", "##alternativeLocus=<",
+                )):
                     metadata_lines.append(line)
                 continue
             if length < 2:
@@ -3007,9 +3076,18 @@ def _fast_scan_input_task(
                                        [sample_names[i] for i in sample_indexes])
                     line_ordinal += 1
                     continue
+            candidate_min = int(context.get("candidate_min_size", 0) or 0)
+            if candidate_min and not sv_row_passes_cutoff(line, candidate_min - 1):
+                # MAXSIZE below the candidate size: graphvcfmerge_snp.py merges
+                # this row as a small indel, so it is never counted twice.
+                line_ordinal += 1
+                continue
             base_id = _fast_line_base(file_index, line_offset)
             observations, consumed = _observations_from_row(
                 line, sample_indexes, sample_names, base_id,
+                ignore_full_locus_dup_insertions=context.get(
+                    "ignore_full_locus_dup_insertions", False,
+                ),
             )
             if consumed - base_id >= _INGEST_ROW_ID_STRIDE:
                 raise ValueError(
@@ -3425,6 +3503,9 @@ def _fast_iter_observations(
                     context["file_sample_indexes"][file_index],
                     context["sample_names"],
                     _fast_line_base(file_index, offset),
+                    ignore_full_locus_dup_insertions=context.get(
+                        "ignore_full_locus_dup_insertions", False,
+                    ),
                 )
                 by_type = {
                     observation.svtype: observation
@@ -3668,11 +3749,20 @@ def _fast_pair_alignment(
         aligner = _make_single_thread_insertion_aligner(core, template)
         aligner_cache[template] = aligner
     best = None
+    best_score = float('-inf')
     for hit in aligner.map(query):
-        if hit.is_primary and hit.strand == 1 and (
-            best is None or hit.mlen > best.mlen
-        ):
-            best = hit
+        if not hit.is_primary or hit.strand != 1 or not hit.cigar_str:
+            continue
+        # Compare the same complete allele pair; unaligned flanks cannot win
+        # merely because minimap2 reports a high native/local match count.
+        resolved = core.cigarextend(
+            hit.cigar_str, template[hit.r_st:hit.r_en], query[hit.q_st:hit.q_en],
+        )
+        padded = (f'{hit.r_st}D{hit.q_st}I' + resolved
+                  + f'{len(query) - hit.q_en}I{len(template) - hit.r_en}D')
+        score = cigar_score(padded)
+        if best is None or score > best_score:
+            best, best_score = hit, score
     if best is None:
         if longest < 1000:
             return _fast_parasail_alignment(seq_a, seq_b)
@@ -4912,6 +5002,8 @@ def _fast_emit_task(
                             value.label, value.label_h,
                             value.qry_start, value.qry_end,
                             value.qry_strand,
+                            getattr(value, "liftover_category", "."),
+                            getattr(value, "pa_class", "primary"),
                         )
                         for value in observations
                     ],
@@ -4931,10 +5023,10 @@ def _fast_extract_candidates(
     """Residual variant candidates from one merged insertion's member
     alignments: every I run is a candidate insertion (with its
     sequence), every D run a candidate deletion, on the parent's axis.
-    Sources are (sample_index, qry_contig, label, label_h, qry_start,
-    qry_end, qry_strand) tuples.  Each residual candidate receives the
-    corresponding assembly interval; parent-path positions must never be
-    emitted as QUERYCOORD."""
+    Sources begin with (sample_index, qry_contig, label, label_h, qry_start,
+    qry_end, qry_strand), followed by optional LIFTCATEGORY and PACLASS
+    provenance. Each residual candidate receives the corresponding assembly
+    interval; parent-path positions must never be emitted as QUERYCOORD."""
     candidates: list = []
     for slot, body in enumerate(member_bodies):
         if slot == rep_slot or not body:
@@ -4984,7 +5076,8 @@ def _fast_query_source_slice(source: tuple, start: int, end: int) -> tuple:
     (
         sample_index, qry_contig, label, label_h,
         qry_start, qry_end, qry_strand,
-    ) = source
+    ) = source[:7]
+    provenance = tuple(source[7:])
     strand = qry_strand or "+"
     if strand == "-":
         low = int(qry_end) - int(end)
@@ -5000,7 +5093,7 @@ def _fast_query_source_slice(source: tuple, start: int, end: int) -> tuple:
             label_h = format_label_h_pair(low - region_start, region_end - high)
     return (
         sample_index, qry_contig, label, label_h,
-        low, high, strand,
+        low, high, strand, *provenance,
     )
 
 
@@ -5520,7 +5613,8 @@ def _fast_round_emit_group(
         (
             sample_index, qry_contig, label, label_h,
             qry_start, qry_end, qry_strand,
-        ) = event[5]
+        ) = event[5][:7]
+        liftover_category = event[5][7] if len(event[5]) > 7 else "."
         if event_index == group["pick"]:
             member_cigar = _sample_self_cigar(event[3])
         else:
@@ -5552,6 +5646,7 @@ def _fast_round_emit_group(
             ),
             vcf_escape(label or "."), vcf_escape(label_h or "."),
             str(template_offset),
+            liftover_category or ".",
         ])
     sample_fields = []
     for sample_index in range(sample_count):
@@ -5574,6 +5669,11 @@ def _fast_round_emit_group(
             rep_event[3] if svtype == "INS" else -rep_event[3]
         ),
         "MAXSIZE": str(rep_event[3]),
+        "PACLASS": (
+            rep_event[5][8]
+            if len(rep_event[5]) > 8 and rep_event[5][8]
+            else "primary"
+        ),
         "SEQ": (
             vcf_escape(rep_event[4])
             if svtype == "INS" and rep_event[4] else "."
@@ -5595,7 +5695,7 @@ def _fast_round_emit_group(
         chosen = [index for index, _body in group["chosen"]]
         save_insertion(_FAST_CONTEXT["insertion_snps"], child_id,
                        [candidates[index][4] for index in chosen], snp_bodies,
-                       [candidates[index][5] for index in chosen], chosen.index(group["pick"]),
+                       [candidates[index][5][:7] for index in chosen], chosen.index(group["pick"]),
                        _FAST_CONTEXT["sample_names"],
                        owner=insertion_owner(_FAST_CONTEXT["insertion_snps"], path_id))
     if rep_event[3] >= minsvsize:
@@ -6390,6 +6490,7 @@ def _fast_prepare_inputs(
             line.startswith("##referenceCoverage")
             or line.startswith("##contig=<")
             or line.startswith("##alternativeLocus=<")
+            or line.startswith("##pseudoLinearMapping")
         )
     ]
     sample_names: List[str] = []
@@ -6429,7 +6530,9 @@ def _fast_scan_batch_task(task):
 
 
 def _fast_stage_scan(
-    input_paths: Sequence[str], shards_dir: str, processes: int, snp_shards_dir=None,
+    input_paths: Sequence[str], shards_dir: str, processes: int,
+    snp_shards_dir=None, ignore_full_locus_dup_insertions: bool = True,
+    candidate_min_size: int = 0,
 ) -> None:
     """Stage 1 for split SLURM runs: scan every input VCF once and
     persist the record shards plus a manifest under --shards-dir."""
@@ -6448,6 +6551,10 @@ def _fast_stage_scan(
         ),
         "sample_names": tuple(sample_names),
         "records_dir": records_dir,
+        "ignore_full_locus_dup_insertions": bool(
+            ignore_full_locus_dup_insertions
+        ),
+        "candidate_min_size": int(candidate_min_size),
     }
     _init_fast_worker(context)
     workers = min(max(1, int(processes)), len(input_paths))
@@ -6593,6 +6700,9 @@ def _fast_stage_scan(
             chrom: dict(per_file)
             for chrom, per_file in chrom_sections.items()
         },
+        "ignore_full_locus_dup_insertions": bool(
+            ignore_full_locus_dup_insertions
+        ),
     }
     with open(_fast_manifest_path(shards_dir), "wb") as handle:
         pickle.dump(manifest, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -6601,6 +6711,7 @@ def _fast_stage_scan(
         for key in (
             "version", "input_paths", "sample_names",
             "file_sample_indexes", "sample_index_by_name",
+            "ignore_full_locus_dup_insertions",
         )
     }
     with open(
@@ -6711,6 +6822,9 @@ def _fast_stage_chrom(
         "file_sample_indexes": manifest["file_sample_indexes"],
         "sample_names": manifest["sample_names"],
         "records_dir": records_dir,
+        "ignore_full_locus_dup_insertions": bool(
+            manifest.get("ignore_full_locus_dup_insertions", False)
+        ),
         "merge_distance": int(merge_distance),
         "size_similarity": float(size_similarity),
         "sequence_similarity": float(sequence_similarity),
@@ -7145,6 +7259,8 @@ def merge_sample_vcfs_fast(
     legacy_fast: bool = True,
     kmermatch: str = DEFAULT_KMERMATCH,
     insertion_snps: Optional[str] = None,
+    ignore_full_locus_dup_insertions: bool = True,
+    candidate_min_size: int = 0,
 ) -> None:
     if not input_paths:
         raise ValueError("no input VCFs")
@@ -7156,6 +7272,7 @@ def merge_sample_vcfs_fast(
             line.startswith("##referenceCoverage")
             or line.startswith("##contig=<")
             or line.startswith("##alternativeLocus=<")
+            or line.startswith("##pseudoLinearMapping")
         )
     ]
     sample_names: List[str] = []
@@ -7210,6 +7327,10 @@ def merge_sample_vcfs_fast(
             ),
             "sample_names": tuple(sample_names),
             "records_dir": records_dir,
+            "ignore_full_locus_dup_insertions": bool(
+                ignore_full_locus_dup_insertions
+            ),
+            "candidate_min_size": int(candidate_min_size),
             "merge_distance": int(merge_distance),
             "size_similarity": float(size_similarity),
             "sequence_similarity": float(sequence_similarity),
@@ -7611,6 +7732,8 @@ def merge_locus_vcfs(args) -> None:
         raise ValueError("--sort-mem-mb must be at least 16")
     if args.minsvsize < 1:
         raise ValueError("--minsvsize must be at least 1")
+    if args.candidate_min_size < 0:
+        raise ValueError("--candidate-min-size must be at least 0")
     if args.merge_distance < 0:
         raise ValueError("--merge-distance must be at least 0")
     if not 0 <= args.size_similarity <= 1:
@@ -7631,7 +7754,14 @@ def merge_locus_vcfs(args) -> None:
         if args.stage == "scan":
             if not paths:
                 raise ValueError("the scan stage needs -i input VCFs")
-            _fast_stage_scan(paths, args.shards_dir, args.processes, args.snp_shards_dir)
+            _fast_stage_scan(
+                paths, args.shards_dir, args.processes,
+                args.snp_shards_dir,
+                ignore_full_locus_dup_insertions=(
+                    args.ignore_full_locus_dup_insertions
+                ),
+                candidate_min_size=args.candidate_min_size,
+            )
         elif args.stage == "chrom":
             if not args.chrom:
                 raise ValueError(
@@ -7691,6 +7821,10 @@ def merge_locus_vcfs(args) -> None:
             legacy_fast=args.fast,
             kmermatch=args.kmermatch,
             insertion_snps=args.insertion_snps,
+            ignore_full_locus_dup_insertions=(
+                args.ignore_full_locus_dup_insertions
+            ),
+            candidate_min_size=args.candidate_min_size,
         )
         if args.insertion_snps:
             from graphvcfmerge_snp_compact import finalize_insertions
@@ -7714,6 +7848,9 @@ def merge_locus_vcfs(args) -> None:
             max_distance=args.sv_max_distance,
             chunk_size=args.chunk_size,
             svcutoff=args.svcutoff,
+            ignore_full_locus_dup_insertions=(
+                args.ignore_full_locus_dup_insertions
+            ),
         )
     else:
         raise ValueError("requires either --snp or --sv")
@@ -7805,9 +7942,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--minsvsize", type=int, default=50, metavar="BP",
         help=(
-            "minimum final merged SV size; input components are initially "
-            "retained down to 0.3 times this value to permit later "
-            "clustering [50]"
+            "minimum final merged SV size; smaller merged groups are "
+            "written to OUTPUT.small.vcf with --output-small [50]"
+        ),
+    )
+    parser.add_argument(
+        "--candidate-min-size", type=int, default=20, metavar="BP",
+        help=(
+            "only sample VCF rows with MAXSIZE >= BP are SV merge candidates; "
+            "smaller rows belong to graphvcfmerge_snp.py --svcutoff BP, so each "
+            "row is merged exactly once; 0 keeps every row [20]"
         ),
     )
     parser.add_argument(
@@ -7882,6 +8026,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--merge-vcfs", action="store_true",
         help="force disk-sharded per-sample merging even with one input VCF",
+    )
+    full_locus_dup = parser.add_mutually_exclusive_group()
+    full_locus_dup.add_argument(
+        "--ignore-full-locus-dup-insertions",
+        dest="ignore_full_locus_dup_insertions",
+        action="store_true",
+        default=True,
+        help=(
+            "exclude redundant main-reference full-locus duplication parent "
+            "insertions while retaining source-locus variants (default)"
+        ),
+    )
+    full_locus_dup.add_argument(
+        "--keep-full-locus-dup-insertions",
+        dest="ignore_full_locus_dup_insertions",
+        action="store_false",
+        help="retain full-locus duplication parent insertions during merging",
     )
     refinement_mode = parser.add_mutually_exclusive_group()
     refinement_mode.add_argument(

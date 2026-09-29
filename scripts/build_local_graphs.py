@@ -2529,6 +2529,15 @@ def run(args: argparse.Namespace) -> None:
     cache_count = write_partition_cache_package(
         manifests, graph_folder, output_dir,
     )
+    if cache_count < len(manifests):
+        # Reconstruction requires caches by default; say so at packaging time.
+        LOG.warning(
+            "partition_caches.jsonl holds %d of %d partition caches%s; "
+            "reconstruct_local_graph_folders.py will stop without caches "
+            "unless run with --no-partition-caches",
+            cache_count, len(manifests),
+            "" if graph_folder else " (no graph folder was given to package caches from)",
+        )
     covered_source = os.path.join(
         adjusted_dir, "reference_covered_mapped_novel.tsv",
     )

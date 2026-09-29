@@ -303,6 +303,103 @@ def merge(paths, snp_output, indel_output=None, *, cutoff=20, processes=1, tmpdi
         concat(root, snp_output, indel_output)
 
 
+def _open_binary(path):
+    import gzip
+    return gzip.open(path, 'rb') if str(path).endswith('.gz') else open(path, 'rb')
+
+
+def _header_id(line):
+    """(type, ID) for ##INFO/##FORMAT/##contig/... lines; None otherwise."""
+    if line.startswith('##') and '=<' in line:
+        kind, body = line[2:].split('=<', 1)
+        for item in body.split(','):
+            if item.startswith('ID='):
+                return kind, item[3:].rstrip('>')
+    return None
+
+
+def fold_small(indel_output, small_paths):
+    """Append SV-merger small VCF rows to the indel VCF and sort; never merge rows.
+
+    The SV merger takes rows with MAXSIZE >= its --candidate-min-size and the
+    indel merge takes rows below --svcutoff, so with equal cutoffs each sample
+    row is in exactly one file. Sample columns are matched by name ('.' when a
+    sample is absent); per-row FORMAT is kept. Rows are ordered by the combined
+    ##contig order (other CHROMs in first-seen order) and POS. Only sort keys
+    and byte offsets are held in memory.
+    """
+    sources = [str(indel_output), *map(str, small_paths)]
+    meta, seen_ids, seen_lines = [], set(), set()
+    columns = None
+    layouts, keys = [], []
+    ranks = {}
+    for file_index, path in enumerate(sources):
+        with _open_binary(path) as handle:
+            offset = 0
+            samples = None
+            for raw in handle:
+                start = offset
+                offset += len(raw)
+                if raw.startswith(b'##'):
+                    line = raw.decode().rstrip('\r\n')
+                    identifier = _header_id(line)
+                    if identifier in seen_ids or line in seen_lines:
+                        continue
+                    if identifier:
+                        seen_ids.add(identifier)
+                        if identifier[0] == 'contig':
+                            ranks.setdefault(identifier[1], len(ranks))
+                    seen_lines.add(line)
+                    meta.append(line)
+                    continue
+                if raw.startswith(b'#CHROM'):
+                    header = raw.decode().rstrip('\r\n').split('\t')
+                    samples = header[9:]
+                    if columns is None:
+                        columns = header
+                        layout = None
+                    else:
+                        missing = [name for name in samples if name not in columns[9:]]
+                        if missing:
+                            raise ValueError(f'{path}: samples absent from {indel_output}: '
+                                             + ', '.join(missing[:5]))
+                        index = {name: position for position, name in enumerate(samples)}
+                        layout = [index.get(name) for name in columns[9:]]
+                        if layout == list(range(len(samples))):
+                            layout = None
+                    layouts.append(layout)
+                    continue
+                if not raw.strip():
+                    continue
+                if samples is None:
+                    raise ValueError(f'{path}: data row before #CHROM header')
+                chrom, pos = raw.split(b'\t', 2)[:2]
+                chrom = chrom.decode()
+                keys.append((ranks.setdefault(chrom, len(ranks)), int(pos), file_index,
+                             len(keys), start))
+    keys.sort()
+    handles = [_open_binary(path) for path in sources]
+    try:
+        with atomic_output(indel_output) as out:
+            for line in meta:
+                out.write(line + '\n')
+            out.write('\t'.join(columns) + '\n')
+            for _rank, _pos, file_index, _order, start in keys:
+                handle = handles[file_index]
+                handle.seek(start)
+                line = handle.readline().decode().rstrip('\r\n')
+                layout = layouts[file_index]
+                if layout is not None:
+                    fields = line.split('\t')
+                    line = '\t'.join(fields[:9] + [fields[9 + position] if position is not None
+                                                    else '.' for position in layout])
+                out.write(line + '\n')
+    finally:
+        for handle in handles:
+            handle.close()
+    return len(keys)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('-i', '--input', nargs='+', default=[])
@@ -311,14 +408,27 @@ def main(argv=None):
     parser.add_argument('--svcutoff', type=int, default=20, help='small indels have MAXSIZE < cutoff [20]')
     parser.add_argument('-t', '--processes', type=int, default=1,
                         help='scan workers or chromosome loading/sorting threads [1]')
-    parser.add_argument('--stage', choices=('scan', 'prepare', 'chrom', 'concat'))
+    parser.add_argument('--stage', choices=('scan', 'prepare', 'chrom', 'concat', 'fold'))
     parser.add_argument('--shards-dir')
     parser.add_argument('--manifest-output', help='scan: durable copy of the chromosome manifest')
     parser.add_argument('--raw-manifest', help='prepare: reuse saved original SNP shards')
     parser.add_argument('--insertion-snps', help='saved insertion SNP directory to sort and append at concat; scan/prepare defer loading it')
     parser.add_argument('--chrom', help='chromosome name or manifest key')
     parser.add_argument('--snp-only', action='store_true', help='ignore SV/indel input rows; at concat, write only the SNP VCF')
+    parser.add_argument('--fold-small', action='append', default=[], metavar='VCF',
+                        help='append these rows (graphvcfmerge.py --output-small, run with '
+                             '--candidate-min-size equal to --svcutoff) to the .indel.vcf and '
+                             'sort, without merging rows; with --stage fold, only do this')
     args = parser.parse_args(argv)
+    if args.fold_small and args.snp_only:
+        parser.error('--fold-small needs the indel output; drop --snp-only')
+    if args.stage == 'fold':
+        if not args.output or not args.fold_small:
+            parser.error('--stage fold requires --output PREFIX and --fold-small VCF')
+        indel_output = output_paths(args.output)[1]
+        count = fold_small(indel_output, args.fold_small)
+        print(f'[graphvcfmerge_snp] wrote {count} sorted rows to {indel_output}', file=sys.stderr)
+        return 0
     if args.svcutoff < 1 or args.processes < 1:
         parser.error('cutoff and process count must be positive')
     if args.stage and not args.shards_dir:
@@ -338,6 +448,8 @@ def main(argv=None):
         snp_output, indel_output, _ = output_paths(args.output)
         concat(args.shards_dir, snp_output, None if args.snp_only else indel_output,
                insertion_snps=args.insertion_snps)
+        if args.fold_small:
+            fold_small(indel_output, args.fold_small)
     else:
         paths = vcf.expand_vcf_inputs(args.input + vcf.read_vcf_input_lists(args.input_list))
         if not paths:
@@ -349,6 +461,8 @@ def main(argv=None):
             if not args.output:
                 parser.error('--output is required')
             merge(paths, *output_paths(args.output)[:2], cutoff=args.svcutoff, processes=args.processes, snp_only=args.snp_only, insertion_snps=args.insertion_snps)
+            if args.fold_small:
+                fold_small(output_paths(args.output)[1], args.fold_small)
     return 0
 
 

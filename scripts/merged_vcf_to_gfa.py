@@ -46,6 +46,16 @@ def build_parser():
     parser.add_argument('--local-path-fasta', action='append', nargs='+', default=[],
                         metavar='FASTA', help='local graph catalog used only to translate VCF targets '
                         'onto included reference/alternative/novel paths; never exported as extra paths')
+    parser.add_argument('--alternative-catalog', metavar='FASTA',
+                        help='graph catalog (GRAPH/summary/alternatives.fasta) for VCF targets '
+                             'outside -r: overlapping/touching records are merged per source '
+                             'contig and placed on the backbone (catalog placement, else '
+                             'aligned). Default: GRAPH/summary/alternatives.fasta when neither '
+                             '--local-path-fasta nor --local-reference-templates is given')
+    parser.add_argument('--drop-unverified', action='store_true',
+                        help='leave out variants whose sequence cannot be verified against a '
+                             'carrier assembly (and variants that depend on them), listing them '
+                             'in OUTPUT.anchors.bed.unresolved.tsv, instead of stopping')
     parser.add_argument('-o', '--output', help='output GFA or GFA.gz')
     parser.add_argument('--anchor', type=int, default=50,
                         help='query/graph flank on each side (default: 50)')
@@ -95,13 +105,21 @@ def main(argv=None):
         args.reference_fasta = os.path.join(args.graph_folder, 'inputs', 'reference_alternatives_novels.fa')
     if args.reference_fai and not args.reference_fasta:
         parser.error('--reference-fai requires --reference-fasta')
+    if (args.gfa_mode == 'rgfa' and not args.alternative_catalog and not args.local_path_fasta
+            and not args.local_reference_templates):
+        default_catalog = os.path.join(args.graph_folder, 'summary', 'alternatives.fasta')
+        if os.path.isfile(default_catalog):
+            args.alternative_catalog = default_catalog
+    if args.alternative_catalog and args.gfa_mode != 'rgfa':
+        parser.error('--alternative-catalog requires --gfa-mode rgfa')
     if (args.local_path_fasta or args.local_reference_templates) and args.gfa_mode != 'rgfa':
         parser.error('local path/template catalogs require --gfa-mode rgfa')
     if not args.bed_only and not args.validate_only and not args.output:
         parser.error('--output is required unless --bed-only or --validate-only is used')
     paths = [*args.vcf, args.query_fasta_list, args.reference_fasta,
              args.reference_fai, *_fasta_values(args.alternatives_fasta),
-             *_fasta_values(args.local_path_fasta), *args.local_reference_templates]
+             *_fasta_values(args.local_path_fasta), *args.local_reference_templates,
+             args.alternative_catalog]
     for path in paths:
         if path and not os.path.isfile(path):
             parser.error(f'input file does not exist: {path}')

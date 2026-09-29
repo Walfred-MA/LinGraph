@@ -56,6 +56,9 @@ class Root:
     kind: str
     order: int
     lift: object = None
+    # A duplication path copies [base, base+length) of FASTA record ``record``.
+    record: str = None
+    base: int = 0
 
 
 @dataclass
@@ -409,11 +412,17 @@ def _prepare_intervals(events, reachable, sources, anchor, query_flanks=True):
     return intervals, missing
 
 
-def _report_unresolved(path, failures, aliases, log):
+def _report_unresolved(path, failures, aliases, log, fatal=True):
     with path.open('w') as output:
         output.write('variant_id\tgfa_name\treason\n')
         for identifier, reason in failures:
             output.write(f'{identifier}\t{aliases.get(identifier, identifier)}\t{reason}\n')
+    if failures and not fatal:
+        categories = Counter(reason.split(':', 1)[0] for _identifier, reason in failures)
+        log(f'Dropped {len(failures)} variant(s) whose sequence could not be verified '
+            '(--drop-unverified); ' + ', '.join(f'{reason}={count}' for reason, count
+                                               in categories.most_common()) + f'; see {path}')
+        return
     if failures:
         for identifier, reason in failures[:20]:
             log(f'Unresolved variant {identifier}: {reason}')
@@ -428,12 +437,17 @@ def _report_unresolved(path, failures, aliases, log):
 
 
 def _extract_queries(args, events, sources, intervals, missing, sequence_checks,
-                     candidates, temporary_root, unresolved, aliases, log):
-    """Retry failed candidates in scaffold batches, preserving successful reads."""
+                     candidates, temporary_root, unresolved, aliases, log, dropped=None):
+    """Retry failed candidates in scaffold batches, preserving successful reads.
+
+    With ``dropped`` (a list), exhausted variants are collected there instead
+    of stopping the run; the caller reports and removes them.
+    """
     verified_intervals, hits = {}, {}
     attempts = Counter()
     round_number = 0
-    _report_unresolved(unresolved, [], aliases, log)
+    if dropped is None:
+        _report_unresolved(unresolved, [], aliases, log)
     while intervals or missing:
         round_number += 1
         for identifier in set(intervals) | {name for name, _reason in missing}:
@@ -485,13 +499,47 @@ def _extract_queries(args, events, sources, intervals, missing, sequence_checks,
             else:
                 events[identifier].query = candidate
                 retry.add(identifier)
-        _report_unresolved(unresolved, exhausted, aliases, log)
+        if dropped is None:
+            _report_unresolved(unresolved, exhausted, aliases, log)
+        else:
+            dropped.extend(exhausted)
         if not retry:
             break
         log(f'Retrying {len(retry)} insertions with later SIZE/span-matched observations')
         intervals, missing = _prepare_intervals(events, retry, sources, args.anchor,
                                                query_flanks=args.gfa_mode != 'rgfa')
     return verified_intervals, hits
+
+
+def _drop_unverified(events, resolver, intervals, dropped, unresolved, aliases, log):
+    """Remove unverifiable variants and everything built on them from the graph.
+
+    A dropped variant is never exported with unverified bases. Variants nested
+    in it or aligned onto it are dropped too; the sidecar then marks all of
+    them as not exported (path '.').
+    """
+    reasons = OrderedDict()
+    for identifier, reason in dropped:
+        reasons.setdefault(identifier, reason)
+    order = getattr(resolver, 'order', None)
+    if order is not None:
+        for name in order:  # parents precede children
+            if name in reasons:
+                continue
+            event = events[name]
+            parent = next((target for target in (event.chrom, *(run.target for run in event.runs))
+                           if target in reasons), None)
+            if parent is not None:
+                reasons[name] = f'depends_on_dropped: {aliases.get(parent, parent)}'
+        resolver.order = [name for name in order if name not in reasons]
+        for name in reasons:
+            resolver.ranks.pop(name, None)
+    else:
+        for name in reasons:
+            events[name].retained = False
+    for name in reasons:
+        intervals.pop(name, None)
+    _report_unresolved(unresolved, list(reasons.items()), aliases, log, fatal=False)
 
 
 def _write_metadata(bed, events, intervals, aliases, resolver, unique_minimum, anchor):
@@ -566,11 +614,13 @@ def _write_metadata(bed, events, intervals, aliases, resolver, unique_minimum, a
             for name, root in sorted(resolver.roots.items()):
                 if root.lift:
                     lift = root.lift
-                    out.write(f'{name}\t{lift["backbone"]}\t{lift["status"]}\t{lift["placements"]}\t{lift["note"]}\n')
+                    out.write('\t'.join(str(value) for value in (
+                        name, lift.get('backbone', '.'), lift.get('status', '.'),
+                        lift.get('placements', '.'), lift.get('note', '.'))) + '\n')
 
 
 def _path_leaves(spec, roots, resolver, anchor):
-    if spec.kind in ('reference', 'alternative', 'novel'):
+    if spec.kind in ('reference', 'alternative', 'novel', 'duplication'):
         return resolver.expand(spec.source, spec.start, spec.end)
     if hasattr(resolver, 'ranks') and spec.kind == 'deletion':
         return resolver.local_path(spec.source, spec.start, spec.end, max(1, anchor))
@@ -662,7 +712,9 @@ def _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks=Non
                         root_reader = IndexedFasta(root.path, root.fai)
                         root_path = root.path
                     written = 0
-                    for sequence in interval_chunks(root_reader, source, start, end, '+'):
+                    record = root.record or source
+                    for sequence in interval_chunks(root_reader, record, root.base+start,
+                                                    root.base+end, '+'):
                         if not VALID_SEQUENCE.fullmatch(sequence):
                             raise ValueError(f'{source}: sequence contains characters invalid in GFA')
                         if ranks is not None and not VG_SEQUENCE.fullmatch(sequence):
@@ -759,11 +811,14 @@ def _run(args, candidates, bed, log):
     log('Streaming VCF metadata and SIZE/span-matched query intervals')
     events = OrderedDict()
     event_kinds = {}
+    record_indexes = {}
+    dup_alignments = {} if args.gfa_mode == 'rgfa' else None
     for order, record in enumerate(rows(args.vcf, sources, args.size_cutoff,
                                        sequence_checks=sequence_checks,
                                        candidate_sink=candidates.add if sequence_checks is not None else None,
                                        insertion_only=getattr(args, 'insertion_only', None) is not None,
-                                       event_kinds=event_kinds)):
+                                       event_kinds=event_kinds, record_indexes=record_indexes,
+                                       dup_alignments=dup_alignments)):
         identifier, chrom, pos, ref_end, length, values, query, query_reason, retained = record
         if identifier in events:
             raise ValueError(f'duplicate insertion ID or variant ID {identifier!r}')
@@ -790,6 +845,16 @@ def _run(args, candidates, bed, log):
                                               list(_flatten(args.local_path_fasta)), log,
                                               template_catalogs=args.local_reference_templates,
                                               backbone=getattr(args, 'reference_haplotype', None))
+        catalog = getattr(args, 'alternative_catalog', None)
+        if catalog:
+            from gfa_catalog_paths import resolve_catalog_paths
+            from gfa_interval_metadata import vcf_paths
+            source_aliases.update(resolve_catalog_paths(
+                events, roots, reachable, catalog, list(vcf_paths(args.vcf)),
+                getattr(args, 'reference_haplotype', None), args.reference_fasta, args.output or bed,
+                Root, log, threads=args.processes))
+        from gfa_duplications import add_duplication_paths
+        add_duplication_paths(events, roots, dup_alignments, source_aliases, Run, Root, log)
         resolver = StableResolver(events, roots, header_lengths, hits, reachable,
                                   args.nested_pos_base, source_aliases=source_aliases)
         stable_names = [aliases.get(name, name) for name in resolver.order] + list(roots)
@@ -805,8 +870,15 @@ def _run(args, candidates, bed, log):
     unresolved = Path(str(bed)+'.unresolved.tsv')
     unique_minimum = max(args.size_cutoff, args.unique_size_cutoff)
     # Reject known-unrecoverable metadata before reading any assembly sequence.
-    _report_unresolved(unresolved, [item for item in missing
-                       if not stable or item[0] not in candidates.positions], aliases, log)
+    drop = bool(getattr(args, 'drop_unverified', False))
+    unrecoverable = [item for item in missing
+                     if not stable or item[0] not in candidates.positions]
+    dropped = [] if drop else None
+    if drop:
+        # Collected here and reported once, after extraction.
+        dropped.extend(unrecoverable)
+    else:
+        _report_unresolved(unresolved, unrecoverable, aliases, log)
     if args.bed_only:
         _report_unresolved(unresolved, missing, aliases, log)
         _write_metadata(bed, events, intervals, aliases, resolver,
@@ -818,8 +890,11 @@ def _run(args, candidates, bed, log):
         temporary_root = Path(directory)
         intervals, extracted = _extract_queries(
             args, events, sources, intervals, missing, sequence_checks,
-            candidates if stable else None, temporary_root, unresolved, aliases, log)
+            candidates if stable else None, temporary_root, unresolved, aliases, log,
+            dropped=dropped)
         hits.update(extracted)
+        if drop:
+            _drop_unverified(events, resolver, intervals, dropped, unresolved, aliases, log)
         _write_metadata(bed, events, intervals, aliases, resolver,
                         unique_minimum, args.anchor)
 
@@ -899,4 +974,39 @@ def _run(args, candidates, bed, log):
                              boundaries, segment_ids, prefix, hits, aliases)
         log(f'Wrote {len(segment_ids)} segments, {links} links, and '
             f'{len(specs)} paths to {output}')
+        if stable:
+            index = Path(str(output) + '.variants.tsv')
+            count = _write_variant_index(index, events, record_indexes, aliases, resolver)
+            log(f'Wrote {count} variant-to-path rows to {index}')
         return 0
+
+
+def _write_variant_index(path, events, record_indexes, aliases, resolver):
+    """Map each VCF data line to its GFA allele path and parent breakpoints.
+
+    ``vcf_index`` numbers VCF data lines from 0 across the -v inputs in order.
+    ``path`` is the allele's P line ('.' when not exported). Parent intervals
+    are in the parent P path's own coordinates; ``parent_strand`` is '-' when
+    a local parent name maps in reverse onto its included path. Deletion paths
+    carry flanks, so a GAF walk uses the parent interval, not their P line.
+    """
+    rows = []
+    for event in events.values():
+        exported = event.identifier in resolver.ranks
+        parent = start = end = strand = '.'
+        if exported:
+            start, end = resolver.breakpoints(event.identifier)
+            parent, strand = event.chrom, '+'
+            if parent not in events:
+                parent, start, end, strand = resolver.canonical_interval(parent, start, end)
+            parent = aliases.get(parent, parent)
+        rows.append((record_indexes.get(event.identifier, -1), event.identifier,
+                     aliases.get(event.identifier, event.identifier) if exported else '.',
+                     event.kind, parent, start, end, strand))
+    rows.sort(key=lambda row: row[0])
+    with open(path, 'w', buffering=CHUNK) as out:
+        out.write('#vcf_index\tvariant_id\tpath\tkind\tparent\tparent_start\t'
+                  'parent_end\tparent_strand\n')
+        for row in rows:
+            out.write('\t'.join(map(str, row)) + '\n')
+    return len(rows)

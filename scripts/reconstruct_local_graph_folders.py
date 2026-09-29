@@ -10,7 +10,7 @@ shared RAM.  Every local graph is then written independently as::
     OUTPUT/Graphs/PARTITION/PARTITION.FA_db.*  # BLAST database
     OUTPUT/Graphs/PARTITION/PARTITION.fasta  # original partition templates
     OUTPUT/Graphs/PARTITION/PARTITIONcache.json  # when packed
-    OUTPUT/summary -> input package directory
+    OUTPUT/summary/  # read-only view: one link per package file
     OUTPUT/references -> input package directory/references  # when present
     OUTPUT/Graphs.list  # graph alignment paths (.FA)
     OUTPUT/Graphs.template.list  # hotspot targets (.fasta)
@@ -29,7 +29,10 @@ sequence when it differs from the main reference used for graph paths.
 No cohort assemblies are read. Non-reference original intervals are recovered
 from packed paths on their own source haplotype/contig; an incomplete package
 must be corrected by its producer, not by requiring downstream assemblies.
-``partition_caches.jsonl`` is optional for compatibility with older packages.
+``partition_caches.jsonl`` is required by default: a missing or empty file
+stops reconstruction, because block partitioning needs each partition's cache.
+``--no-partition-caches`` explicitly builds folders without caches (for older
+packages). Partitions that the package has no cache for are reported.
 """
 from __future__ import annotations
 
@@ -41,6 +44,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -435,6 +439,75 @@ def build_graph_blast_database(graph_fasta: str) -> None:
         )
 
 
+PACKAGE_SOURCE_LINK = ".package_source"
+
+
+def _summary_view_state(summary: Path, package_target: str) -> str:
+    """Classify OUTPUT/summary before any work: absent, package, legacy, view."""
+    if not os.path.lexists(summary):
+        return "absent"
+    if summary.is_symlink():
+        if os.path.realpath(summary) == package_target:
+            return "legacy"  # old writable link to the whole package
+        raise FileExistsError(f"{summary}: already exists and does not point to {package_target}")
+    if not summary.is_dir():
+        raise FileExistsError(f"{summary}: exists and is not a summary view")
+    if os.path.realpath(summary) == package_target:
+        return "package"  # the output root holds the package itself
+    marker = summary / PACKAGE_SOURCE_LINK
+    if not marker.is_symlink() or os.path.realpath(marker) != package_target:
+        raise FileExistsError(
+            f"{summary}: an existing directory that is not a view of {package_target}"
+        )
+    return "view"
+
+
+def write_summary_view(summary: Path, package_target: str) -> None:
+    """Expose the package as a read-only directory of per-file links.
+
+    A link to the whole package directory let later steps that write into
+    OUTPUT/summary (for example a packaging run) replace the original package
+    files. The view is a real directory whose entries link to the package
+    files; its mode is read-only, so creating, renaming or deleting files in
+    it fails instead of changing the package. Nothing is copied.
+    """
+    state = _summary_view_state(summary, package_target)
+    if state == "package":
+        return
+    temporary = summary.with_name(f".{summary.name}.view.tmp.{os.getpid()}")
+    if os.path.lexists(temporary):
+        shutil.rmtree(temporary)
+    temporary.mkdir()
+    try:
+        # Links live inside the view, which sits beside the final name, so
+        # targets are relative to the view directory itself.
+        base = os.path.realpath(temporary)
+        for entry in sorted(os.listdir(package_target)):
+            (temporary / entry).symlink_to(
+                os.path.relpath(os.path.join(package_target, entry), base),
+            )
+        (temporary / PACKAGE_SOURCE_LINK).symlink_to(
+            os.path.relpath(package_target, base), target_is_directory=True,
+        )
+        if state == "legacy":
+            summary.unlink()  # removes only the old link, never the package
+        elif state == "view":
+            os.chmod(summary, 0o755)
+            for entry in os.listdir(summary):
+                if not (summary / entry).is_symlink():
+                    raise FileExistsError(f"{summary / entry}: unexpected file in the summary view")
+                (summary / entry).unlink()
+            summary.rmdir()
+        # Renaming a directory needs write permission on it; lock it after.
+        os.replace(temporary, summary)
+        os.chmod(summary, 0o555)
+    except BaseException:
+        if os.path.lexists(temporary):
+            os.chmod(temporary, 0o755)
+            shutil.rmtree(temporary)
+        raise
+
+
 def reference_header(
     partition: str,
     row: Mapping[str, str],
@@ -492,6 +565,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("-j", "--jobs", type=int, default=16)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--no-partition-caches", action="store_true",
+        help="allow a missing or empty partition_caches.jsonl (older packages); "
+             "caches the package does hold are still written, and partitions "
+             "without one get no cache.json (default: require the package's caches)",
+    )
+    parser.add_argument(
         "--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
     )
@@ -526,10 +605,8 @@ def run(args: argparse.Namespace) -> None:
 
     summary_link = Path(output_dir) / "summary"
     package_target = os.path.realpath(package_dir)
-    if os.path.lexists(summary_link) and os.path.realpath(summary_link) != package_target:
-        raise FileExistsError(
-            f"{summary_link}: already exists and does not point to {package_dir}"
-        )
+    # Fail before any work if OUTPUT/summary is something else.
+    _summary_view_state(summary_link, package_target)
     references_source = Path(package_dir) / "references"
     references_link = Path(output_dir) / "references"
     references_target = references_source.resolve() if references_source.is_dir() else None
@@ -544,10 +621,24 @@ def run(args: argparse.Namespace) -> None:
     partition_caches = read_partition_cache_package(
         caches_path, by_partition,
     )
+    if not partition_caches and not getattr(args, "no_partition_caches", False):
+        state = "is empty" if os.path.isfile(caches_path) else "is missing"
+        raise ValueError(
+            f"{caches_path} {state}: the package holds no partition caches, so "
+            "block partitioning would find no cache.json files. Rebuild the "
+            "package from graph folders that have current PARTITIONcache.json "
+            "files, or pass --no-partition-caches to build folders without caches"
+        )
+    missing_caches = len(by_partition) - len(partition_caches)
     LOG.info(
-        "Loaded %d optional partition cache record(s)",
-        len(partition_caches),
+        "Loaded %d partition cache record(s) for %d partition(s)",
+        len(partition_caches), len(by_partition),
     )
+    if partition_caches and missing_caches:
+        LOG.warning(
+            "%d partition(s) have no cache in %s; block partitioning will skip "
+            "their alignment rows", missing_caches, caches_path,
+        )
     LOG.info(
         "Loading all reference and alternative sequences into shared RAM",
     )
@@ -813,6 +904,16 @@ def run(args: argparse.Namespace) -> None:
         legacy_graph_path = os.path.join(directory, "graph.FA")
         legacy_original_graph_path = os.path.join(directory, "graph.fasta")
 
+        def remove_stale_cache() -> None:
+            # A cache is valid only for the package it came from: without a
+            # package record, an older cache.json here would be reused by
+            # block partitioning against a possibly different graph.
+            if cache_text is None:
+                try:
+                    os.remove(cache_path)
+                except FileNotFoundError:
+                    pass
+
         def remove_legacy_names() -> None:
             for legacy in (legacy_graph_path, legacy_original_graph_path):
                 try:
@@ -841,6 +942,7 @@ def run(args: argparse.Namespace) -> None:
             and os.stat(original_graph_path).st_mtime_ns >= input_mtime
         ):
             remove_legacy_names()
+            remove_stale_cache()
             return partition, 0, 0, True
         has_refined = any(row["type"] == "reference" for row in rows)
         graph_template_rows = selected_reference_rows(rows)
@@ -937,6 +1039,7 @@ def run(args: argparse.Namespace) -> None:
                 with open(cache_tmp, "wt", encoding="utf-8") as cache_output:
                     cache_output.write(cache_text)
                 os.replace(cache_tmp, cache_path)
+            remove_stale_cache()
             remove_legacy_names()
         finally:
             for temporary in (
@@ -992,12 +1095,8 @@ def run(args: argparse.Namespace) -> None:
         "Generated graph alignment list and KmerSearcher template cache: %s, %s",
         listing, cache,
     )
-    if not os.path.lexists(summary_link):
-        summary_link.symlink_to(
-            os.path.relpath(package_target, os.path.realpath(output_dir)),
-            target_is_directory=True,
-        )
-    LOG.info("Summary package available at %s", summary_link)
+    write_summary_view(summary_link, package_target)
+    LOG.info("Summary package available read-only at %s", summary_link)
     if references_target is not None:
         if not os.path.lexists(references_link):
             references_link.symlink_to(

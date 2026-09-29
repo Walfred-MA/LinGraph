@@ -206,7 +206,13 @@ def _other_variant(fields, info, samples, samples_available, cutoff,
                     continue
                 for allele in split_sample_alleles(text, fields[8]):
                     values = parse_hsv_allele(allele)
-                    if values is None or values[1] != svtype or not accepted_contig(sample, values[4]):
+                    if values is None or not accepted_contig(sample, values[4]):
+                        continue
+                    # INS_SNP: a SNP inside a merged insertion, placed on the
+                    # insertion or projected to the destination its bases copy
+                    # (tools/extract_insertion_snps.py), possibly a chromosome.
+                    projected = kind == 'snp' and values[1] == 'INS_SNP'
+                    if values[1] != svtype and not projected:
                         continue
                     if kind == 'snp' and values[3].upper() != sequence.upper():
                         continue
@@ -214,14 +220,28 @@ def _other_variant(fields, info, samples, samples_available, cutoff,
                     if coordinate is None:
                         continue
                     low = int(coordinate[1])
+                    if kind == 'snp' and not coordinate[2] and coordinate[3] == '-':
+                        # graphreftovcf writes a '-' strand point as the
+                        # traversal boundary (end - offset): the base itself
+                        # is the one before it.
+                        low -= 1
                     high = int(coordinate[2]) if coordinate[2] else low + (1 if kind == 'snp' else 0)
                     low, high = sorted((low, high))
                     if high - low == size:
-                        candidate = (sample, values[4], low, high, coordinate[3] or '+')
-                        if candidate not in candidates:
-                            candidates.append(candidate)
+                        strand = coordinate[3] or '+'
+                        # A reverse projection complements ALT while QUERYCOORD
+                        # keeps the sample strand: try both readings; the base
+                        # check against the assembly keeps only a true one.
+                        strands = (strand, '-' if strand == '+' else '+') if projected else (strand,)
+                        for strand in strands:
+                            candidate = (sample, values[4], low, high, strand)
+                            if candidate not in candidates:
+                                candidates.append(candidate)
         query = candidates[0] if candidates else None
-        reason = 'ok' if query else f'coordinate_mismatch: no {svtype} allele has a usable query interval'
+        if query:
+            reason = 'ok'
+        else:
+            reason = f'coordinate_mismatch: no {svtype} allele has a usable query interval'
         if candidate_sink is not None:
             candidate_sink(identifier, candidates)
     if event_kinds is not None:
@@ -231,14 +251,37 @@ def _other_variant(fields, info, samples, samples_available, cutoff,
 
 
 def rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=None,
-         *, insertion_only=False, event_kinds=None):
+         *, insertion_only=False, event_kinds=None, record_indexes=None,
+         dup_alignments=None):
+    """Stream variant definitions from one or more VCFs.
+
+    ``record_indexes`` receives each yielded ID's global data-line index:
+    VCF data lines are numbered from 0 across all inputs in order.
+    ``dup_alignments`` receives ``ID -> (ALTERNATIVECIGAR, literal SEQ)``
+    for full-locus duplication insertions.
+    """
+    counter = [0]
     for item in vcf_paths(path):
         yield from _rows(item, samples_available, cutoff, sequence_checks, candidate_sink,
-                         insertion_only=insertion_only, event_kinds=event_kinds)
+                         insertion_only=insertion_only, event_kinds=event_kinds,
+                         record_indexes=record_indexes, dup_alignments=dup_alignments,
+                         counter=counter)
+
+
+def _literal_insertion(text, size):
+    """Return the plain inserted bases of INFO/SEQ, or None if encoded."""
+    text = _unescape(text or '')
+    if len(text) == size and _PAYLOAD.fullmatch(text):
+        return text
+    match = re.fullmatch(r'[<>](\d+)I([A-Za-z]+)', text)
+    if match and int(match[1]) == size == len(match[2]):
+        return match[2]
+    return None
 
 
 def _rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=None,
-          *, insertion_only=False, event_kinds=None):
+          *, insertion_only=False, event_kinds=None, record_indexes=None,
+          dup_alignments=None, counter=None):
     """Stream candidates, preferring full representative matches in rGFA mode."""
     opener = gzip.open if str(path).endswith('.gz') else open
     samples = ()
@@ -249,8 +292,13 @@ def _rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=
                 continue
             if line.startswith('#') or not line.strip():
                 continue
+            record_index = counter[0] if counter is not None else None
+            if counter is not None:
+                counter[0] += 1
             try:
                 fields = line.rstrip('\r\n').split('\t', 9)
+                if record_indexes is not None and len(fields) > 2:
+                    record_indexes[fields[2]] = record_index
                 if len(fields) < 8:
                     raise ValueError('malformed VCF record')
                 info = dict(item.split('=', 1) for item in fields[7].split(';') if '=' in item)
@@ -264,6 +312,11 @@ def _rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=
                 if size == 0:
                     continue
                 runs = graph_runs(info.get('SEQ', ''), size)
+                if (dup_alignments is not None and info.get('PACLASS') == 'fulllocusdup'
+                        and info.get('ALTERNATIVECIGAR', '.') != '.'):
+                    dup_alignments[identifier] = (
+                        _unescape(info['ALTERNATIVECIGAR']),
+                        _literal_insertion(info.get('SEQ', ''), size))
                 if sequence_checks is not None:
                     sequence_checks[identifier] = literal_checks(info.get('SEQ', ''), size)
                 query = None
