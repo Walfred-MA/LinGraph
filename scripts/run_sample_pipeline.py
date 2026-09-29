@@ -81,6 +81,7 @@ class PipelinePaths:
     local_templates: Path
     graphcigartoref: Path
     graphcigartoreffix: Path
+    pseudolinear: Path
     vcf: Path
     genomelift_tmp: Path
     norm_folder: Path
@@ -124,6 +125,7 @@ def output_paths(
         local_templates=query_dir / "local_reference_templates.fa",
         graphcigartoref=query_dir / f"{sample}.graphcigartoref.tsv",
         graphcigartoreffix=query_dir / f"{sample}.graphcigartoreffix.tsv",
+        pseudolinear=query_dir / f"{sample}.pseudolinear.tsv",
         vcf=query_dir / f"{sample}.vcf",
         genomelift_tmp=query_dir / f"{sample}.GenomeLiftTemp",
         norm_folder=query_dir / f"{sample}.per_graph_norms",
@@ -131,16 +133,10 @@ def output_paths(
     )
 
 
-def pipeline_script_path(script_dir: Path, script: str) -> Path:
-    if script == "namecontigsfix.py":
-        return script_dir.parent / "tools" / script
-    return script_dir / script
-
-
 def script_command(script_dir: Path, script: str, *arguments: object) -> Tuple[str, ...]:
     return (
         sys.executable,
-        str(pipeline_script_path(script_dir, script)),
+        str(script_dir / script),
         *(str(argument) for argument in arguments),
     )
 
@@ -524,7 +520,8 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
 
     genomelift_arguments: List[object] = [
         "--input", paths.refmatch,
-        "--alignments", paths.query_align,
+        # The reference _align.txt gives the final lift stages their coverage.
+        "--alignments", f"{paths.query_align},{paths.reference_align}",
         "--output", paths.genomelift,
         "--refhaplo", args.reference_sample,
         "--threads", args.threads,
@@ -542,6 +539,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
         "--local-reference-templates", paths.local_templates,
         "--fasta-query", fasta_query,
         "-m", f"{paths.genomelift},{paths.genomeliftfix}",
+        "--pseudo-linear-assignments", paths.pseudolinear,
         "-o", paths.vcf,
         "--columns", args.sample,
         "-t", args.threads,
@@ -573,7 +571,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
                 "GenomeLift.py",
                 *genomelift_arguments,
             ),
-            inputs=(paths.refmatch, paths.query_align),
+            inputs=(paths.refmatch, paths.query_align, paths.reference_align),
             outputs=(paths.genomelift,),
         ),
         Stage(
@@ -619,12 +617,16 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
                 "-i", paths.graphcigartoref,
                 "--genomelift", paths.genomelift,
                 "--genomelift-fix-output", paths.genomeliftfix,
+                "--pseudo-linear-output", paths.pseudolinear,
                 "--query-genome", args.sample,
                 "--fasta-query", fasta_query,
                 "--reference", fasta_reference,
                 "--local-reference-templates", paths.local_templates,
                 "--output", paths.graphcigartoreffix,
                 "--processes", args.threads,
+                # A failed gap alignment stops the stage instead of silently
+                # dropping that gap's variants.
+                "--strict",
             ),
             inputs=(
                 paths.graphcigartoref, paths.genomelift,
@@ -633,7 +635,8 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
                 paths.local_templates,
                 Path(str(paths.local_templates) + ".fai"),
             ),
-            outputs=(paths.graphcigartoreffix, paths.genomeliftfix),
+            outputs=(paths.graphcigartoreffix, paths.genomeliftfix,
+                     paths.pseudolinear),
         ),
         Stage(
             name="vcf",
@@ -648,6 +651,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
                 script_dir / "graphreftovcf_persample.py",
                 fasta_reference_index, fasta_query_index, paths.genomelift,
                 paths.genomeliftfix,
+                paths.pseudolinear,
                 paths.local_templates,
                 Path(str(paths.local_templates) + ".fai"),
             ),
@@ -1003,11 +1007,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--buffer-size",
         type=int,
-        default=1000,
+        default=512,
         metavar="ROWS",
         help=(
             "completed graphcigartoref rows buffered before writing "
-            "(default: 1000); use 0 to flush every completed parallel job "
+            "(default: 512); use 0 to flush every completed parallel job "
             "for diagnosis"
         ),
     )
@@ -1038,9 +1042,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--maxtasksperchild",
         type=int,
-        default=512,
+        default=1,
         metavar="N",
-        help="recycle graphcigartoref workers after N comparisons (default: 512; 0 disables)",
+        help="recycle graphcigartoref workers after N comparisons, returning their "
+             "memory (default: 1; 0 disables)",
     )
     parser.add_argument(
         "--edge-blackregion",
@@ -1183,7 +1188,7 @@ def preflight(
     run_plan: Optional[Sequence[bool]] = None,
 ) -> None:
     missing_scripts = [
-        pipeline_script_path(script_dir, name)
+        script_dir / name
         for name in (
             "align_partition_hotspots.py",
             "summarize_partition_hotspot_segments.py",
@@ -1198,7 +1203,7 @@ def preflight(
             "graphreftovcf_persample.py",
             "namecontigsfix.py",
         )
-        if not pipeline_script_path(script_dir, name).is_file()
+        if not (script_dir / name).is_file()
     ]
     if missing_scripts:
         raise FileNotFoundError(

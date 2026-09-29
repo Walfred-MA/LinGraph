@@ -2,15 +2,17 @@
 """Fill internal query-annotation gaps in per-sample graph-CIGAR output.
 
 The input is the seven-column table emitted by
-``graphcigartoref_persample.py``.  Existing rows are immutable: they are copied
-to the output byte-for-byte and are never sliced, removed, or reassigned by
-this additive stage.
+``graphcigartoref_persample.py``.  Before gap discovery, this stage applies a
+dedicated linear edge-trim score to every existing comparison.  Weak terminal
+query/reference sequence is removed from the working row and becomes visible
+to the neighboring gap analysis.  Unchanged rows remain byte-identical;
+trimmed rows replace their input row in the output, and rows with no confident
+core are omitted.  The original alignment columns remain provenance.
 
 Internal positive gaps on each query contig are selected from the union of the
 effective column-3 query intervals.  Finite GenomeLift regions always mask
 overlapping ``-inf`` rows; the remaining ``-inf`` rows are assigned by the
 same complete-alignment score and >=1000 threshold used by graphreftovcf.py.
-This changes only the analysis view: original rows are still copied unchanged.
 Every gap shorter than 100 bp is selected; larger gaps require more than 100
 uppercase A/C/G/T bases and an uppercase fraction greater than 0.2.  Gaps of
 1 Mb or more are never selected.
@@ -28,10 +30,12 @@ insertion contains the query gap plus the lower-priority query sequence that
 projects across the reference overlap, which represents a tandem duplication.
 
 After query-gap alignment, positive same-reference gaps at exact query
-breakpoints are subtracted from the union of all reference intervals
-represented by the query.  Any uncovered piece is emitted as a pure deletion.
-Pairs separated by unresolved query sequence, or overlapping on the query,
-cannot establish a deletion and are skipped.  By default the output contains
+breakpoints are considered only when both neighboring anchors have overlapping
+extended query and reference alignment windows.  Those gaps are subtracted
+from the union of all reference intervals represented by the query, and any
+uncovered piece is emitted as a pure deletion.  Pairs lacking either anchor,
+separated by unresolved query sequence, or overlapping on the query cannot
+establish a deletion and are skipped.  By default the output contains
 the exact original input followed by new query-gap and deletion rows.
 ``--gaps-only`` writes only the additions.
 
@@ -45,6 +49,14 @@ are not filled and do not generate deletion rows. Only one connected core is
 retained per PA, then GenomeLift-style neighboring gap ownership is recomputed.
 The sparse changed rows are written to ``--genomelift-fix-output`` for use
 after the original GenomeLift file in a comma-ordered VCF ``--coord-map``.
+Score-qualified resurrected PAs are also marked there. A contained
+resurrected PA is excluded from gap-fill ownership but remains available to
+the post-gapfill pseudo-linear election. Resurrection is its lowest region
+tier, after owned, imputed, and extended sequence; the PA's GenomeLift class
+remains a separate, earlier priority category. After
+the corrected graph-CIGAR and sparse GenomeLift override are complete, this
+same process writes the exclusive pseudo-linear assignment table; it is not a
+separate workflow stage.
 """
 
 from __future__ import annotations
@@ -52,6 +64,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import dataclasses
+import functools
 import heapq
 import multiprocessing as mp
 import os
@@ -63,6 +76,7 @@ import traceback
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import graphcigartoref as core
+import pseudolinear_assignments as pseudolinear
 from graph_cigar_payloads import query_only_graph_cigar
 from GenomeLift import (
     compute_priority_display_offsets_for_regions,
@@ -71,8 +85,11 @@ from GenomeLift import (
 from graphcigartoref_persample import (
     SyntheticDeletionRow,
     _align_reference_flank_ops,
+    _next_result,
+    _trim_reference_operation_edges,
     read_genomelift,
     render_synthetic_deletion_or_warn,
+    slice_query_coord,
 )
 from graphreftovcf import (
     MIN_INFINITE_FALLBACK_ALIGNMENT_SCORE,
@@ -82,6 +99,13 @@ from graphreftovcf import (
     resolve_infinite_fallback_candidates,
 )
 from minsetref_segments import count_unmasked
+
+
+def default_pseudolinear_path(output_path: str) -> str:
+    suffix = ".graphcigartoreffix.tsv"
+    if output_path.endswith(suffix):
+        return output_path[:-len(suffix)] + ".pseudolinear.tsv"
+    return output_path + ".pseudolinear.tsv"
 
 
 DEFAULT_ANCHOR = 100
@@ -106,6 +130,7 @@ class AnnotationRow:
     graph_cigar: str
     reference_coord: Optional[core.Coord] = None
     alternative_intervals: Optional[dict] = None
+    fields: Tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -248,6 +273,7 @@ def annotation_from_fields(
         graph_cigar=fields[6],
         reference_coord=core.parse_coord(fields[3]),
         alternative_intervals=read_tag(fields),
+        fields=tuple(fields),
     )
 
 
@@ -258,6 +284,141 @@ def annotation_from_tsv(text: str, line_number: int) -> AnnotationRow:
     if row is None:
         raise ValueError("generated gap row has a zero-width query interval")
     return row
+
+
+def annotation_lift_role(row: AnnotationRow) -> str:
+    """Return the mapping-layer role carried by a graph-CIGAR row."""
+    prefix = "LIFT_ROLE:Z:"
+    for field in row.fields[7:]:
+        if field.startswith(prefix):
+            return field[len(prefix):].strip().lower()
+    return ""
+
+
+def _gapfill_edge_operation_bounds(
+    operations: Sequence[core.CigarOp],
+    minimum_score: int = 100,
+    gap_penalty: int = 4,
+) -> Optional[Tuple[int, int]]:
+    """Return the confident core under the gapfill edge-trim policy.
+
+    This is intentionally independent of the concave scores used to compare
+    complete realignments. Matches add one point per base; every mismatch or
+    indel operation costs its length plus a four-point opening penalty. The
+    first/last exact-match operation bounds the eligible core.
+    """
+    minimum_score = int(minimum_score)
+    gap_penalty = int(gap_penalty)
+    if minimum_score < 0 or gap_penalty < 0:
+        raise ValueError("gapfill edge-trim scores must be nonnegative")
+    matches = [
+        index for index, operation in enumerate(operations)
+        if operation.op in {"=", "M"} and operation.n > 0
+    ]
+    if not matches:
+        return None
+    first_match, last_match = matches[0], matches[-1]
+
+    def contribution(operation: core.CigarOp) -> int:
+        if operation.op in {"=", "M"}:
+            return operation.n
+        if operation.op in {"X", "I", "D"}:
+            return -(operation.n + gap_penalty)
+        return 0
+
+    left = first_match
+    score = 0
+    for index in range(first_match, last_match + 1):
+        score += contribution(operations[index])
+        if score < 0:
+            left = index + 1
+            score = 0
+        elif score > minimum_score:
+            break
+
+    right = last_match + 1
+    score = 0
+    for index in range(last_match, first_match - 1, -1):
+        score += contribution(operations[index])
+        if score < 0:
+            right = index
+            score = 0
+        elif score > minimum_score:
+            break
+    return (left, right) if right > left else None
+
+
+def trim_annotation_edges_for_gapfill(
+    row: AnnotationRow,
+) -> Optional[AnnotationRow]:
+    """Trim weak row edges and refresh effective query/reference intervals."""
+    total = core.graph_cigar_query_span(row.graph_cigar, row.query_name)
+    operations = [
+        operation
+        for segment in core.parse_reference_cigar_segments(
+            row.graph_cigar, row.query_name,
+        )
+        for operation in segment.ops
+    ]
+    non_h_count = sum(operation.op != "H" for operation in operations)
+    if non_h_count <= 1:
+        return row
+    bounds = _gapfill_edge_operation_bounds(operations)
+    if bounds is None:
+        return None
+    left, right = bounds
+    query_start = sum(
+        core.query_consume(operation.op, operation.n)
+        for operation in operations[:left]
+    )
+    query_end = sum(
+        core.query_consume(operation.op, operation.n)
+        for operation in operations[:right]
+    )
+    trimmed_coord = slice_query_coord(
+        row.query_coord, query_start, query_end, total,
+    )
+    if query_start == 0 and query_end == total:
+        if all(
+            operation.op == "H"
+            for operation in operations[:left] + operations[right:]
+        ):
+            graph_cigar = row.graph_cigar
+        else:
+            graph_cigar = _trim_reference_operation_edges(
+                row.graph_cigar, left, right,
+            )
+    else:
+        graph_cigar = core.slice_reference_cigar_by_query(
+            row.graph_cigar,
+            query_start,
+            query_end,
+            row.query_name,
+            include_left_boundary_deletions=False,
+        )
+    graph_cigar = query_only_graph_cigar(graph_cigar)
+    return _refresh_annotation(row, graph_cigar, trimmed_coord)
+
+
+def trim_annotations_for_gapfill(
+    rows: Sequence[AnnotationRow],
+) -> Tuple[List[AnnotationRow], Dict[str, int]]:
+    output: List[AnnotationRow] = []
+    stats = {"unchanged": 0, "trimmed": 0, "removed": 0}
+    for row in rows:
+        trimmed = trim_annotation_edges_for_gapfill(row)
+        if trimmed is None:
+            stats["removed"] += 1
+            continue
+        output.append(trimmed)
+        if (
+            trimmed.query_coord == row.query_coord
+            and trimmed.graph_cigar == row.graph_cigar
+        ):
+            stats["unchanged"] += 1
+        else:
+            stats["trimmed"] += 1
+    return output, stats
 
 
 def annotation_to_tsv(row: AnnotationRow) -> str:
@@ -314,11 +475,7 @@ def _clusters(
     end = ordered[0].query_coord.end
     members = [ordered[0]]
     for row in ordered[1:]:
-        # Exact adjacency is a real ownership boundary.  In particular, two
-        # adjacent owned query intervals can project to overlapping reference
-        # intervals, which is the evidence for a tandem duplication.  Folding
-        # touching intervals into one cluster hides that boundary entirely.
-        if row.query_coord.start < end:
+        if row.query_coord.start <= end:
             end = max(end, row.query_coord.end)
             members.append(row)
             continue
@@ -972,25 +1129,24 @@ def discover_gap_tasks(
         ):
             _left_start, gap_start, left_members = left_cluster
             gap_end, _right_end, right_members = right_cluster
-            if gap_end < gap_start:
+            if gap_end <= gap_start:
                 continue
             stats["internal_gaps"] += 1
             gap_size = gap_end - gap_start
-            if gap_size:
-                sequence = query_reader.fetch(contig, gap_start, gap_end, "+")
-                unmasked = count_unmasked(sequence)
-                if not gap_is_eligible(
-                    gap_size,
-                    unmasked,
-                    maximum_gap,
-                    minimum_unmasked,
-                    minimum_fraction,
-                    # The masking exception is fixed at <100 bp.  Changing the
-                    # alignment-anchor length must not change gap eligibility.
-                    DEFAULT_ANCHOR,
-                ):
-                    stats["masked_or_large"] += 1
-                    continue
+            sequence = query_reader.fetch(contig, gap_start, gap_end, "+")
+            unmasked = count_unmasked(sequence)
+            if not gap_is_eligible(
+                gap_size,
+                unmasked,
+                maximum_gap,
+                minimum_unmasked,
+                minimum_fraction,
+                # The masking exception is fixed at <100 bp.  Changing the
+                # alignment-anchor length must not change gap eligibility.
+                DEFAULT_ANCHOR,
+            ):
+                stats["masked_or_large"] += 1
+                continue
             left_edge_rows = tuple(
                 row for row in left_members
                 if row.query_coord.end == gap_start
@@ -1053,8 +1209,12 @@ def discover_gap_tasks(
                 if selected_side == "right"
                 else left_block.annotation
             )
-            same_reference = _same_reference(
-                left_boundary, right_boundary, reference_index,
+            # Opposite reference strands (e.g. an inversion breakpoint) have
+            # no signed reference gap; treat them as different references so
+            # the gap is filled one-sided from the selected block.
+            same_reference = (
+                _same_reference(left_boundary, right_boundary, reference_index)
+                and left_boundary.strand == right_boundary.strand
             )
             reference_gap_size: Optional[int] = None
             insertion_start: Optional[int] = None
@@ -1069,7 +1229,7 @@ def discover_gap_tasks(
                     if selected_boundary.strand == "+"
                     else left_boundary.position - right_boundary.position
                 )
-                if reference_gap_size == 0 and gap_size > 0:
+                if reference_gap_size == 0:
                     # The query interval is absent from both neighboring rows
                     # but the two reference breakpoints touch. Preserve it as
                     # a pure insertion instead of silently dropping the gap.
@@ -1111,37 +1271,6 @@ def discover_gap_tasks(
                         continue
                     mode = "tandem-duplication"
                     stats["tandem_duplication"] += 1
-
-            # A zero-width query boundary has no sequence to align.  It is
-            # nevertheless informative when the two owned rows project to an
-            # overlapping reference interval: the lower-priority row's query
-            # prefix/suffix is a tandem copy.  Other zero-width boundaries do
-            # not need a query-gap task (ordinary reference deletions are
-            # handled by discover_reference_gap_deletions()).
-            if gap_size == 0 and mode != "tandem-duplication":
-                continue
-
-            if mode == "tandem-duplication":
-                if insertion_start is None or insertion_end is None:
-                    stats["unprojectable_tandem"] += 1
-                    continue
-                insertion_size = insertion_end - insertion_start
-                if insertion_size <= 0:
-                    stats["unprojectable_tandem"] += 1
-                    continue
-                insertion_sequence = query_reader.fetch(
-                    contig, insertion_start, insertion_end, "+",
-                )
-                if not gap_is_eligible(
-                    insertion_size,
-                    count_unmasked(insertion_sequence),
-                    maximum_gap,
-                    minimum_unmasked,
-                    minimum_fraction,
-                    DEFAULT_ANCHOR,
-                ):
-                    stats["masked_or_large"] += 1
-                    continue
 
             # A bounded alignment must include the *complete* interval between
             # the two reference breakpoints.  The former 1-kb cap sent every
@@ -1859,7 +1988,7 @@ def _score_annotation_cigar(item: Tuple[int, str]) -> Tuple[int, float]:
 def _score_annotations_parallel(
     rows: Sequence[AnnotationRow], processes: int,
 ) -> Dict[int, float]:
-    """Score surviving resurrection rows, in parallel when worthwhile."""
+    """Score eligible resurrection rows, in parallel when worthwhile."""
     items = [(id(row), row.graph_cigar) for row in rows]
     worker_count = min(max(1, processes), len(items))
     if worker_count > 1 and len(items) >= 32:
@@ -1951,10 +2080,10 @@ def _suppress_contained_resurrected_pas(
 ) -> set:
     """Discard a resurrected PA contained by another resurrected PA.
 
-    Containment is deliberately decided before score competition.  It avoids
-    allowing a short inner resurrected PA to split one outer PA into two
-    disconnected ownership islands.  Equal spans are not containment; those
-    continue to use alignment score and the stable sweep tie-breakers.
+    Callers must score and threshold candidates before this function. It
+    avoids allowing a short inner resurrected PA to split one outer PA into
+    two disconnected ownership islands. Equal spans are not containment;
+    those continue to use alignment score and the stable sweep tie-breakers.
     """
     suppressed = set()
     for candidates in candidates_by_contig.values():
@@ -2004,6 +2133,7 @@ def determine_final_pa_ownership(
     primary_reference_index: Optional[
         Mapping[str, Tuple[int, int, int, int]]
     ] = None,
+    resurrected_alleles_out: Optional[set] = None,
 ) -> Tuple[
     Dict[str, Tuple[int, int]],
     Dict[str, Tuple[str, str]],
@@ -2013,9 +2143,12 @@ def determine_final_pa_ownership(
 
     Mapped finite PAs have the highest tier. Former ``-inf`` PAs whose full
     alignment score is >=1000 are resurrected at that score. Within either
-    tier, alternative/novel-target alignments receive half priority. An outer
-    resurrected PA consumes a fully contained resurrected PA before scoring
-    unless that would let a non-primary outer suppress a primary inner PA.
+    tier, alternative/novel-target alignments receive half priority. A
+    score-qualified outer resurrected PA consumes a fully contained
+    resurrected PA for gap-fill ownership unless that would let a non-primary
+    outer suppress a primary inner PA. Contained qualified PAs remain marked
+    for the later pseudo-linear assignment, where resurrection is the lowest
+    region tier rather than a GenomeLift class.
     Unmapped-only PAs that overlap mapped evidence are discarded. A partially
     mapped PA may retain only the low-priority sequence connected to its
     winning mapped core.
@@ -2045,7 +2178,6 @@ def determine_final_pa_ownership(
     deferred_resurrections: List[
         Tuple[AnnotationRow, str, object, List[Tuple[int, int]], bool]
     ] = []
-    valid_regions_by_contig: Dict[str, List[Tuple[int, int]]] = {}
     for annotation in annotations:
         non_primary = annotation_targets_non_primary(
             annotation, primary_reference_index,
@@ -2075,9 +2207,6 @@ def determine_final_pa_ownership(
                 mapped_rows_by_allele.get(allele, 0) + 1
             )
             bucket = candidates_by_contig.setdefault(lift.locus.chrom, [])
-            region_bucket = valid_regions_by_contig.setdefault(
-                lift.locus.chrom, [],
-            )
             for start, end in intersections:
                 bucket.append(OwnershipCandidate(
                     start,
@@ -2092,7 +2221,6 @@ def determine_final_pa_ownership(
                     annotation.line_number,
                     non_primary,
                 ))
-                region_bucket.append((start, end))
             # Preserve GenomeLift's previous valid-owner decision as the
             # tie-breaker when two mapped valid PAs overlap. Positive gap
             # extensions are clipped back to the original PA locus here;
@@ -2125,58 +2253,82 @@ def determine_final_pa_ownership(
                     non_primary,
                 ))
 
-    valid_union_by_contig = {
-        contig: _merge_intervals(intervals)
-        for contig, intervals in valid_regions_by_contig.items()
-    }
-
-    # Gate 1 (>1000 bp): a resurrected candidate survives only when at least
-    # one CONTIGUOUS uncovered stretch outside the valid union exceeds
-    # MIN_INFINITE_FALLBACK_ALIGNMENT_SCORE bases; where the union covers it,
-    # it can never out-rank valid ownership.
-    gated_by_contig: Dict[
+    # Score every intersecting former -inf alignment. The threshold is an
+    # alignment score measured in points, not a length in bases: with +4 per
+    # match, a perfect 251-bp alignment already exceeds the 1000-point gate.
+    # The previous length shortcut therefore missed real resurrected PAs,
+    # especially contained ones. Finite candidates still outrank them in the
+    # ownership sweep, so scoring covered rows cannot displace a valid owner.
+    eligible_by_contig: Dict[
         str, List[Tuple[int, int, str, AnnotationRow, bool]]
     ] = {}
     for (
         annotation, allele, lift, intersections, non_primary
     ) in deferred_resurrections:
-        union = valid_union_by_contig.get(lift.locus.chrom, ())
-        best = 0
-        for start, end in intersections:
-            for piece_start, piece_end in _uncovered_pieces(
-                start, end, union,
-            ):
-                best = max(best, piece_end - piece_start)
-        if best <= MIN_INFINITE_FALLBACK_ALIGNMENT_SCORE:
-            continue
-        bucket = gated_by_contig.setdefault(lift.locus.chrom, [])
+        bucket = eligible_by_contig.setdefault(lift.locus.chrom, [])
         for start, end in intersections:
             bucket.append((start, end, allele, annotation, non_primary))
 
-    # Gate 2: exclude a resurrected candidate lying fully inside another
-    # resurrected candidate on the same contig, before any scoring.
+    # Score each eligible resurrection before applying
+    # containment.  Suppressing first is incorrect: a low-scoring outer PA
+    # could otherwise remove a high-scoring contained PA and then fail its own
+    # score threshold, losing both alignments.
+    unique_rows: Dict[int, AnnotationRow] = {}
+    for entries in eligible_by_contig.values():
+        for _start, _end, _allele, annotation, _non_primary in entries:
+            unique_rows.setdefault(id(annotation), annotation)
+    score_by_annotation = _score_annotations_parallel(
+        list(unique_rows.values()), processes,
+    )
+    qualified_by_contig: Dict[
+        str, List[Tuple[int, int, str, AnnotationRow, bool]]
+    ] = {}
+    qualified_resurrected_alleles = set()
+    for contig, entries in eligible_by_contig.items():
+        for entry in entries:
+            annotation = entry[3]
+            if (
+                score_by_annotation[id(annotation)]
+                < MIN_INFINITE_FALLBACK_ALIGNMENT_SCORE
+            ):
+                continue
+            qualified_by_contig.setdefault(contig, []).append(entry)
+            qualified_resurrected_alleles.add(entry[2])
+    if resurrected_alleles_out is not None:
+        resurrected_alleles_out.update(qualified_resurrected_alleles)
+
+    # A contained resurrection remains represented in graphcigartoreffix and
+    # is marked in genomeliftfix for the later pseudo-linear assignment.  It
+    # is suppressed only from this gap-fill ownership election, where letting
+    # it split the outer owner's connected core would create artificial gaps.
     surviving_resurrections: List[
         Tuple[int, int, str, AnnotationRow, bool]
     ] = []
     removed_alleles: set = set()
     surviving_alleles: set = set()
-    for contig in sorted(gated_by_contig):
+    for contig in sorted(qualified_by_contig):
+        # Longest-first at equal starts, so an outer interval always precedes
+        # every interval it contains, including ones sharing its start.
         entries = sorted(
-            gated_by_contig[contig],
-            key=lambda entry: (entry[0], entry[1], entry[2]),
+            qualified_by_contig[contig],
+            key=lambda entry: (entry[0], -entry[1], entry[2]),
         )
         removed = [False] * len(entries)
         for outer_index, entry in enumerate(entries):
             if removed[outer_index]:
                 continue
-            current_end = entry[1]
+            current_start, current_end = entry[0], entry[1]
             for inner_index in range(outer_index + 1, len(entries)):
                 if removed[inner_index]:
                     continue
-                if entries[inner_index][0] >= current_end:
+                inner_start, inner_end = entries[inner_index][:2]
+                if inner_start >= current_end:
                     break
+                # Containment may share either endpoint; identical spans are
+                # not containment and compete by score instead.
                 if (
-                    entries[inner_index][1] < current_end
+                    inner_end <= current_end
+                    and (inner_start, inner_end) != (current_start, current_end)
                     and not (entry[4] and not entries[inner_index][4])
                 ):
                     removed[inner_index] = True
@@ -2188,21 +2340,10 @@ def determine_final_pa_ownership(
                 surviving_alleles.add(entry[2])
     contained_resurrected = removed_alleles - surviving_alleles
 
-    # Only the surviving resurrected candidates pay for a CIGAR score parse.
-    unique_rows: Dict[int, AnnotationRow] = {}
-    for (
-        _start, _end, _allele, annotation, _non_primary
-    ) in surviving_resurrections:
-        unique_rows.setdefault(id(annotation), annotation)
-    score_by_annotation = _score_annotations_parallel(
-        list(unique_rows.values()), processes,
-    )
     for (
         start, end, allele, annotation, non_primary
     ) in surviving_resurrections:
         alignment_score = score_by_annotation[id(annotation)]
-        if alignment_score < MIN_INFINITE_FALLBACK_ALIGNMENT_SCORE:
-            continue
         priority_score = ownership_priority_score(
             annotation, alignment_score, primary_reference_index,
         )
@@ -2432,20 +2573,17 @@ def select_annotations_for_final_ownership(
     lift_by_allele: Mapping[str, object],
     max_impute: int = DEFAULT_MAX_IMPUTE,
 ) -> Tuple[List[AnnotationRow], Dict[str, int]]:
-    """Slice the analysis view to the finalized PA-owned query intervals.
+    """Filter the analysis view to rows with at least one surviving owner.
 
-    The seven-column output remains additive and its original rows are still
-    copied byte-for-byte.  Gap discovery, however, must use the ownership
-    intervals written to ``genomeliftfix.tsv``.  Keeping every source row at
-    full length leaves independently aligned neighboring blocks overlapping
-    on the query and hides both their owned boundary and any reference
-    overlap at that boundary.
-
-    A merged annotation can name several PAs.  Each distinct finalized owner
-    receives its own CIGAR slice and only those owner names are retained on
-    that analysis row, so priority lookup uses the block that actually owns
-    the slice.  Legacy rows with no matching GenomeLift name stay unchanged.
+    Ownership was already finalized and swapped into the GenomeLift overlay.
+    The graph-CIGAR rows were generated per block independently of ownership
+    in graphcigartoref_persample.py, so the analysis view keeps every
+    surviving row byte-identical: no interval clipping, no per-PA expansion,
+    and no CIGAR work.  A row is excluded only when every matching PA lost
+    ownership (pure ``-inf`` after finalization); rows with no matching
+    GenomeLift name are kept for backward compatibility.
     """
+    del max_impute
     retained: List[AnnotationRow] = []
     stats = {
         "input_rows": len(annotations),
@@ -2457,7 +2595,7 @@ def select_annotations_for_final_ownership(
     }
     for annotation in annotations:
         matched = [
-            (allele, lift_by_allele[allele])
+            lift_by_allele[allele]
             for allele in query_name_parts(annotation.query_name)
             if (
                 allele in lift_by_allele
@@ -2468,56 +2606,13 @@ def select_annotations_for_final_ownership(
         if matched:
             stats["logical_pa_rows"] += len(matched)
             owned = [
-                (allele, lift) for allele, lift in matched
+                lift for lift in matched
                 if not _lift_has_infinite_ownership(lift)
             ]
             stats["excluded_pa_rows"] += len(matched) - len(owned)
             if not owned:
                 stats["excluded_rows"] += 1
                 continue
-
-            owners_by_interval: Dict[Tuple[int, int], List[str]] = {}
-            for allele, lift in owned:
-                owned_start, owned_end = apply_interval_extensions_to_coord(
-                    lift.locus.start,
-                    lift.locus.end,
-                    lift.locus.strand,
-                    lift.left_extension,
-                    lift.right_extension,
-                    max_impute,
-                )
-                start = max(annotation.query_coord.start, owned_start)
-                end = min(annotation.query_coord.end, owned_end)
-                if end <= start:
-                    stats["excluded_pa_rows"] += 1
-                    continue
-                owners_by_interval.setdefault((start, end), []).append(allele)
-
-            if not owners_by_interval:
-                stats["excluded_rows"] += 1
-                continue
-
-            ordered_intervals = sorted(owners_by_interval)
-            for previous, current in zip(
-                ordered_intervals, ordered_intervals[1:],
-            ):
-                if previous[1] > current[0]:
-                    raise ValueError(
-                        f"{annotation.query_name}: finalized ownership "
-                        f"intervals overlap: {previous} and {current}"
-                    )
-
-            slices = slice_annotation_query_intervals(
-                annotation, ordered_intervals,
-            )
-            for interval in ordered_intervals:
-                owners = tuple(sorted(set(owners_by_interval[interval])))
-                row = dataclasses.replace(
-                    slices[interval], query_name=";".join(owners),
-                )
-                retained.append(row)
-                stats["retained_bases"] += interval[1] - interval[0]
-            continue
         else:
             stats["legacy_rows"] += 1
         retained.append(annotation)
@@ -2556,8 +2651,9 @@ def write_genomeliftfix(
     lift_rows: Sequence[OwnershipLiftRow],
     final_core: Mapping[str, Tuple[int, int]],
     offsets: Mapping[str, Tuple[str, str]],
+    resurrected_alleles: Optional[set] = None,
 ) -> int:
-    """Write only PA rows whose coordinate ownership actually changed."""
+    """Write sparse ownership changes and resurrected-PA class markers."""
     path = os.path.abspath(os.path.expanduser(path))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     temporary = path + f".tmp.{os.getpid()}"
@@ -2565,9 +2661,10 @@ def write_genomeliftfix(
     try:
         with open(temporary, "wt") as output:
             output.write(
-                "# sparse GenomeLift ownership overrides; later "
+                "# sparse GenomeLift ownership/class overrides; later "
                 "--coord-map entries replace earlier PA names\n"
             )
+            resurrected_alleles = resurrected_alleles or set()
             for row in lift_rows:
                 fields = list(row.fields)
                 core_interval = final_core.get(row.allele)
@@ -2594,6 +2691,15 @@ def write_genomeliftfix(
                 _replace_part_value(
                     fields, 13, row.part_index, new_right,
                 )
+                if row.allele in resurrected_alleles:
+                    # Columns 15/16 are optional downstream metadata. Keep a
+                    # numeric stage placeholder in column 15 for compatibility
+                    # and record the explicit lowest-priority class in 16.
+                    while len(fields) < 15:
+                        fields.append("0")
+                    while len(fields) < 16:
+                        fields.append("")
+                    fields[15] = "resurrected"
                 if tuple(fields) == old_fields:
                     continue
                 output.write("\t".join(fields) + "\n")
@@ -2697,6 +2803,70 @@ def read_represented_deletions(path: str) -> List[Tuple[str, int, int]]:
     return output
 
 
+@functools.lru_cache(maxsize=262144)
+def _extended_coordinate_intervals(
+    text: str,
+) -> Tuple[Tuple[str, int, int], ...]:
+    intervals = []
+    for value in text.split(";"):
+        coord = core.parse_coord(value.strip())
+        if coord is not None and coord.end > coord.start:
+            intervals.append((coord.chrom, coord.start, coord.end))
+    return tuple(sorted(intervals))
+
+
+def _extended_columns_overlap(
+    left: str,
+    right: str,
+    reference_index: Optional[Mapping[str, Tuple[int, int, int, int]]] = None,
+) -> bool:
+    """Test positive overlap between two sorted extended-coordinate lists."""
+    a = _extended_coordinate_intervals(left)
+    b = _extended_coordinate_intervals(right)
+    if reference_index is not None:
+        a = tuple(sorted(
+            (resolved, start, end)
+            for path, start, end in a
+            for resolved in (_resolve_reference_path(path, reference_index),)
+            if resolved is not None
+        ))
+        b = tuple(sorted(
+            (resolved, start, end)
+            for path, start, end in b
+            for resolved in (_resolve_reference_path(path, reference_index),)
+            if resolved is not None
+        ))
+    i = j = 0
+    while i < len(a) and j < len(b):
+        ac, a0, a1 = a[i]
+        bc, b0, b1 = b[j]
+        if ac < bc:
+            i += 1
+        elif bc < ac:
+            j += 1
+        elif a1 <= b0:
+            i += 1
+        elif b1 <= a0:
+            j += 1
+        else:
+            return True
+    return False
+
+
+def _deletion_anchors_have_overlapping_context(
+    left: AnnotationRow,
+    right: AnnotationRow,
+    reference_index: Mapping[str, Tuple[int, int, int, int]],
+) -> bool:
+    return (
+        _extended_columns_overlap(left.query_alignment, right.query_alignment)
+        and _extended_columns_overlap(
+            left.reference_alignment, right.reference_alignment,
+            reference_index,
+        )
+    )
+
+
 def discover_reference_gap_deletions(
     annotations: Sequence[AnnotationRow],
     lift_by_allele: Mapping[str, object],
@@ -2707,9 +2877,10 @@ def discover_reference_gap_deletions(
     """Call uncovered reference gaps only at an observed query breakpoint.
 
     Missing graph coverage is not, by itself, evidence of a deletion.  The
-    neighboring query annotations must meet exactly: if query bases remain
-    between them, that interval is unresolved and must not be converted into
-    a reference deletion merely because gap alignment was skipped or failed.
+    neighboring query annotations must meet exactly and their complete
+    alignment windows must overlap on both the query and reference axes.  If
+    either anchor is absent, the interval is unresolved/unassembled rather
+    than evidence for a biological deletion.
     """
     represented_deletions = tuple(represented_deletions)
     coverage = reference_coverage_by_contig(
@@ -2729,6 +2900,7 @@ def discover_reference_gap_deletions(
         "positive_query_gaps_skipped": 0,
         "positive_query_gap_bases_skipped": 0,
         "query_overlaps_skipped": 0,
+        "unanchored_reference_gaps_skipped": 0,
     }
     for contig in sorted(by_contig):
         ordered = sorted(by_contig[contig], key=lambda row: (
@@ -2764,6 +2936,11 @@ def discover_reference_gap_deletions(
                 # breakpoint either.  They require ownership reconciliation,
                 # not an absence call inferred from missing graph coverage.
                 stats["query_overlaps_skipped"] += 1
+                continue
+            if not _deletion_anchors_have_overlapping_context(
+                left, right, reference_index,
+            ):
+                stats["unanchored_reference_gaps_skipped"] += 1
                 continue
             uncovered = _subtract_coverage(
                 gap_start, gap_end, coverage.get(path, ()),
@@ -3015,6 +3192,36 @@ def _worker(task: GapTask) -> GapResult:
     return result
 
 
+def _worker_batch(batch: Sequence[GapTask]) -> List[GapResult]:
+    return [_worker(task) for task in batch]
+
+
+def _gap_task_batches(
+    tasks: Sequence[GapTask], worker_count: int, chunksize: int,
+) -> List[List[GapTask]]:
+    """Order work largest-first and batch only the small gaps.
+
+    Every aligner call is single-threaded (in-process mappy, or SSW/DP), so a
+    large gap gains nothing from running alone in the parent.  Scheduling the
+    longest tasks first keeps them from becoming the tail of the pool, while
+    batching small gaps keeps IPC overhead negligible.
+    """
+    ordered = sorted(
+        tasks, key=lambda task: (-(task.end - task.start), task.index),
+    )
+    large = [task for task in ordered if task.end - task.start >= 1_000]
+    small = [task for task in ordered if task.end - task.start < 1_000]
+    small_batch = chunksize or max(
+        1, min(64, len(small) // max(1, worker_count * 8)),
+    )
+    batches: List[List[GapTask]] = [[task] for task in large]
+    batches.extend(
+        small[offset:offset + small_batch]
+        for offset in range(0, len(small), small_batch)
+    )
+    return batches
+
+
 def align_gap_tasks(
     tasks: Sequence[GapTask],
     query_path: str,
@@ -3044,18 +3251,14 @@ def align_gap_tasks(
     completed = 0
     results: List[GapResult] = []
 
-    # Small gaps fan out across worker processes with single-threaded
-    # aligners; large gaps run one at a time in this process with minimap2
-    # given every requested thread.
-    small_tasks = [task for task in tasks if task.end - task.start < 1_000]
-    large_tasks = [task for task in tasks if task.end - task.start >= 1_000]
-    aligner_threads = max(1, processes)
+    # Every aligner call is single-threaded, so all gaps share one worker
+    # pool. Large gaps are scheduled first, one per batch.
+    worker_count = min(processes, len(tasks))
+    large_count = sum(task.end - task.start >= 1_000 for task in tasks)
     sys.stderr.write(
         "[fill_graphcigartoref_gaps] scheduling "
-        f"{len(small_tasks)} small (<1000bp) task(s) across "
-        f"{min(processes, max(1, len(small_tasks)))} process(es) and "
-        f"{len(large_tasks)} large task(s) one-by-one with "
-        f"{aligner_threads} aligner thread(s)\n"
+        f"{len(tasks) - large_count} small (<1000bp) and {large_count} large "
+        f"task(s) largest-first across {max(1, worker_count)} process(es)\n"
     )
 
     def report_progress(force: bool = False) -> None:
@@ -3098,12 +3301,9 @@ def align_gap_tasks(
                 )
             report_progress()
 
-    worker_count = min(processes, len(small_tasks))
-    if small_tasks and worker_count > 1:
+    if worker_count > 1:
         context = mp.get_context(start_method)
-        actual_chunksize = chunksize or max(
-            1, min(64, len(small_tasks) // max(1, worker_count * 8)),
-        )
+        batches = _gap_task_batches(tasks, worker_count, chunksize)
         with context.Pool(
             processes=worker_count,
             initializer=_init_worker,
@@ -3115,13 +3315,13 @@ def align_gap_tasks(
                 maximum_reference_extension,
             ),
         ) as pool:
-            result_iter = pool.imap_unordered(
-                _worker, small_tasks, actual_chunksize,
-            )
-            pool_pending = len(small_tasks)
+            result_iter = pool.imap_unordered(_worker_batch, batches, 1)
+            pool_pending = len(batches)
+            # A killed worker's batch is never re-run; stop instead of waiting.
+            seen_workers: Dict[int, object] = {}
             while pool_pending > 0:
                 try:
-                    result = result_iter.next(timeout=60)
+                    batch_results = _next_result(result_iter, pool, seen_workers, 60)
                 except mp.TimeoutError:
                     elapsed = max(1e-6, time.monotonic() - started)
                     sys.stderr.write(
@@ -3132,39 +3332,19 @@ def align_gap_tasks(
                     continue
                 except StopIteration:
                     break
-                results.append(result)
                 pool_pending -= 1
-                completed += 1
-                report_progress()
-
-    serial_small = small_tasks if small_tasks and worker_count <= 1 else []
-    if serial_small or large_tasks:
+                for result in batch_results:
+                    results.append(result)
+                    completed += 1
+                    report_progress()
+    else:
         query_reader = core.FastaRegionReader(query_path)
         reference_reader = core.FastaRegionReader(
             reference_path,
             template_fasta=(local_reference_templates or None),
         )
         try:
-            if serial_small:
-                run_serial(serial_small, query_reader, reference_reader)
-            if large_tasks:
-                previous_threads = os.environ.get(
-                    "GRAPH_CIGARTOREF_MINIMAP2_THREADS"
-                )
-                os.environ["GRAPH_CIGARTOREF_MINIMAP2_THREADS"] = str(
-                    aligner_threads
-                )
-                try:
-                    run_serial(large_tasks, query_reader, reference_reader)
-                finally:
-                    if previous_threads is None:
-                        os.environ.pop(
-                            "GRAPH_CIGARTOREF_MINIMAP2_THREADS", None,
-                        )
-                    else:
-                        os.environ["GRAPH_CIGARTOREF_MINIMAP2_THREADS"] = (
-                            previous_threads
-                        )
+            run_serial(tasks, query_reader, reference_reader)
         finally:
             query_reader.handle.close()
             reference_reader.close()
@@ -3173,23 +3353,43 @@ def align_gap_tasks(
     return [result.row for result in results if result.row is not None], results
 
 
-def _all_input_rows(input_path: str) -> List[str]:
-    """Return every nonempty input row unchanged and in original order."""
-    output: List[str] = []
+def _render_annotation_row(row: AnnotationRow) -> str:
+    if len(row.fields) < 7:
+        raise ValueError(f"{row.query_name}: missing original TSV fields")
+    fields = list(row.fields)
+    fields[2] = coord_text(row.query_coord)
+    fields[5] = row.reference_alignment
+    fields[6] = row.graph_cigar
+    return "\t".join(fields)
+
+
+def _base_rows_after_gapfill_trimming(
+    input_path: str,
+    original_rows: Sequence[AnnotationRow],
+    trimmed_rows: Sequence[AnnotationRow],
+) -> Iterable[str]:
+    """Replace positive-width input rows with their gapfill-trimmed view."""
+    original_lines = {row.line_number for row in original_rows}
+    replacement = {
+        row.line_number: _render_annotation_row(row)
+        for row in trimmed_rows
+    }
     with open(input_path, "rt") as source:
-        for raw in source:
+        for line_number, raw in enumerate(source, 1):
             text = raw.rstrip("\r\n")
             if not text:
                 continue
-            output.append(text)
-    return output
+            if line_number not in original_lines:
+                yield text
+            elif line_number in replacement:
+                yield replacement[line_number]
 
 
 def _write_output(
     input_path: str,
     output_path: str,
-    base_rows: Sequence[str],
-    added_rows: Sequence[str],
+    base_rows: Iterable[str],
+    added_rows: Iterable[str],
     gaps_only: bool,
 ) -> None:
     if not output_path:
@@ -3260,6 +3460,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("-o", "--output", default="")
     parser.add_argument(
+        "--pseudo-linear-output",
+        default="",
+        help=(
+            "exclusive pseudo-linear assignment TSV written after gap "
+            "filling; defaults to SAMPLE.pseudolinear.tsv beside --output"
+        ),
+    )
+    parser.add_argument(
         "--gaps-only", action="store_true",
         help="write only new gap rows instead of copying the input first",
     )
@@ -3299,8 +3507,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--strict", action="store_true",
-        help="fail when any eligible gap cannot be aligned",
+        "--strict", action="store_true", default=True,
+        help="fail when any eligible gap cannot be aligned (default)",
+    )
+    parser.add_argument(
+        "--allow-failed-gaps", dest="strict", action="store_false",
+        help="continue with a warning if an eligible gap cannot be aligned",
     )
     args = parser.parse_args(argv)
     if args.processes < 1:
@@ -3331,6 +3543,23 @@ def run(args: argparse.Namespace) -> int:
         if args.genomelift_fix_output
         else default_genomeliftfix_path(genomelift_path)
     )
+    output_path = (
+        os.path.abspath(os.path.expanduser(args.output)) if args.output else ""
+    )
+    pseudo_linear_path = (
+        os.path.abspath(os.path.expanduser(args.pseudo_linear_output))
+        if args.pseudo_linear_output
+        else default_pseudolinear_path(output_path) if output_path else ""
+    )
+    if args.pseudo_linear_output and not output_path:
+        raise ValueError("--pseudo-linear-output requires --output")
+    if args.pseudo_linear_output and args.gaps_only:
+        raise ValueError(
+            "pseudo-linear assignment requires the complete post-gapfill "
+            "table; do not combine --gaps-only with --pseudo-linear-output"
+        )
+    if args.gaps_only:
+        pseudo_linear_path = ""
     query_path = os.path.abspath(os.path.expanduser(args.fasta_query))
     reference_path = os.path.abspath(os.path.expanduser(args.reference))
     local_reference_templates = (
@@ -3355,11 +3584,20 @@ def run(args: argparse.Namespace) -> int:
     finally:
         primary_reader.close()
 
-    annotations = read_annotations(input_path)
+    input_annotations = read_annotations(input_path)
+    annotations, trim_stats = trim_annotations_for_gapfill(input_annotations)
+    # A sequence alternative is an independent duplication/source alignment.
+    # Preserve it in the output, but never let it extend PA ownership, fill a
+    # location-layer gap, or manufacture a reference deletion.  Sequence-only
+    # mappings carry role=main and remain eligible.
+    ownership_annotations = [
+        row for row in annotations
+        if annotation_lift_role(row) != "alternative"
+    ]
     lift_rows = read_genomelift(genomelift_path)
     lift_by_allele = {row.allele: row for row in lift_rows}
     query_genome = args.query_genome or infer_query_genome(
-        annotations, lift_by_allele,
+        input_annotations, lift_by_allele,
     )
     selected_lift_rows = {}
     for allele, row in lift_by_allele.items():
@@ -3375,12 +3613,14 @@ def run(args: argparse.Namespace) -> int:
     ownership_lift_rows = read_ownership_lift_rows(
         genomelift_path, query_genome,
     )
+    resurrected_alleles = set()
     final_core, final_offsets, final_ownership_stats = (
         determine_final_pa_ownership(
-            annotations,
+            ownership_annotations,
             ownership_lift_rows,
             args.processes,
             primary_reference_index,
+            resurrected_alleles,
         )
     )
     updated_pa_count = write_genomeliftfix(
@@ -3388,6 +3628,7 @@ def run(args: argparse.Namespace) -> int:
         ownership_lift_rows,
         final_core,
         final_offsets,
+        resurrected_alleles,
     )
     lift_by_allele = apply_final_ownership_to_lifts(
         lift_by_allele,
@@ -3396,7 +3637,7 @@ def run(args: argparse.Namespace) -> int:
     )
     analysis_annotations, ownership_stats = (
         select_annotations_for_final_ownership(
-            annotations,
+            ownership_annotations,
             lift_by_allele,
             args.max_impute,
         )
@@ -3408,7 +3649,7 @@ def run(args: argparse.Namespace) -> int:
         f"analysis: {final_ownership_stats['mapped_pas']} mapped PA(s), "
         f"{final_ownership_stats['resurrected_pas']} resurrected PA(s), "
         f"{final_ownership_stats['contained_resurrected_pas']} contained "
-        "resurrected PA(s) removed, "
+        "resurrected PA(s) deferred to pseudo-linear assignment, "
         f"{final_ownership_stats['suppressed_unmapped_pas']} overlapping "
         "unmapped-only PA(s) removed, "
         f"{final_ownership_stats['ambiguous_mapped_pas']} disconnected "
@@ -3449,9 +3690,10 @@ def run(args: argparse.Namespace) -> int:
     discovery_elapsed = time.monotonic() - discovery_started
 
     sys.stderr.write(
-        "[fill_graphcigartoref_gaps] additive mode: preserving all "
-        f"{len(annotations)} positive-width input row(s); no existing query "
-        "or reference alignment will be trimmed or removed\n"
+        "[fill_graphcigartoref_gaps] linear edge trimming before gap "
+        f"analysis: {trim_stats['unchanged']} unchanged, "
+        f"{trim_stats['trimmed']} trimmed, {trim_stats['removed']} without "
+        "a confident core removed; trimmed rows replace their input rows\n"
     )
     sys.stderr.write(
         "[fill_graphcigartoref_gaps] corrected ownership analysis view: "
@@ -3506,7 +3748,7 @@ def run(args: argparse.Namespace) -> int:
 
     deletion_started = time.monotonic()
     generated_annotations = [
-        annotation_from_tsv(row, len(annotations) + index + 1)
+        annotation_from_tsv(row, len(input_annotations) + index + 1)
         for index, row in enumerate(rows)
     ]
     deletion_rows, deletion_stats = discover_reference_gap_deletions(
@@ -3533,15 +3775,28 @@ def run(args: argparse.Namespace) -> int:
                 clipped_start, min(row.ref_coord.end, chrom_length),
             )
             rendered_deletion_bases += clipped_end - clipped_start
-    base_rows = _all_input_rows(input_path)
-    added_rows = list(rows) + rendered_deletions
+    base_rows = _base_rows_after_gapfill_trimming(
+        input_path, input_annotations, annotations,
+    )
+    def added_rows_iter() -> Iterable[str]:
+        yield from rows
+        yield from rendered_deletions
+
     _write_output(
         input_path,
-        args.output,
+        output_path,
         base_rows,
-        added_rows,
+        added_rows_iter(),
         args.gaps_only,
     )
+    assignment_counts = {}
+    if pseudo_linear_path:
+        assignment_counts = pseudolinear.build_assignments(
+            output_path,
+            (genomelift_path, genomelift_fix_path),
+            pseudo_linear_path,
+            args.max_impute,
+        )
     deletion_elapsed = time.monotonic() - deletion_started
     sys.stderr.write(
         f"[fill_graphcigartoref_gaps] emitted {len(rows)}/{len(tasks)} gap row(s)"
@@ -3554,12 +3809,20 @@ def run(args: argparse.Namespace) -> int:
         f"({deletion_stats['positive_query_gap_bases_skipped']} query bp) "
         "with unresolved query sequence and "
         f"{deletion_stats['query_overlaps_skipped']} pair(s) with query "
-        "overlap; emitted "
+        "overlap, and "
+        f"{deletion_stats['unanchored_reference_gaps_skipped']} pair(s) "
+        "without overlapping extended query/reference anchors; emitted "
         f"{len(rendered_deletions)}/"
         f"{deletion_stats['reference_deletions']} uncovered deletion row(s) "
         f"({rendered_deletion_bases} bp); alignment "
         f"{alignment_elapsed:.2f}s, deletion/output "
-        f"{deletion_elapsed:.2f}s, total "
+        f"{deletion_elapsed:.2f}s; pseudo-linear assignments "
+        f"primary={assignment_counts.get('PRIMARY', 0)}, "
+        f"insertion={assignment_counts.get('INSERTION', 0)}, "
+        f"deletion={assignment_counts.get('DELETION', 0)}, "
+        f"unmapped={assignment_counts.get('UNMAPPED', 0)}"
+        + (f" in {pseudo_linear_path}" if pseudo_linear_path else " skipped (stdout/gaps-only)")
+        + "; total "
         f"{time.monotonic() - run_started:.2f}s\n"
     )
     return 0

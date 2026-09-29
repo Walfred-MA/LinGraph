@@ -325,79 +325,133 @@ def fold_small(indel_output, small_paths):
     indel merge takes rows below --svcutoff, so with equal cutoffs each sample
     row is in exactly one file. Sample columns are matched by name ('.' when a
     sample is absent); per-row FORMAT is kept. Rows are ordered by the combined
-    ##contig order (other CHROMs in first-seen order) and POS. Only sort keys
-    and byte offsets are held in memory.
+    ##contig order (other CHROMs in first-seen order) and POS. Sort keys are
+    stored in a disk-backed SQLite table to keep RAM bounded. Compressed inputs
+    are first decompressed to temporary plain files, since rows are read back
+    by seeking.
     """
     sources = [str(indel_output), *map(str, small_paths)]
+    Path(indel_output).parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='fold-small-', dir=Path(indel_output).parent) as work:
+        plain = []
+        for number, path in enumerate(sources):
+            if path.endswith('.gz'):
+                copy = str(Path(work) / f'{number}.vcf')
+                with _open_binary(path) as source, open(copy, 'wb') as target:
+                    shutil.copyfileobj(source, target, 1 << 20)
+                path = copy
+            plain.append(path)
+        return _fold_small(indel_output, sources, plain, work)
+
+
+def _fold_small(indel_output, sources, plain, work):
+    import sqlite3
+
     meta, seen_ids, seen_lines = [], set(), set()
     columns = None
-    layouts, keys = [], []
+    layouts = []
     ranks = {}
-    for file_index, path in enumerate(sources):
-        with _open_binary(path) as handle:
-            offset = 0
-            samples = None
-            for raw in handle:
-                start = offset
-                offset += len(raw)
-                if raw.startswith(b'##'):
-                    line = raw.decode().rstrip('\r\n')
-                    identifier = _header_id(line)
-                    if identifier in seen_ids or line in seen_lines:
-                        continue
-                    if identifier:
-                        seen_ids.add(identifier)
-                        if identifier[0] == 'contig':
-                            ranks.setdefault(identifier[1], len(ranks))
-                    seen_lines.add(line)
-                    meta.append(line)
-                    continue
-                if raw.startswith(b'#CHROM'):
-                    header = raw.decode().rstrip('\r\n').split('\t')
-                    samples = header[9:]
-                    if columns is None:
-                        columns = header
-                        layout = None
-                    else:
-                        missing = [name for name in samples if name not in columns[9:]]
-                        if missing:
-                            raise ValueError(f'{path}: samples absent from {indel_output}: '
-                                             + ', '.join(missing[:5]))
-                        index = {name: position for position, name in enumerate(samples)}
-                        layout = [index.get(name) for name in columns[9:]]
-                        if layout == list(range(len(samples))):
-                            layout = None
-                    layouts.append(layout)
-                    continue
-                if not raw.strip():
-                    continue
-                if samples is None:
-                    raise ValueError(f'{path}: data row before #CHROM header')
-                chrom, pos = raw.split(b'\t', 2)[:2]
-                chrom = chrom.decode()
-                keys.append((ranks.setdefault(chrom, len(ranks)), int(pos), file_index,
-                             len(keys), start))
-    keys.sort()
-    handles = [_open_binary(path) for path in sources]
+    database_path = str(Path(work) / 'sort.sqlite3')
+    database = sqlite3.connect(database_path)
+    database.execute('PRAGMA temp_store=FILE')
+    database.execute('PRAGMA cache_size=-32768')
+    database.execute('PRAGMA journal_mode=OFF')
+    database.execute('PRAGMA synchronous=OFF')
+    database.execute(
+        'CREATE TABLE row_key('
+        'contig_rank INTEGER, pos INTEGER, file_index INTEGER, '
+        'row_order INTEGER, byte_offset INTEGER)'
+    )
+    insert = 'INSERT INTO row_key VALUES (?, ?, ?, ?, ?)'
     try:
-        with atomic_output(indel_output) as out:
-            for line in meta:
-                out.write(line + '\n')
-            out.write('\t'.join(columns) + '\n')
-            for _rank, _pos, file_index, _order, start in keys:
-                handle = handles[file_index]
-                handle.seek(start)
-                line = handle.readline().decode().rstrip('\r\n')
-                layout = layouts[file_index]
-                if layout is not None:
-                    fields = line.split('\t')
-                    line = '\t'.join(fields[:9] + [fields[9 + position] if position is not None
-                                                    else '.' for position in layout])
-                out.write(line + '\n')
+        for file_index, path in enumerate(plain):
+            path_label = sources[file_index]
+            with open(path, 'rb') as handle:
+                offset = 0
+                row_order = 0
+                pending = []
+                samples = None
+                for raw in handle:
+                    start = offset
+                    offset += len(raw)
+                    if raw.startswith(b'##'):
+                        line = raw.decode().rstrip('\r\n')
+                        identifier = _header_id(line)
+                        if identifier in seen_ids or line in seen_lines:
+                            continue
+                        if identifier:
+                            seen_ids.add(identifier)
+                            if identifier[0] == 'contig':
+                                ranks.setdefault(identifier[1], len(ranks))
+                        seen_lines.add(line)
+                        meta.append(line)
+                        continue
+                    if raw.startswith(b'#CHROM'):
+                        header = raw.decode().rstrip('\r\n').split('\t')
+                        samples = header[9:]
+                        if columns is None:
+                            columns = header
+                            layout = None
+                        else:
+                            missing = [name for name in samples if name not in columns[9:]]
+                            if missing:
+                                raise ValueError(f'{path_label}: samples absent from {indel_output}: '
+                                                 + ', '.join(missing[:5]))
+                            index = {name: position for position, name in enumerate(samples)}
+                            layout = [index.get(name) for name in columns[9:]]
+                            if layout == list(range(len(samples))):
+                                layout = None
+                        layouts.append(layout)
+                        continue
+                    if not raw.strip():
+                        continue
+                    if samples is None:
+                        raise ValueError(f'{path_label}: data row before #CHROM header')
+                    chrom, pos = raw.split(b'\t', 2)[:2]
+                    chrom = chrom.decode()
+                    pending.append((
+                        ranks.setdefault(chrom, len(ranks)), int(pos),
+                        file_index, row_order, start,
+                    ))
+                    row_order += 1
+                    if len(pending) >= 50_000:
+                        database.executemany(insert, pending)
+                        pending.clear()
+                if pending:
+                    database.executemany(insert, pending)
+            database.commit()
+
+        row_count = database.execute(
+            'SELECT COUNT(*) FROM row_key'
+        ).fetchone()[0]
+        handles = [open(path, 'rb') for path in plain]
+        try:
+            with atomic_output(indel_output) as out:
+                for line in meta:
+                    out.write(line + '\n')
+                if columns is None:
+                    raise ValueError(f'{indel_output}: missing #CHROM header')
+                out.write('\t'.join(columns) + '\n')
+                cursor = database.execute(
+                    'SELECT file_index, byte_offset FROM row_key '
+                    'ORDER BY contig_rank, pos, file_index, row_order'
+                )
+                for file_index, start in cursor:
+                    handle = handles[file_index]
+                    handle.seek(start)
+                    line = handle.readline().decode().rstrip('\r\n')
+                    layout = layouts[file_index]
+                    if layout is not None:
+                        fields = line.split('\t')
+                        line = '\t'.join(fields[:9] + [fields[9 + position] if position is not None
+                                                        else '.' for position in layout])
+                    out.write(line + '\n')
+        finally:
+            for handle in handles:
+                handle.close()
     finally:
-        for handle in handles:
-            handle.close()
-    return len(keys)
+        database.close()
+    return row_count
 
 
 def main(argv=None):

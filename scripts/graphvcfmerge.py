@@ -3714,7 +3714,10 @@ def _fast_pair_alignment(
         return 0.0, None
     if seq_a.upper() == seq_b.upper():
         return 1.0, f"{len(seq_a)}="
-    if len(seq_a) <= 5 and len(seq_b) <= 5:
+    if len(seq_a) == len(seq_b) <= 5:
+        # Equal short lengths: a base-by-base =/X run. Unequal short pairs
+        # need a real alignment to place the gap (ACG vs CG is 1I2=, not
+        # 2X1I), so they take the global aligner below.
         upper_a = seq_a.upper()
         upper_b = seq_b.upper()
         body_parts = []
@@ -3731,10 +3734,6 @@ def _fast_pair_alignment(
                 run_len = 1
         if run_len:
             body_parts.append(f"{run_len}{run_op}")
-        if len(upper_a) > len(upper_b):
-            body_parts.append(f"{len(upper_a) - len(upper_b)}I")
-        elif len(upper_b) > len(upper_a):
-            body_parts.append(f"{len(upper_b) - len(upper_a)}H")
         return _truvari_seqsim(seq_a, seq_b), "".join(body_parts)
     longest = max(len(seq_a), len(seq_b))
     if longest < 200:
