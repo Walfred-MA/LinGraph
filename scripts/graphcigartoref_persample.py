@@ -1404,6 +1404,11 @@ def _init_prepare_worker(
     _PREP_REFERENCE_EXTENSION = reference_extension
 
 
+def _prepare_input_batch(tasks: Sequence[PreparationTask]) -> List[PreparedInputRecord]:
+    """Prepare one batch in a worker (the pool's unit of work)."""
+    return [_prepare_input_worker(task) for task in tasks]
+
+
 def _prepare_input_worker(task: PreparationTask) -> PreparedInputRecord:
     alignment_index = (
         _PREP_REFERENCE_ALIGNMENT_INDEX
@@ -1533,15 +1538,51 @@ def _prepare_input_records(
         initializer=initializer,
         initargs=initargs,
     ) as pool:
-        result_iter = pool.imap(_prepare_input_worker, tasks, actual_chunksize)
+        # Pool.imap with chunksize > 1 returns a plain generator without
+        # next(timeout); batch the tasks here and send one batch per task so
+        # the result iterator supports the dead-worker check.
+        batches = [tasks[start:start + actual_chunksize]
+                   for start in range(0, len(tasks), actual_chunksize)]
+        result_iter = pool.imap(_prepare_input_batch, batches, 1)
         seen: Dict[int, object] = {}
-        for _task in tasks:
-            record = _next_result(result_iter, pool, seen, None)
-            records[record.allele] = record
+        for _batch in batches:
+            for record in _next_result(result_iter, pool, seen, None):
+                records[record.allele] = record
     return records
 
 
 _WORKER_CHECK_SECONDS = 5.0
+
+
+_HUGE_GROUP_SPAN = 2_000_000
+_QUERY_SPAN = re.compile(r"(\d+)-(\d+)[+-]?$")
+
+
+def _group_span(group) -> int:
+    """Query bases covered by a candidate group (max end - min start)."""
+    lows, highs = [], []
+    for base, members in group:
+        for pair in (base, *members):
+            match = _QUERY_SPAN.search(getattr(pair, "query_coord_text", "") or "")
+            if match:
+                lows.append(int(match[1]))
+                highs.append(int(match[2]))
+    return max(highs) - min(lows) if lows else 0
+
+
+def _pending_group_labels(candidate_groups, finished, limit: int = 3) -> str:
+    """Name up to ``limit`` unfinished candidate groups (query and interval)."""
+    labels = []
+    for index, group in enumerate(candidate_groups):
+        if index in finished:
+            continue
+        pair = group[0][0]
+        name = pair.query_name or pair.label or f"line {pair.line_no}"
+        coord = getattr(pair, "query_coord_text", "") or ""
+        labels.append(f"{name}" + (f" ({coord})" if coord else ""))
+        if len(labels) >= limit:
+            break
+    return ", ".join(labels) or "none"
 
 
 def _check_pool_workers(pool, seen: Dict[int, object]) -> None:
@@ -4962,11 +5003,11 @@ def _write_parallel(
     shared_values: Tuple,
 ) -> Tuple[Dict[str, int], List[core.Coord]]:
     context = mp.get_context(args.mp_start_method)
-    buffer_size = int(getattr(args, "buffer_size", 1000))
+    buffer_size = int(getattr(args, "buffer_size", 512))
     buffer_bytes = int(getattr(args, "buffer_bytes", 64 * 1024 * 1024))
     progress_every = int(getattr(args, "progress_every", 1000))
     progress_seconds = float(getattr(args, "progress_seconds", 60.0))
-    maxtasksperchild = int(getattr(args, "maxtasksperchild", 512))
+    maxtasksperchild = int(getattr(args, "maxtasksperchild", 1))
     candidate_groups = group_column10_candidates(pairs)
     comparison_count = sum(len(group) for group in candidate_groups)
     conversion_stats = _empty_conversion_stats()
@@ -5004,84 +5045,115 @@ def _write_parallel(
         )
         gc.freeze()
         try:
-            with context.Pool(
-                processes=args.processes,
-                initializer=_init_worker_state,
-                initargs=initargs,
-                maxtasksperchild=(maxtasksperchild or None),
-            ) as pool:
-                # Conversion costs vary by orders of magnitude. Dispatch one
-                # merged comparison per pool task and consume results as they
-                # finish. A multi-match produces one physical row containing
-                # the complete CIGAR plus all logical ownership intervals.
-                result_iter = pool.imap_unordered(
-                    _worker_build_column10_candidates,
-                    enumerate(candidate_groups),
-                    1,
+            # Groups covering more than _HUGE_GROUP_SPAN query bases run last,
+            # one at a time, so each can use the whole job's memory.
+            huge = [index for index, group in enumerate(candidate_groups)
+                    if _group_span(group) > _HUGE_GROUP_SPAN]
+            huge_set = set(huge)
+            phases = [([index for index in range(len(candidate_groups))
+                        if index not in huge_set], args.processes)]
+            if huge:
+                sys.stderr.write(
+                    f"[graphcigartoref_persample] deferring {len(huge)} candidate "
+                    f"group(s) covering >{_HUGE_GROUP_SPAN} query bases to run one "
+                    f"at a time at the end: {_pending_group_labels(candidate_groups, set(range(len(candidate_groups))) - huge_set, limit=10)}\n"
                 )
-                seen_workers: Dict[int, object] = {}
-                while completed < len(candidate_groups):
-                    try:
-                        _index, rows, stats, error = _next_result(
-                            result_iter, pool, seen_workers,
-                            progress_seconds if progress_seconds > 0 else None,
-                        )
-                    except mp.TimeoutError:
-                        elapsed = max(1e-6, time.monotonic() - started)
-                        sys.stderr.write(
-                            "[graphcigartoref_persample] still waiting: "
-                            f"{completed}/{len(candidate_groups)} candidate "
-                            "groups completed "
-                            f"after {elapsed:.0f}s; the next result may be a "
-                            "pathological long comparison\n"
-                        )
-                        continue
-                    completed += 1
-                    if error is not None:
-                        base_pair = candidate_groups[_index][0][0]
-                        if is_grouped_pair(base_pair):
-                            _add_conversion_stats(conversion_stats, {
-                                "candidate_comparisons": len(
-                                    candidate_groups[_index]
-                                ),
-                                "candidate_errors": len(
-                                    candidate_groups[_index]
-                                ),
-                                "empty_groups": 1,
-                            })
+                phases.append((huge, 1))
+            for phase_indices, phase_processes in phases:
+                if not phase_indices:
+                    continue
+                with context.Pool(
+                    processes=phase_processes,
+                    initializer=_init_worker_state,
+                    initargs=initargs,
+                    maxtasksperchild=(maxtasksperchild or None),
+                ) as pool:
+                    # Conversion costs vary by orders of magnitude. Dispatch one
+                    # merged comparison per pool task and consume results as they
+                    # finish. A multi-match produces one physical row containing
+                    # the complete CIGAR plus all logical ownership intervals.
+                    result_iter = pool.imap_unordered(
+                        _worker_build_column10_candidates,
+                        [(index, candidate_groups[index]) for index in phase_indices],
+                        1,
+                    )
+                    seen_workers: Dict[int, object] = {}
+                    finished: Set[int] = set()
+                    phase_done = 0
+                    while phase_done < len(phase_indices):
+                        try:
+                            _index, rows, stats, error = _next_result(
+                                result_iter, pool, seen_workers,
+                                progress_seconds if progress_seconds > 0 else None,
+                            )
+                        except mp.TimeoutError:
+                            elapsed = max(1e-6, time.monotonic() - started)
+                            remaining = len(candidate_groups) - completed
+                            pending = (
+                                "; pending: " + _pending_group_labels(candidate_groups, finished)
+                                if remaining <= 10 else ""
+                            )
                             sys.stderr.write(
-                                "[graphcigartoref_persample] warning: skipping "
-                                f"unconvertible grouped comparison:\n{error}\n"
+                                "[graphcigartoref_persample] still waiting: "
+                                f"{completed}/{len(candidate_groups)} candidate "
+                                "groups completed "
+                                f"after {elapsed:.0f}s; the next result may be a "
+                                f"pathological long comparison{pending}\n"
                             )
                             continue
-                        pool.terminate()
-                        raise RuntimeError(error)
-                    _add_conversion_stats(conversion_stats, stats)
-                    for row in rows or ():
-                        writer.write(row)
-                        coord = _row_query_interval(row)
-                        if coord is not None:
-                            emitted_coordinates.append(coord)
-                        emitted += 1
-                    if (
-                        progress_every > 0
-                        and (
-                            completed % progress_every == 0
-                            or completed == len(candidate_groups)
-                        )
-                    ):
-                        elapsed = max(1e-6, time.monotonic() - started)
-                        rate = completed / elapsed
-                        last_pair = candidate_groups[_index][0][0]
-                        last_label = last_pair.query_name or last_pair.label
-                        if len(last_label) > 240:
-                            last_label = last_label[:237] + "..."
-                        sys.stderr.write(
-                            "[graphcigartoref_persample] completed "
-                            f"{completed}/{len(candidate_groups)} candidate groups, "
-                            f"{emitted} output rows ({rate:.2f}/s); "
-                            f"last={last_label}\n"
-                        )
+                        except RuntimeError as error:
+                            raise RuntimeError(
+                                f"{error}; unfinished candidate groups include "
+                                f"{_pending_group_labels(candidate_groups, finished)}"
+                            ) from error
+                        completed += 1
+                        phase_done += 1
+                        finished.add(_index)
+                        if error is not None:
+                            base_pair = candidate_groups[_index][0][0]
+                            if is_grouped_pair(base_pair):
+                                _add_conversion_stats(conversion_stats, {
+                                    "candidate_comparisons": len(
+                                        candidate_groups[_index]
+                                    ),
+                                    "candidate_errors": len(
+                                        candidate_groups[_index]
+                                    ),
+                                    "empty_groups": 1,
+                                })
+                                sys.stderr.write(
+                                    "[graphcigartoref_persample] warning: skipping "
+                                    f"unconvertible grouped comparison:\n{error}\n"
+                                )
+                                continue
+                            pool.terminate()
+                            raise RuntimeError(error)
+                        _add_conversion_stats(conversion_stats, stats)
+                        for row in rows or ():
+                            writer.write(row)
+                            coord = _row_query_interval(row)
+                            if coord is not None:
+                                emitted_coordinates.append(coord)
+                            emitted += 1
+                        if (
+                            progress_every > 0
+                            and (
+                                completed % progress_every == 0
+                                or completed == len(candidate_groups)
+                            )
+                        ):
+                            elapsed = max(1e-6, time.monotonic() - started)
+                            rate = completed / elapsed
+                            last_pair = candidate_groups[_index][0][0]
+                            last_label = last_pair.query_name or last_pair.label
+                            if len(last_label) > 240:
+                                last_label = last_label[:237] + "..."
+                            sys.stderr.write(
+                                "[graphcigartoref_persample] completed "
+                                f"{completed}/{len(candidate_groups)} candidate groups, "
+                                f"{emitted} output rows ({rate:.2f}/s); "
+                                f"last={last_label}\n"
+                            )
         finally:
             # Preserve every result already returned to the parent on normal
             # completion, Python exceptions, or an interactive interruption.
@@ -5198,12 +5270,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--buffer-size",
         type=int,
-        default=1000,
+        default=512,
         metavar="ROWS",
         help=(
-            "number of completed parallel result rows buffered in RAM before "
-            "writing (default: 1000); 0 writes and flushes every completed "
-            "row immediately for debugging"
+            "completed results are saved to this buffer as each worker task "
+            "finishes and written to the output file every ROWS rows "
+            "(default: 512); 0 writes and flushes every completed row "
+            "immediately for debugging"
         ),
     )
     parser.add_argument(
@@ -5250,11 +5323,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--maxtasksperchild",
         type=int,
-        default=512,
+        default=1,
         metavar="N",
         help=(
-            "recycle each worker after N comparison tasks to bound allocator/cache "
-            "growth; 0 keeps workers for the whole run (default: 512)"
+            "recycle each worker after N comparison tasks. Results are returned "
+            "as text, so a worker exiting after its task returns all memory it "
+            "grew to (idle workers otherwise keep it); 0 keeps workers for the "
+            "whole run (default: 1)"
         ),
     )
     parser.add_argument(
@@ -5353,7 +5428,7 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("--progress-seconds must be >= 0")
     if getattr(args, "large_align_slots", 4) < 0:
         raise ValueError("--large-align-slots must be >= 0")
-    if getattr(args, "maxtasksperchild", 512) < 0:
+    if getattr(args, "maxtasksperchild", 1) < 0:
         raise ValueError("--maxtasksperchild must be >= 0")
     if args.max_extension < 0:
         raise ValueError("--max-extension must be >= 0")
