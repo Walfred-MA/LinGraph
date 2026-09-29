@@ -310,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mode_group = cohort_merge.add_modes(parser)
     parser.add_argument('--mc-graph', '--MC-graph', dest='mc_graph', action='store_true',
-                        help='select --all by default for subsequent GFA export')
+                        help='enable subsequent GFA export (merge mode defaults to --all)')
     stages = parser.add_mutually_exclusive_group()
     stages.add_argument('--merge-only', action='store_true', help='merge existing sample VCFs without upstream calling')
     stages.add_argument('--recall-only', action='store_true', help='recall VCFs and merge from existing saved inputs; do not schedule upstream jobs')

@@ -821,7 +821,7 @@ if MERGE_MODE != "snp":
             """
             {params.slurm} {PYTHON:q} {input.script:q} \
               -I {input.vcf_list:q} --stage scan \
-              --shards-dir {MERGE_TMPDIR:q} --sv \
+              --shards-dir {MERGE_TMPDIR:q} --sv --candidate-min-size 0 \
               --processes {MERGE_SCAN_PROCESSES} \
               {MERGE_LOCUS_DUP_OPTION} {params.snps}
             test -e {output.chroms:q}
