@@ -200,7 +200,7 @@ def _other_variant(fields, info, samples, samples_available, cutoff,
         if sequence_checks is not None:
             sequence_checks[identifier] = literal_checks(sequence, size)
         candidates = []
-        if len(fields) == 10:
+        if len(fields) == 10 and samples_available:
             for sample, text in zip(samples, fields[9].split('\t')):
                 if sample not in samples_available:
                     continue
@@ -229,10 +229,14 @@ def _other_variant(fields, info, samples, samples_available, cutoff,
                     low, high = sorted((low, high))
                     if high - low == size:
                         strand = coordinate[3] or '+'
-                        # A reverse projection complements ALT while QUERYCOORD
-                        # keeps the sample strand: try both readings; the base
-                        # check against the assembly keeps only a true one.
-                        strands = (strand, '-' if strand == '+' else '+') if projected else (strand,)
+                        # A SNP called on a graph path traversed in reverse
+                        # (graphreftovcf direction '<'), or projected through a
+                        # reverse mapping (INS_SNP), has a complemented ALT while
+                        # QUERYCOORD keeps the query strand; the VCF does not
+                        # record that direction. Try both readings at the same
+                        # position; only one whose carrier base equals ALT passes.
+                        strands = ((strand, '-' if strand == '+' else '+') if kind == 'snp'
+                                   else (strand,))
                         for strand in strands:
                             candidate = (sample, values[4], low, high, strand)
                             if candidate not in candidates:
@@ -252,20 +256,103 @@ def _other_variant(fields, info, samples, samples_available, cutoff,
 
 def rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=None,
          *, insertion_only=False, event_kinds=None, record_indexes=None,
-         dup_alignments=None):
+         dup_alignments=None, select=None, index=None):
     """Stream variant definitions from one or more VCFs.
 
     ``record_indexes`` receives each yielded ID's global data-line index:
     VCF data lines are numbered from 0 across all inputs in order.
     ``dup_alignments`` receives ``ID -> (ALTERNATIVECIGAR, literal SEQ)``
     for full-locus duplication insertions.
+
+    With ``index`` (a RecordIndex) and no ``select``, every data line's byte
+    offset and each file's first data-line index are recorded while
+    streaming. With both, only the sorted global data-line indexes in
+    ``select`` are read, seeking in plain files and skipping in .gz files.
     """
     counter = [0]
-    for item in vcf_paths(path):
+    for number, item in enumerate(vcf_paths(path)):
+        if select is not None:
+            source = _selected_lines(item, select, index, number)
+        else:
+            if index is not None:
+                index.file_starts.append(counter[0])
+            source = _file_lines(item, counter, index)
         yield from _rows(item, samples_available, cutoff, sequence_checks, candidate_sink,
                          insertion_only=insertion_only, event_kinds=event_kinds,
                          record_indexes=record_indexes, dup_alignments=dup_alignments,
-                         counter=counter)
+                         source=source)
+    if index is not None and select is None:
+        index.file_starts.append(counter[0])
+
+
+class RecordIndex:
+    """Byte offset of every VCF data line (-1 in .gz files) and file starts."""
+
+    def __init__(self):
+        from array import array
+        self.offsets = array('q')
+        self.file_starts = []
+
+
+def _is_data(line):
+    return not line.startswith('#') and bool(line.strip())
+
+
+def _file_lines(path, counter, index=None):
+    """(line label, line, global data-line index or None) for a whole file."""
+    if str(path).endswith('.gz'):
+        with gzip.open(path, 'rt') as handle:
+            for lineno, line in enumerate(handle, 1):
+                data = None
+                if _is_data(line):
+                    data = counter[0]
+                    counter[0] += 1
+                    if index is not None:
+                        index.offsets.append(-1)
+                yield lineno, line, data
+        return
+    with open(path, 'rb') as handle:
+        position = 0
+        for lineno, raw in enumerate(handle, 1):
+            line = raw.decode()
+            data = None
+            if _is_data(line):
+                data = counter[0]
+                counter[0] += 1
+                if index is not None:
+                    index.offsets.append(position)
+            position += len(raw)
+            yield lineno, line, data
+
+
+def _selected_lines(path, select, index, number):
+    """Header lines, then only the selected data lines of file ``number``."""
+    import numpy as np
+    first, last = index.file_starts[number], index.file_starts[number + 1]
+    wanted = select[np.searchsorted(select, first):np.searchsorted(select, last)].tolist()
+    if str(path).endswith('.gz'):
+        # No random access: stream and skip unselected records.
+        pending = iter(wanted)
+        target = next(pending, None)
+        for lineno, line, data in _file_lines(path, [first]):
+            if data is None:
+                if line.startswith('#'):
+                    yield lineno, line, None
+            elif data == target:
+                yield lineno, line, data
+                target = next(pending, None)
+                if target is None:
+                    break
+        return
+    with open(path, 'rb') as handle:
+        for lineno, raw in enumerate(handle, 1):
+            line = raw.decode()
+            if not line.startswith('#'):
+                break
+            yield lineno, line, None
+        for data in wanted:
+            handle.seek(index.offsets[data])
+            yield f'data line {data + 1}', handle.readline().decode(), data
 
 
 def _literal_insertion(text, size):
@@ -281,132 +368,129 @@ def _literal_insertion(text, size):
 
 def _rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=None,
           *, insertion_only=False, event_kinds=None, record_indexes=None,
-          dup_alignments=None, counter=None):
+          dup_alignments=None, counter=None, source=None):
     """Stream candidates, preferring full representative matches in rGFA mode."""
-    opener = gzip.open if str(path).endswith('.gz') else open
     samples = ()
-    with opener(path, 'rt') as handle:
-        for lineno, line in enumerate(handle, 1):
-            if line.startswith('#CHROM\t'):
-                samples = tuple(line.rstrip('\r\n').split('\t')[9:])
+    if source is None:
+        source = _file_lines(path, counter if counter is not None else [0])
+    for lineno, line, record_index in source:
+        if line.startswith('#CHROM\t'):
+            samples = tuple(line.rstrip('\r\n').split('\t')[9:])
+            continue
+        if record_index is None:
+            continue
+        try:
+            fields = line.rstrip('\r\n').split('\t', 9)
+            if record_indexes is not None and len(fields) > 2:
+                record_indexes[fields[2]] = record_index
+            if len(fields) < 8:
+                raise ValueError('malformed VCF record')
+            info = dict(item.split('=', 1) for item in fields[7].split(';') if '=' in item)
+            if info.get('SVTYPE') != 'INS':
+                if not insertion_only:
+                    yield _other_variant(fields, info, samples, samples_available, cutoff,
+                                         sequence_checks, candidate_sink, event_kinds)
                 continue
-            if line.startswith('#') or not line.strip():
+            identifier = fields[2]
+            size = abs(int(info['SVLEN']))
+            if size == 0:
                 continue
-            record_index = counter[0] if counter is not None else None
-            if counter is not None:
-                counter[0] += 1
-            try:
-                fields = line.rstrip('\r\n').split('\t', 9)
-                if record_indexes is not None and len(fields) > 2:
-                    record_indexes[fields[2]] = record_index
-                if len(fields) < 8:
-                    raise ValueError('malformed VCF record')
-                info = dict(item.split('=', 1) for item in fields[7].split(';') if '=' in item)
-                if info.get('SVTYPE') != 'INS':
-                    if not insertion_only:
-                        yield _other_variant(fields, info, samples, samples_available, cutoff,
-                                             sequence_checks, candidate_sink, event_kinds)
-                    continue
-                identifier = fields[2]
-                size = abs(int(info['SVLEN']))
-                if size == 0:
-                    continue
-                runs = graph_runs(info.get('SEQ', ''), size)
-                if (dup_alignments is not None and info.get('PACLASS') == 'fulllocusdup'
-                        and info.get('ALTERNATIVECIGAR', '.') != '.'):
-                    dup_alignments[identifier] = (
-                        _unescape(info['ALTERNATIVECIGAR']),
-                        _literal_insertion(info.get('SEQ', ''), size))
-                if sequence_checks is not None:
-                    sequence_checks[identifier] = literal_checks(info.get('SEQ', ''), size)
-                query = None
-                query_priority = 2
-                candidates = []
-                candidate_priority = {}
-                eligible = ins_seen = size_seen = span_seen = False
-                observed_sizes, observed_spans = set(), set()
-                if len(fields) == 10:
-                    offset = 0
-                    for sample in samples:
-                        stop = fields[9].find('\t', offset)
-                        if stop < 0:
-                            stop = len(fields[9])
-                        if sample in samples_available:
-                            eligible = True
-                            observations = (parse_sample_query_intervals(
-                                sample, fields[9][offset:stop], fields[8], include_alignment=True)
-                                if sequence_checks is not None else parse_sample_query_intervals(
-                                    sample, fields[9][offset:stop], fields[8]))
-                            for observation in observations:
-                                if not accepted_contig(sample, observation[1]):
-                                    continue
-                                ins_seen = True
-                                if len(observed_sizes) < 3:
-                                    observed_sizes.add(observation[5])
-                                if observation[5] != size:
-                                    continue
-                                size_seen = True
-                                span = observation[3] - observation[2]
-                                if len(observed_spans) < 3:
-                                    observed_spans.add(span)
-                                if span != size:
-                                    continue
-                                span_seen = True
-                                candidate = observation[:5]
-                                priority = 1
-                                if sequence_checks is not None:
-                                    cigar, template_offset = observation[6:8]
-                                    # FORMAT CIGAR is relative to this row's
-                                    # implicit representative. Prefer a full
-                                    # forward exact match at template offset 0;
-                                    # QUERYCOORD separately orients FASTA bases.
-                                    if (cigar in (f'>{size}=', f'>0H{size}=') and
-                                            template_offset in ('.', '0')):
-                                        priority = 0
-                                if candidate_sink is not None or sequence_checks is not None:
-                                    if candidate not in candidate_priority:
-                                        candidates.append(candidate)
-                                    candidate_priority[candidate] = min(
-                                        priority, candidate_priority.get(candidate, priority))
-                                # The nominated sequence is still verified
-                                # against INFO/SEQ during extraction.
-                                if priority < query_priority:
-                                    query = candidate
-                                    query_priority = priority
-                        if stop == len(fields[9]):
-                            break
-                        offset = stop + 1
-                if candidates:
-                    candidates.sort(key=candidate_priority.__getitem__)
-                    if candidate_priority[candidates[0]] == 0:
-                        # Preserve representative provenance. If an exact
-                        # representative source fails FASTA validation, do not
-                        # substitute a member with a non-exact alignment.
-                        candidates = [value for value in candidates
-                                      if candidate_priority[value] == 0]
-                    query = candidates[0]
-                if candidate_sink is not None:
-                    candidate_sink(identifier, candidates)
-                if query is not None:
-                    query_reason = 'ok'
-                elif not eligible:
-                    query_reason = 'sample_missing: no VCF sample is present in query FASTA list'
-                elif not ins_seen:
-                    query_reason = 'ins_missing: query-list samples have no INS observation'
-                elif not size_seen:
-                    values = ','.join(map(str, sorted(observed_sizes))) or 'none'
-                    query_reason = (f'size_mismatch: no INS observation has SIZE={size}; '
-                                    f'observed SIZE={values}')
-                elif not span_seen:
-                    values = ','.join(map(str, sorted(observed_spans))) or 'none'
-                    query_reason = (f'coordinate_mismatch: no SIZE-matched observation has '
-                                    f'QUERYCOORD span={size}; '
-                                    f'observed span={values}')
-                else:
-                    query_reason = 'coordinate_mismatch: no template-length query interval is usable'
-                pos = int(fields[1])
-                yield (identifier, fields[0], pos, int(info.get('END', pos)),
-                       size, runs, query, query_reason,
-                       fields[6] in ('PASS', '.') and size >= cutoff)
-            except (ValueError, KeyError, IndexError) as error:
-                raise ValueError(f'{path}:{lineno}: {error}') from error
+            runs = graph_runs(info.get('SEQ', ''), size)
+            if (dup_alignments is not None and info.get('PACLASS') == 'fulllocusdup'
+                    and info.get('ALTERNATIVECIGAR', '.') != '.'):
+                dup_alignments[identifier] = (
+                    _unescape(info['ALTERNATIVECIGAR']),
+                    _literal_insertion(info.get('SEQ', ''), size))
+            if sequence_checks is not None:
+                sequence_checks[identifier] = literal_checks(info.get('SEQ', ''), size)
+            query = None
+            query_priority = 2
+            candidates = []
+            candidate_priority = {}
+            eligible = ins_seen = size_seen = span_seen = False
+            observed_sizes, observed_spans = set(), set()
+            if len(fields) == 10 and samples_available:
+                offset = 0
+                for sample in samples:
+                    stop = fields[9].find('\t', offset)
+                    if stop < 0:
+                        stop = len(fields[9])
+                    if sample in samples_available:
+                        eligible = True
+                        observations = (parse_sample_query_intervals(
+                            sample, fields[9][offset:stop], fields[8], include_alignment=True)
+                            if sequence_checks is not None else parse_sample_query_intervals(
+                                sample, fields[9][offset:stop], fields[8]))
+                        for observation in observations:
+                            if not accepted_contig(sample, observation[1]):
+                                continue
+                            ins_seen = True
+                            if len(observed_sizes) < 3:
+                                observed_sizes.add(observation[5])
+                            if observation[5] != size:
+                                continue
+                            size_seen = True
+                            span = observation[3] - observation[2]
+                            if len(observed_spans) < 3:
+                                observed_spans.add(span)
+                            if span != size:
+                                continue
+                            span_seen = True
+                            candidate = observation[:5]
+                            priority = 1
+                            if sequence_checks is not None:
+                                cigar, template_offset = observation[6:8]
+                                # FORMAT CIGAR is relative to this row's
+                                # implicit representative. Prefer a full
+                                # forward exact match at template offset 0;
+                                # QUERYCOORD separately orients FASTA bases.
+                                if (cigar in (f'>{size}=', f'>0H{size}=') and
+                                        template_offset in ('.', '0')):
+                                    priority = 0
+                            if candidate_sink is not None or sequence_checks is not None:
+                                if candidate not in candidate_priority:
+                                    candidates.append(candidate)
+                                candidate_priority[candidate] = min(
+                                    priority, candidate_priority.get(candidate, priority))
+                            # The nominated sequence is still verified
+                            # against INFO/SEQ during extraction.
+                            if priority < query_priority:
+                                query = candidate
+                                query_priority = priority
+                    if stop == len(fields[9]):
+                        break
+                    offset = stop + 1
+            if candidates:
+                candidates.sort(key=candidate_priority.__getitem__)
+                if candidate_priority[candidates[0]] == 0:
+                    # Preserve representative provenance. If an exact
+                    # representative source fails FASTA validation, do not
+                    # substitute a member with a non-exact alignment.
+                    candidates = [value for value in candidates
+                                  if candidate_priority[value] == 0]
+                query = candidates[0]
+            if candidate_sink is not None:
+                candidate_sink(identifier, candidates)
+            if query is not None:
+                query_reason = 'ok'
+            elif not eligible:
+                query_reason = 'sample_missing: no VCF sample is present in query FASTA list'
+            elif not ins_seen:
+                query_reason = 'ins_missing: query-list samples have no INS observation'
+            elif not size_seen:
+                values = ','.join(map(str, sorted(observed_sizes))) or 'none'
+                query_reason = (f'size_mismatch: no INS observation has SIZE={size}; '
+                                f'observed SIZE={values}')
+            elif not span_seen:
+                values = ','.join(map(str, sorted(observed_spans))) or 'none'
+                query_reason = (f'coordinate_mismatch: no SIZE-matched observation has '
+                                f'QUERYCOORD span={size}; '
+                                f'observed span={values}')
+            else:
+                query_reason = 'coordinate_mismatch: no template-length query interval is usable'
+            pos = int(fields[1])
+            yield (identifier, fields[0], pos, int(info.get('END', pos)),
+                   size, runs, query, query_reason,
+                   fields[6] in ('PASS', '.') and size >= cutoff)
+        except (ValueError, KeyError, IndexError) as error:
+            raise ValueError(f'{path}:{lineno}: {error}') from error

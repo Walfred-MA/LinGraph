@@ -852,7 +852,9 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     inputs += [Path(str(path) + ".fai") for path in (fixed, templates, *query_sources.values(), catalog)]
     inputs += [ROOT / name for name in ("gfa_interval_pipeline.py", "gfa_interval_metadata.py",
                "gfa_query_anchors.py", "gfa_stable_coords.py", "gfa_source_catalog.py",
-               "minsetref_core.py", "minsetref_segments.py", "assembly_contigs.py")]
+               "gfa_catalog_paths.py", "gfa_duplications.py", "gfa_topology.py",
+               "gfa_partitioned.py", "minsetref_core.py", "minsetref_segments.py",
+               "assembly_contigs.py")]
     if args.slurm:
         wrapper = [sys.executable, ROOT / 'graph_build_snakemake/workflow/scripts/pipeline_inputs.py',
                    'run-slurm', '--cpus', args.threads, '--memory', args.slurm_memory or '64G',

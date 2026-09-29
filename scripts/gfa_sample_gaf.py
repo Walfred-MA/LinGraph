@@ -339,20 +339,25 @@ class Sample:
     def __init__(self, records):
         order = np.lexsort((records['qe'], records['qs'], records['contig']))
         self.records = records[order]
+        # Contiguous int64 columns: searchsorted on a structured-array field
+        # view, or on uint32 with a Python int key, copies the whole column on
+        # every call (quadratic over a sample).
+        for name in ('contig', 'qs', 'qe', 'var', 'strand'):
+            setattr(self, name, np.ascontiguousarray(self.records[name], dtype=np.int64))
         self.used = np.zeros(len(self.records), dtype=bool)
         self.cache = {}
 
     def between(self, contig, low, high):
         """Record positions with query span inside [low, high] on contig."""
-        records = self.records
-        left = int(np.searchsorted(records['contig'], contig, side='left'))
-        right = int(np.searchsorted(records['contig'], contig, side='right'))
-        start = left + int(np.searchsorted(records['qs'][left:right], low, side='left'))
+        left = int(np.searchsorted(self.contig, contig, side='left'))
+        right = int(np.searchsorted(self.contig, contig, side='right'))
+        start = left + int(np.searchsorted(self.qs[left:right], low, side='left'))
         output = []
+        qs, qe, used = self.qs, self.qe, self.used
         for position in range(start, right):
-            if records['qs'][position] > high:
+            if qs[position] > high:
                 break
-            if records['qe'][position] <= high and not self.used[position]:
+            if qe[position] <= high and not used[position]:
                 output.append(position)
         return output
 
@@ -360,7 +365,7 @@ class Sample:
         """Pieces for [low, high) of path with candidate variants spliced."""
         chosen = []
         for position in candidates:
-            variant = int(self.records['var'][position])
+            variant = int(self.var[position])
             if G['var_parent'][variant] != path:
                 continue
             a, b = int(G['var_start'][variant]), int(G['var_end'][variant])
@@ -387,10 +392,9 @@ class Sample:
             return []
         path = int(G['var_path'][variant])
         cumulative = _path_cumulative(path, self.cache)
-        records = self.records
         nested = [candidate for candidate in self.between(
-            int(records['contig'][position]), int(records['qs'][position]),
-            int(records['qe'][position])) if candidate != position]
+            int(self.contig[position]), int(self.qs[position]),
+            int(self.qe[position])) if candidate != position]
         self.used[position] = True
         pieces = self.splice(path, 0, int(cumulative[-1]), nested, stats)
         return reverse_pieces(pieces) if G['var_reverse'][variant] else pieces
@@ -493,7 +497,7 @@ def write_sample_gaf(task):
                 path, low, high, _strand = canonical
                 pieces = []
                 for position in candidates:
-                    variant = int(sample.records['var'][position])
+                    variant = int(sample.var[position])
                     if (G['var_kind'][variant] == KINDS['deletion'] and G['var_parent'][variant] == path
                             and low <= G['var_start'][variant] <= G['var_end'][variant] <= high):
                         sample.used[position] = True
@@ -511,15 +515,14 @@ def write_sample_gaf(task):
                 # No usable anchor (e.g. a locus duplication): use the
                 # variants carried inside this query interval directly.
                 pieces = []
-                records = sample.records
-                variants = [int(records['var'][position]) for position in candidates]
+                variants = [int(sample.var[position]) for position in candidates]
                 inner = {int(G['var_path'][variant]) for variant in variants} - {-1}
                 for position, variant in zip(candidates, variants):
                     # Nested variants are spliced inside their parent allele.
                     if sample.used[position] or int(G['var_parent'][variant]) in inner:
                         continue
                     allele = sample.allele(position, variant, stats)
-                    if records['strand'][position]:
+                    if sample.strand[position]:
                         allele = reverse_pieces(allele)
                     pieces.extend(allele)
                     stats['variants_spliced'] += 1

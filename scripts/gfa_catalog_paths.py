@@ -187,15 +187,21 @@ def _tail(piece, start, size):
 
 def resolve_catalog_paths(events, roots, reachable, catalog, vcf_paths, backbone,
                           backbone_fasta, output_prefix, root_type, log, *,
-                          threads=1, relift=None):
-    """Add merged catalog paths as roots; return {VCF name: SourceAlias}."""
-    needed = set()
-    for name in reachable:
-        event = events[name]
-        needed.add(event.chrom)
-        needed.update(run.target for run in event.runs if run.target)
-    needed.difference_update(events)
-    needed.difference_update(roots)
+                          threads=1, relift=None, needed=None):
+    """Add merged catalog paths as roots; return {VCF name: SourceAlias}.
+
+    With a precomputed ``needed`` set, ``events`` only needs to contain the
+    variant IDs that could collide with catalog names (``alt_*`` and
+    ``##alternativeLocus`` IDs), not every variant.
+    """
+    if needed is None:
+        needed = set()
+        for name in reachable:
+            event = events[name]
+            needed.add(event.chrom)
+            needed.update(run.target for run in event.runs if run.target)
+        needed.difference_update(events)
+    needed = set(needed) - set(roots)
     loci = read_alternative_loci(vcf_paths)
     # Templates the samples were called against, even without variants, so
     # GAF walks can pass through them. Best effort: skipped if not covered.

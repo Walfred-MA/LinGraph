@@ -66,7 +66,12 @@ def build_parser():
                         help='additional minimum for #unique paths')
     parser.add_argument('-t', '--processes', type=int,
                         default=int(os.environ.get('SLURM_CPUS_PER_TASK', '1')),
-                        help='parallel query FASTA readers (default: Slurm CPUs or 1)')
+                        help='parallel query FASTA readers and topology/GFA writers (default: Slurm CPUs or 1)')
+    parser.add_argument('--partition-records', type=int, default=0, metavar='N',
+                        help='bound memory for very large cohorts: process whole variant trees '
+                             'in partitions of about N VCF records (e.g. 5000000), with extra '
+                             'passes over the input; the GFA is identical to a one-pass run. '
+                             '0 processes everything at once (default)')
     parser.add_argument('--bed-only', action='store_true',
                         help='write BED/mapping outputs without GFA')
     parser.add_argument('--validate-only', action='store_true',
@@ -101,6 +106,11 @@ def main(argv=None):
         parser.error('--processes must be positive')
     if args.max_node_length < 1:
         parser.error('--max-node-length must be positive')
+    if args.partition_records < 0:
+        parser.error('--partition-records must be nonnegative')
+    if args.partition_records and (args.gfa_mode != 'rgfa' or args.bed_only or args.validate_only):
+        parser.error('--partition-records needs --gfa-mode rgfa and a GFA output '
+                     '(not --bed-only or --validate-only)')
     if args.gfa_mode == 'rgfa' and not args.reference_fasta:
         args.reference_fasta = os.path.join(args.graph_folder, 'inputs', 'reference_alternatives_novels.fa')
     if args.reference_fai and not args.reference_fasta:

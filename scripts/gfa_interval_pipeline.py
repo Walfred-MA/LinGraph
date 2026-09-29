@@ -1,5 +1,4 @@
 """Simple, query-backed GFA construction without a database."""
-from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict, OrderedDict
 from dataclasses import dataclass
 import gzip
@@ -10,11 +9,13 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
+import time
 
 from gfa_query_anchors import interval_chunks, read_query_list, scaffold_pool
 from minsetref_core import IndexedFasta
 
 CHUNK = 1024 * 1024
+ROOT_WINDOW = 4 * CHUNK
 VALID_SEQUENCE = re.compile(r'[A-Za-z=.]+')
 VG_SEQUENCE = re.compile(r'[ACGTNacgtn]+')
 
@@ -542,7 +543,8 @@ def _drop_unverified(events, resolver, intervals, dropped, unresolved, aliases, 
     _report_unresolved(unresolved, list(reasons.items()), aliases, log, fatal=False)
 
 
-def _write_metadata(bed, events, intervals, aliases, resolver, unique_minimum, anchor):
+def _write_metadata(bed, events, intervals, aliases, resolver, unique_minimum, anchor,
+                    mapping_prefix=None, sidecars=True):
     bed_rows = []
     for event in events.values():
         interval = intervals.get(event.identifier)
@@ -600,23 +602,29 @@ def _write_metadata(bed, events, intervals, aliases, resolver, unique_minimum, a
                 if hasattr(resolver, 'canonical_interval'):
                     ref_contig, ref_start, ref_end, ref_strand = resolver.canonical_interval(
                         ref_contig, ref_start, ref_end)
+                if mapping_prefix is not None:
+                    out.write(mapping_prefix(event.identifier))
                 out.write(f'{piece}\t{event_name}\t{run.qstart}\t{run.qend-run.qstart}\t'
                           f'{sample}\t{contig}\t{qstart}\t{qend}\t{strand}\t'
                           f'{aliases.get(ref_contig,ref_contig)}\t{ref_start}\t{ref_end}\t'
                           f'{run.operation}\t{target}\t{tstart}\t{tend}\t{tstrand}\t{ref_strand}\n')
-    if hasattr(resolver, 'source_aliases'):
-        with open(str(bed)+'.local-paths.tsv', 'w') as out:
-            out.write('local_path\ttarget\tstart\tend\tstrand\n')
-            for name, alias in sorted(resolver.source_aliases.items()):
-                out.write(f'{name}\t{alias.target}\t{alias.start}\t{alias.end}\t{alias.strand}\n')
-        with open(str(bed)+'.template-lifts.tsv', 'w') as out:
-            out.write('template\tbackbone\tstatus\tplacements\tnote\n')
-            for name, root in sorted(resolver.roots.items()):
-                if root.lift:
-                    lift = root.lift
-                    out.write('\t'.join(str(value) for value in (
-                        name, lift.get('backbone', '.'), lift.get('status', '.'),
-                        lift.get('placements', '.'), lift.get('note', '.'))) + '\n')
+    if sidecars and hasattr(resolver, 'source_aliases'):
+        _write_source_sidecars(bed, resolver.source_aliases, resolver.roots)
+
+
+def _write_source_sidecars(bed, source_aliases, roots):
+    with open(str(bed)+'.local-paths.tsv', 'w') as out:
+        out.write('local_path\ttarget\tstart\tend\tstrand\n')
+        for name, alias in sorted(source_aliases.items()):
+            out.write(f'{name}\t{alias.target}\t{alias.start}\t{alias.end}\t{alias.strand}\n')
+    with open(str(bed)+'.template-lifts.tsv', 'w') as out:
+        out.write('template\tbackbone\tstatus\tplacements\tnote\n')
+        for name, root in sorted(roots.items()):
+            if root.lift:
+                lift = root.lift
+                out.write('\t'.join(str(value) for value in (
+                    name, lift.get('backbone', '.'), lift.get('status', '.'),
+                    lift.get('placements', '.'), lift.get('note', '.'))) + '\n')
 
 
 def _path_leaves(spec, roots, resolver, anchor):
@@ -638,18 +646,6 @@ def _link_leaves(spec, roots, resolver, anchor):
         # Even --anchor 0 must attach the allele to its parent graph.
         return resolver.local_path(spec.source, spec.start, spec.end, max(1, anchor))
     return _path_leaves(spec, roots, resolver, anchor)
-
-
-def _atomic_keys(leaf, boundaries):
-    kind, source, start, end, orientation = leaf
-    points = boundaries[kind, source]
-    first, last = bisect_left(points, start), bisect_right(points, end)
-    selected = points[first:last]
-    pairs = list(zip(selected, selected[1:]))
-    if orientation == '-':
-        pairs.reverse()
-    for low, high in pairs:
-        yield (kind, source, low, high), orientation
 
 
 class _OpenFiles:
@@ -689,6 +685,7 @@ def _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks=Non
     query_files = _OpenFiles()
     root_reader = None
     root_path = None
+    window = None
     try:
         for (kind, source, start, end), number in segment_ids.items():
             output.write(f'S\t{prefix}{number}\t'.encode('ascii'))
@@ -711,10 +708,22 @@ def _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks=Non
                             root_reader.close()
                         root_reader = IndexedFasta(root.path, root.fai)
                         root_path = root.path
+                        window = None
                     written = 0
                     record = root.record or source
-                    for sequence in interval_chunks(root_reader, record, root.base+start,
-                                                    root.base+end, '+'):
+                    low, high = root.base+start, root.base+end
+                    if high - low <= ROOT_WINDOW:
+                        # Segments of one root arrive in coordinate order: read
+                        # the FASTA in large windows, not one call per segment.
+                        if not (window and window[0] == record and
+                                window[1] <= low and high <= window[1] + len(window[2])):
+                            limit = root_reader.index[record][0] if record in root_reader.index else high
+                            window = (record, low, ''.join(interval_chunks(
+                                root_reader, record, low, max(high, min(limit, low + ROOT_WINDOW)), '+')))
+                        pieces = (window[2][low-window[1]:high-window[1]],)
+                    else:
+                        pieces = interval_chunks(root_reader, record, low, high, '+')
+                    for sequence in pieces:
                         if not VALID_SEQUENCE.fullmatch(sequence):
                             raise ValueError(f'{source}: sequence contains characters invalid in GFA')
                         if ranks is not None and not VG_SEQUENCE.fullmatch(sequence):
@@ -736,67 +745,122 @@ def _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks=Non
             root_reader.close()
 
 
-def _write_graph(output_path, temporary_root, specs, roots, resolver, anchor,
-                 boundaries, segment_ids, prefix, hits, aliases):
-    path_file = temporary_root / 'paths.gfa'
-    links = {}
-    ranks = getattr(resolver, 'ranks', None)
-    with open(path_file, 'wb', buffering=CHUNK) as output:
-        for spec in specs:
-            previous = None
-            rank = ranks[spec.source] if ranks is not None else 0
-            for leaf in _link_leaves(spec, roots, resolver, anchor):
-                for key, orientation in _atomic_keys(leaf, boundaries):
-                    token = segment_ids[key], orientation
-                    if previous:
-                        edge = previous[0], previous[1], token[0], token[1]
-                        if ranks is not None:
-                            reverse_edge = (edge[2], '-' if edge[3] == '+' else '+',
-                                            edge[0], '-' if edge[1] == '+' else '+')
-                            edge = min(edge, reverse_edge)
-                        links[edge] = min(links.get(edge, rank), rank)
-                    previous = token
-            output.write(f'P\t{spec.name}\t'.encode('ascii'))
-            first = True
-            for leaf in _path_leaves(spec, roots, resolver, anchor):
-                for key, orientation in _atomic_keys(leaf, boundaries):
-                    token = segment_ids[key], orientation
-                    if not first:
-                        output.write(b',')
-                    output.write(f'{prefix}{token[0]}{token[1]}'.encode('ascii'))
-                    first = False
-            if first:
+_WRITE_STATE = None
+
+
+def _write_part(task):
+    """Write one ordered block of S or P lines to its own temporary file."""
+    kind, low, high, path = task
+    specs, roots, leaves, first, last, numbers, segments, prefix, hits, aliases, ranks = _WRITE_STATE
+    import gfa_topology as topology
+    with open(path, 'wb', buffering=CHUNK) as output:
+        if kind == 'S':
+            _write_segments(output, segments.part(low, high), hits, roots, aliases, prefix, ranks)
+            return path
+        for index in range(low, high):
+            spec = specs[index]
+            text = topology.path_text(index, leaves, first, last, numbers, prefix)
+            if not text:
                 raise ValueError(f'{spec.name}: empty GFA path')
             lift = roots[spec.source].lift if spec.source in roots else None
             lift_tag = f'\tLS:Z:{lift["status"]}' if lift else ''
             if lift and lift['status'] not in ('mapped', 'one_sided'):
                 lift_tag += '\tUP:Z:unplaced'
-            output.write(f'\t*\tTP:Z:{spec.kind}{lift_tag}\n'.encode('ascii'))
+            output.write(f'P\t{spec.name}\t{text}\t*\tTP:Z:{spec.kind}{lift_tag}\n'.encode('ascii'))
+    return path
 
+
+def _write_parts(temporary_root, specs, roots, leaves, first, last, numbers, segment_ids,
+                 prefix, hits, aliases, ranks, stable, processes=1, tag=''):
+    """Write ordered S and P blocks (forked workers) and compute the links.
+
+    Returns (S part files, P part files, (left, right, rank) link arrays).
+    """
+    global _WRITE_STATE
+    import gc
+    import multiprocessing as mp
+    import gfa_topology as topology
+    blocks = max(1, processes) * 4
+    tasks = []
+    for kind, total in (('S', len(segment_ids)), ('P', len(specs))):
+        size = max(1, -(-total // blocks))
+        for number, low in enumerate(range(0, total, size)):
+            tasks.append((kind, low, min(total, low + size),
+                          temporary_root / f'part.{tag}{kind}.{number:06d}.gfa'))
+    _WRITE_STATE = (specs, roots, leaves, first, last, numbers, segment_ids, prefix,
+                    hits, aliases, ranks)
+    try:
+        if processes > 1 and len(tasks) > 1 and 'fork' in mp.get_all_start_methods():
+            gc.freeze()
+            try:
+                with mp.get_context('fork').Pool(processes, maxtasksperchild=1) as pool:
+                    pending = pool.map_async(_write_part, tasks, 1)
+                    # Links are computed here while the workers write S and P.
+                    links = topology.links(leaves, first, last, numbers, stable)
+                    pending.get()
+            finally:
+                gc.unfreeze()
+        else:
+            for task in tasks:
+                _write_part(task)
+            links = topology.links(leaves, first, last, numbers, stable)
+    finally:
+        _WRITE_STATE = None
+    return ([task[3] for task in tasks if task[0] == 'S'],
+            [task[3] for task in tasks if task[0] == 'P'], links)
+
+
+def _copy_parts(parts, output, remove=True):
+    for path in parts:
+        with open(path, 'rb') as part:
+            shutil.copyfileobj(part, output, length=CHUNK)
+        if remove:
+            os.unlink(path)
+
+
+def _write_links(output, left, right, link_ranks, prefix, ranked):
+    step = 100_000
+    for low in range(0, len(left), step):
+        part = slice(low, low + step)
+        rows = zip((left[part] >> 1).tolist(), (left[part] & 1).tolist(),
+                   (right[part] >> 1).tolist(), (right[part] & 1).tolist(),
+                   link_ranks[part].tolist())
+        output.write(''.join(
+            f'L\t{prefix}{a}\t{"+-"[ao]}\t{prefix}{b}\t{"+-"[bo]}\t0M'
+            + (f'\tSR:i:{rank}\n' if ranked else '\n')
+            for a, ao, b, bo, rank in rows).encode('ascii'))
+
+
+def _write_graph(output_path, temporary_root, specs, roots, resolver, leaves,
+                 first, last, numbers, segment_ids, prefix, hits, aliases, stable,
+                 processes=1):
+    """Write H, S, L, P lines; S and P blocks are written by forked workers."""
+    ranks = getattr(resolver, 'ranks', None)
+    s_parts, p_parts, (left, right, link_ranks) = _write_parts(
+        temporary_root, specs, roots, leaves, first, last, numbers, segment_ids, prefix,
+        hits, aliases, ranks, stable, processes)
     temporary = str(output_path) + f'.tmp.{os.getpid()}'
     try:
         opener = gzip.open if str(output_path).endswith('.gz') else open
         with opener(temporary, 'wb') as output:
             output.write(b'H\tVN:Z:1.0\tTS:Z:merged_vcf_to_gfa.py\n')
-            _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks)
-            for edge in sorted(links):
-                left, left_orientation, right, right_orientation = edge
-                tags = f'\tSR:i:{links[edge]}' if ranks is not None else ''
-                output.write(f'L\t{prefix}{left}\t{left_orientation}\t{prefix}{right}\t'
-                             f'{right_orientation}\t0M{tags}\n'.encode('ascii'))
-            with open(path_file, 'rb') as paths:
-                shutil.copyfileobj(paths, output, length=CHUNK)
+            _copy_parts(s_parts, output)
+            _write_links(output, left, right, link_ranks, prefix, ranks is not None)
+            _copy_parts(p_parts, output)
         os.replace(temporary, output_path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    return len(links)
+    return len(left)
 
 
 def run(args, _read_vcf=None, _chunks=None, _operations=None, log=print):
     from gfa_interval_metadata import vcf_paths
     bed = Path(args.anchor_bed or (str(args.output or next(vcf_paths(args.vcf))) + '.anchors.bed')).resolve()
     bed.parent.mkdir(parents=True, exist_ok=True)
+    if getattr(args, 'partition_records', 0):
+        from gfa_partitioned import run_partitioned
+        return run_partitioned(args, bed, log)
     with tempfile.TemporaryFile(dir=bed.parent) as spool:
         return _run(args, QueryCandidates(spool), bed, log)
 
@@ -926,37 +990,28 @@ def _run(args, candidates, bed, log):
             prefix = '_' + prefix
 
         log(f'Building shared topology for {len(specs)} GFA paths')
-        cuts = defaultdict(set)
-        for spec in specs:
-            getters = ((_path_leaves, _link_leaves) if stable and (spec.kind in ('insertion', 'snp', 'substitution', 'deletion') or
-                        (spec.source in roots and roots[spec.source].lift))
-                       else (_path_leaves,))
-            for get_leaves in getters:
-                for kind, source, start, end, _orientation in get_leaves(
-                        spec, roots, resolver, args.anchor):
-                    cuts[kind, source].update((start, end))
-                    if stable:
-                        # Chop only covered intervals, never large unused gaps
-                        # between disjoint pieces of a query source.
-                        cuts[kind, source].update(range(start+args.max_node_length, end,
-                                                       args.max_node_length))
-        boundaries = {source: sorted(points) for source, points in cuts.items()}
-        segment_keys = set()
-        for spec in specs:
-            for leaf in _link_leaves(spec, roots, resolver, args.anchor):
-                segment_keys.update(key for key, _orientation in
-                                    _atomic_keys(leaf, boundaries))
+        import gfa_topology as topology
+        started = time.monotonic()
+        ids, source_names, is_query = topology.source_order(
+            roots, events, resolver, header_lengths, stable)
+        leaves = topology.collect_leaves(specs, roots, resolver, args.anchor, ids,
+                                         _path_leaves, _link_leaves, args.processes, log)
+        del ids
+        log(f'Topology: {len(leaves.source)} leaves for {len(specs)} paths in '
+            f'{time.monotonic() - started:.1f}s')
+        started = time.monotonic()
+        keys = topology.boundaries(leaves, stable, args.max_node_length)
+        first, last = topology.pair_ranges(keys, leaves.source, leaves.start, leaves.end)
+        forbidden = set()
         if stable:
             prefix = ''  # Preserve numeric node IDs through VG import/export.
-            segment_ids = {}
-            number = 0
-            for key in sorted(segment_keys, key=lambda k: (resolver.ranks[k[1]], k)):
-                number += 1
-                while str(number) in names or str(number) in stable_names:
-                    number += 1
-                segment_ids[key] = number
-        else:
-            segment_ids = {key: number for number, key in enumerate(sorted(segment_keys), 1)}
+            forbidden = {int(name) for name in names | stable_names
+                         if name.isascii() and name.isdigit() and name == str(int(name))}
+        used, numbers = topology.number_segments(keys, leaves, first, last, stable, forbidden)
+        topology.check_path_coverage(used, first, last, leaves, specs)
+        segment_ids = topology.Segments(keys, used, numbers, source_names, is_query)
+        log(f'Topology: numbered {len(segment_ids)} segments from {len(keys)} cut points in '
+            f'{time.monotonic() - started:.1f}s')
         if args.validate_only:
             if stable:
                 class Discard:
@@ -970,10 +1025,12 @@ def _run(args, candidates, bed, log):
         output = Path(args.output).resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         log('Writing GFA segments, links, and paths')
-        links = _write_graph(output, temporary_root, specs, roots, resolver, args.anchor,
-                             boundaries, segment_ids, prefix, hits, aliases)
+        started = time.monotonic()
+        links = _write_graph(output, temporary_root, specs, roots, resolver, leaves,
+                             first, last, numbers, segment_ids, prefix, hits, aliases, stable,
+                             args.processes)
         log(f'Wrote {len(segment_ids)} segments, {links} links, and '
-            f'{len(specs)} paths to {output}')
+            f'{len(specs)} paths to {output} in {time.monotonic() - started:.1f}s')
         if stable:
             index = Path(str(output) + '.variants.tsv')
             count = _write_variant_index(index, events, record_indexes, aliases, resolver)

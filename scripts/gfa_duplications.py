@@ -102,13 +102,37 @@ def add_duplication_paths(events, roots, dup_alignments, source_aliases, run_typ
     """Add shared PA roots and rewrite duplication insertions onto them."""
     if not dup_alignments:
         return {}
+    insertions = {identifier for identifier in dup_alignments
+                  if identifier in events and events[identifier].kind == 'insertion'}
+    plan = plan_duplication_paths(dup_alignments, roots, source_aliases, root_type,
+                                  insertions, events)
+    apply_duplication_paths(events, plan, run_type)
+    log_duplication_plan(plan, len(dup_alignments), log)
+    return plan['shared']
+
+
+def log_duplication_plan(plan, count, log):
+    log(f'Full-locus duplications: {count} insertion(s), '
+        f'{sum(len(values) for values in plan["shared"].values())} shared PA path(s); '
+        + ', '.join(f'{key}={value}' for key, value in sorted(plan['stats'].items())))
+    for reason, identifiers in sorted(plan['examples'].items()):
+        log(f'  not_found_{reason} examples: {", ".join(identifiers)}')
+
+
+def plan_duplication_paths(dup_alignments, roots, source_aliases, root_type,
+                           insertions=None, event_names=()):
+    """Verify pieces, cluster them per target and add the shared PA roots.
+
+    Global step: needs every duplication insertion's CIGAR and SEQ, but not
+    the variants themselves. ``insertions`` limits it to IDs that are
+    insertion variants; ``event_names`` guards the new root names.
+    """
     stats = defaultdict(int)
     parsed = {}
     readers = {}
     try:
         for identifier, (cigar, literal) in dup_alignments.items():
-            event = events.get(identifier)
-            if event is None or event.kind != 'insertion':
+            if insertions is not None and identifier not in insertions:
                 continue
             if literal is None:
                 stats['no_literal_seq'] += 1
@@ -140,6 +164,7 @@ def add_duplication_paths(events, roots, dup_alignments, source_aliases, run_typ
 
     # Place pieces first: only verified pieces define the shared PA extent.
     placed = {}
+    examples = defaultdict(list)
     for identifier, (pieces, literal) in parsed.items():
         cursor = 0
         kept = []
@@ -147,6 +172,10 @@ def add_duplication_paths(events, roots, dup_alignments, source_aliases, run_typ
             position = literal.find(piece['sequence'], cursor)
             if position < 0:
                 stats['sequence_not_found'] += 1
+                reason = _not_found_reason(piece['sequence'], literal, cursor)
+                stats[f'not_found_{reason}'] += 1
+                if len(examples[reason]) < 5:
+                    examples[reason].append(identifier)
                 continue
             kept.append((piece, position))
             cursor = position + len(piece['sequence'])
@@ -165,12 +194,19 @@ def add_duplication_paths(events, roots, dup_alignments, source_aliases, run_typ
         base = roots[target]
         for low, high in _clusters(intervals):
             name = f'dup_{target}_{low}_{high}'
-            if name in roots or name in events:
+            if name in roots or name in event_names:
                 raise ValueError(f'duplication path name {name!r} collides with another path')
             roots[name] = root_type(name, base.path, base.fai, high - low, True,
                                     'duplication', next_order, record=target, base=low)
             next_order += 1
             shared.setdefault(target, []).append((low, high, name))
+
+    return {'shared': shared, 'placed': placed, 'stats': stats, 'examples': examples}
+
+
+def apply_duplication_paths(events, plan, run_type):
+    """Rewrite the runs of every planned duplication insertion in ``events``."""
+    shared, stats = plan['shared'], plan['stats']
 
     def locate(piece):
         for low, high, name in shared[piece['target']]:
@@ -178,8 +214,10 @@ def add_duplication_paths(events, roots, dup_alignments, source_aliases, run_typ
                 return name, low, high
         raise AssertionError('piece outside its duplication cluster')
 
-    for identifier, (kept, literal) in placed.items():
-        event = events[identifier]
+    for identifier, (kept, literal) in plan['placed'].items():
+        event = events.get(identifier)
+        if event is None:
+            continue
         runs = []
         unique = 0
         cursor = 0
@@ -224,7 +262,18 @@ def add_duplication_paths(events, roots, dup_alignments, source_aliases, run_typ
                              f'{sum(run.qend - run.qstart for run in runs)} of {event.length} bases')
         event.runs = runs
         stats['insertions_on_shared_path'] += 1
-    log(f'Full-locus duplications: {len(dup_alignments)} insertion(s), '
-        f'{sum(len(values) for values in shared.values())} shared PA path(s); '
-        + ', '.join(f'{key}={value}' for key, value in sorted(stats.items())))
-    return shared
+
+
+def _not_found_reason(sequence, literal, cursor):
+    """Why a piece's rebuilt bases are absent from SEQ (diagnostic only)."""
+    if reverse_complement(sequence) in literal:
+        return 'reverse_complement'
+    if sequence in literal:
+        return 'before_previous_piece'
+    if len(sequence) > len(literal):
+        if literal in sequence:
+            return 'seq_inside_piece'
+        if reverse_complement(literal) in sequence:
+            return 'seq_inside_piece_reverse_complement'
+        return 'piece_longer_than_seq'
+    return 'no_exact_match'

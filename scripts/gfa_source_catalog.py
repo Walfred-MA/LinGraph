@@ -110,8 +110,12 @@ def template_lift(fields, roots, backbone):
 
 
 def resolve_local_sources(events, roots, reachable, sources, catalogs, log,
-                          template_catalogs=(), backbone=None):
-    """Map needed catalog records to contained, sequence-identical included roots."""
+                          template_catalogs=(), backbone=None, needed=None):
+    """Map needed catalog records to contained, sequence-identical included roots.
+
+    ``needed`` (target names of reachable variants that are neither variants
+    nor roots) may be given precomputed instead of ``events``/``reachable``.
+    """
     from gfa_interval_pipeline import Root
 
     counts = defaultdict(lambda: [0, 0])
@@ -121,13 +125,14 @@ def resolve_local_sources(events, roots, reachable, sources, catalogs, log,
             counts[root.kind][1] += root.length
     log('Included FASTA paths: ' + '; '.join(
         f'{kind}={count} paths/{bases} bases' for kind, (count, bases) in sorted(counts.items())))
-    needed = set()
-    for name in reachable:
-        event = events[name]
-        needed.add(event.chrom)
-        needed.update(run.target for run in event.runs if run.target)
-    needed.difference_update(events)
-    needed.difference_update(roots)
+    if needed is None:
+        needed = set()
+        for name in reachable:
+            event = events[name]
+            needed.add(event.chrom)
+            needed.update(run.target for run in event.runs if run.target)
+        needed.difference_update(events)
+    needed = set(needed) - set(roots)
     if (not needed or not catalogs) and not template_catalogs:
         return {}
 
