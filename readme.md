@@ -73,10 +73,11 @@ To use a separate helper installation, set `MINSETREF_GRAPH_TOOLS` to its direct
 compiling. The helper check above verifies that the graph-alignment tools can
 be located. Use `--no-install-deps` to build with an environment you manage yourself.
 
-Graph mode requires at least **4 CPUs**; examples below use `-t 16`. Memory and
-temporary storage needs depend on assembly count and repeat complexity. For
-cohorts with thousands of haplotypes, use shared storage and the SLURM options described in
-[the full command guide](scripts/LinGraph.md#slurm-and-dependencies).
+Graph mode requires at least **4 CPUs**; examples below use `-t 16`. For a full
+cohort run, we recommend **32 CPUs and at least 64 GB RAM**. Larger cohorts or
+high repeat complexity may need more memory and temporary storage. For cohorts
+with thousands of haplotypes, use shared storage and the SLURM options described
+in [the full command guide](scripts/LinGraph.md#slurm-and-dependencies).
 
 ## Modes and input preparation
 

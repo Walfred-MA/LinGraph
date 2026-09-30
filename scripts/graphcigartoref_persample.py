@@ -1570,6 +1570,25 @@ def _group_span(group) -> int:
     return max(highs) - min(lows) if lows else 0
 
 
+# A comparison whose reference x query locus spans reach 1 Mb x 1 Mb can hold a
+# realignment pair that costs several GB (a 1 Mb satellite pair used ~4.7 GB).
+_HUGE_GROUP_PRODUCT = 1_000_000 * 1_000_000
+
+
+def _coord_text_span(text) -> int:
+    match = _QUERY_SPAN.search(text or "")
+    return int(match[2]) - int(match[1]) if match else 0
+
+
+def _group_product(group) -> int:
+    """Largest reference span x query span among a group's comparisons."""
+    return max((
+        _coord_text_span(getattr(pair, "query_coord_text", ""))
+        * _coord_text_span(getattr(pair, "ref_coord_text", ""))
+        for base, members in group for pair in (base, *members)
+    ), default=0)
+
+
 def _pending_group_labels(candidate_groups, finished, limit: int = 3) -> str:
     """Name up to ``limit`` unfinished candidate groups (query and interval)."""
     labels = []
@@ -5032,6 +5051,9 @@ def _write_parallel(
         writer = _CompletedRowBuffer(output, buffer_size, buffer_bytes)
         completed = 0
         emitted = 0
+        # Indices refer to the full candidate list across both pool phases.
+        # Retain normal-phase completions when reporting a huge-phase failure.
+        finished: Set[int] = set()
         started = time.monotonic()
         # Move the fully built shared structures (assembly, graph sequences,
         # CIGAR tables) into the GC permanent generation before forking.
@@ -5045,23 +5067,33 @@ def _write_parallel(
         )
         gc.freeze()
         try:
-            # Groups covering more than _HUGE_GROUP_SPAN query bases run last,
-            # one at a time, so each can use the whole job's memory.
+            # Groups covering more than _HUGE_GROUP_SPAN query bases, or whose
+            # reference x query spans reach _HUGE_GROUP_PRODUCT, run last, one
+            # at a time, so each can use the whole job's memory.
             huge = [index for index, group in enumerate(candidate_groups)
-                    if _group_span(group) > _HUGE_GROUP_SPAN]
+                    if _group_span(group) > _HUGE_GROUP_SPAN
+                    or _group_product(group) >= _HUGE_GROUP_PRODUCT]
             huge_set = set(huge)
             phases = [([index for index in range(len(candidate_groups))
                         if index not in huge_set], args.processes)]
             if huge:
                 sys.stderr.write(
                     f"[graphcigartoref_persample] deferring {len(huge)} candidate "
-                    f"group(s) covering >{_HUGE_GROUP_SPAN} query bases to run one "
+                    f"group(s) covering >{_HUGE_GROUP_SPAN} query bases or "
+                    f"reference x query >= {_HUGE_GROUP_PRODUCT:.0e} to run one "
                     f"at a time at the end: {_pending_group_labels(candidate_groups, set(range(len(candidate_groups))) - huge_set, limit=10)}\n"
                 )
                 phases.append((huge, 1))
             for phase_indices, phase_processes in phases:
                 if not phase_indices:
                     continue
+                sys.stderr.write(
+                    "[graphcigartoref_persample] starting conversion phase: "
+                    f"{len(phase_indices)} candidate group(s), "
+                    f"{phase_processes} worker(s); "
+                    f"already completed {completed}/{len(candidate_groups)}\n"
+                )
+                sys.stderr.flush()
                 with context.Pool(
                     processes=phase_processes,
                     initializer=_init_worker_state,
@@ -5078,7 +5110,6 @@ def _write_parallel(
                         1,
                     )
                     seen_workers: Dict[int, object] = {}
-                    finished: Set[int] = set()
                     phase_done = 0
                     while phase_done < len(phase_indices):
                         try:
@@ -5784,6 +5815,11 @@ if getattr(core, "_PROFILE_ENABLED", False):
             globals()[_profiled_name] = _persample_profile_wrap(
                 _profiled_fn, _dump_every,
             )
+
+
+if os.environ.get("GRAPH_CIGARTOREF_MEMORY_TRACE", "") not in {"", "0"}:
+    from graphcigar_memory_trace import install as _install_memory_trace
+    _install_memory_trace(core, globals(), os.environ["GRAPH_CIGARTOREF_MEMORY_TRACE"])
 
 
 if __name__ == "__main__":

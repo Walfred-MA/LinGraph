@@ -2759,6 +2759,12 @@ def _best_payload_hit_alignment(ref_seq, qry_seq, hits, score):
 # hits AFTER mapping allows a reverse primary to suppress the forward hit.
 _MINIMAP_FOR_ONLY = 0x100000
 
+# minimap2 realignment is an optional rescue: every caller keeps its D/I when
+# it is refused.  Above this ref x query length product (10 Mb x 1 Mb, e.g.
+# 3.33 Mb x 3 Mb) a satellite pair can exhaust a worker's memory, so it is
+# not attempted.
+_MINIMAP2_MAX_LENGTH_PRODUCT = 10_000_000 * 1_000_000
+
 
 def _mappy_payload_ops(
     ref_seq: str, qry_seq: str, *, preset: Optional[str] = None,
@@ -2816,6 +2822,11 @@ def minimap2_payload_ops(
         return [(len(qry_seq), 'I', qry_seq)] if qry_seq else []
     if not qry_seq:
         return [(len(ref_seq), 'D', '')] if ref_seq else []
+    if len(ref_seq) * len(qry_seq) > _MINIMAP2_MAX_LENGTH_PRODUCT:
+        raise RuntimeError(
+            f'minimap2 payload alignment skipped: {len(ref_seq)} x '
+            f'{len(qry_seq)} bp exceeds the length-product cap'
+        )
     if _mappy is not None and os.environ.get(
         'GRAPH_CIGARTOREF_NO_MAPPY', '',
     ) in {'', '0'}:
@@ -3369,6 +3380,8 @@ def _minimap2_tandem_hits(ref_seq: str, qry_seq: str) -> List[TandemAlignmentHit
     diverged tandem repeats in the whole allele.
     The caller still requires a strict score gain over the graph alignment.
     """
+    if len(ref_seq) * len(qry_seq) > _MINIMAP2_MAX_LENGTH_PRODUCT:
+        return []
     raw_hits = []
     if _mappy is not None and os.environ.get('GRAPH_CIGARTOREF_NO_MAPPY', '') in {'', '0'}:
         aligner = _mappy.Aligner(seq=ref_seq, preset='map-ont', best_n=50,
