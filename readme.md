@@ -203,6 +203,10 @@ The package extracts into `cohort_minsetref_v3/summary/`. Its main files are:
 | `references/CHM13_h1_rig/` | Supplied CHM13 reference alignment and block coordinates |
 | `references/HG38_h1_rig/` | Supplied GRCh38 reference alignment and block coordinates |
 
+The archive contains the graph summary, not the reconstructed full graph. Run
+LinGraph's `scripts/reconstruct_local_graph_folders.py` in Step 2 to build all
+local graphs before using `Win50KGraph` for variant calling.
+
 ### 2. Reconstruct all local graphs
 
 Use the matching **CHM13 FASTA used to build the package**, with its adjacent
