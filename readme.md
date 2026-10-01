@@ -176,6 +176,13 @@ with `singular` mode for new haplotype assemblies.
 Download **`Win50KGraph.tar.gz`** (about 2.43 GB) from the Figshare record.
 The download is available after the record is published and the DOI is active.
 
+To download it from a terminal, run this command from the directory where you
+want the archive saved. `-C -` resumes an interrupted download:
+
+```bash
+curl -L -C - https://ndownloader.figshare.com/files/69451449 -o Win50KGraph.tar.gz
+```
+
 Allow additional disk space for extraction and the reconstructed graphs, and
 RAM for the uncompressed reference and packed sequences during reconstruction.
 
