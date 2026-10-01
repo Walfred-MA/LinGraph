@@ -129,6 +129,11 @@ Input rules:
   indexes. Preparation accepts compressed inputs.
 - Relative FASTA paths are resolved from the input list's directory. Paths
   cannot contain whitespace; do not add an index column.
+- **Every first-column haplotype name must be unique across the entire input
+  list.** Do not assign the same name to different FASTAs, for example, two
+  separate `HG002_h1` rows. Name collisions make inputs and per-haplotype
+  outputs ambiguous and can cause one assembly's results to be mistaken for
+  another's.
 - **`CHM13_h1` and `HG38_h1` can keep their native contig names and masking.**
   They still need matching indexes, created with `samtools faidx reference.fa`.
 - Calling checks the first sequence and index entry. Run preparation explicitly
