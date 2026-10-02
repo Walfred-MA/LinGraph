@@ -35,6 +35,9 @@ from __future__ import annotations
 import argparse
 from alignment_scoring import scoring_runs, run_score, cigar_score
 import bisect
+from array import array
+import contextlib
+import copy
 import ctypes
 import functools
 import glob
@@ -52,6 +55,8 @@ import re
 import shutil
 import signal
 import struct
+import threading
+import types
 
 from graphvcfmerge_kmer import DEFAULT_KMERMATCH
 import graphvcfmerge_checkpoints as checkpoints
@@ -70,8 +75,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from contextlib import contextmanager
+import dataclasses
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -2150,16 +2156,6 @@ class ShardedSvObservation:
         return int(self.size)
 
 
-@dataclass
-class MergedSvClusterPlan:
-    members: List[ShardedSvObservation]
-    insertion_group: int = -1
-    insertion_order: int = -1
-    row_id: str = ""
-    info_sequence: Optional[str] = None
-    referenced_templates: Tuple[str, ...] = ()
-
-
 def _safe_locus_key(chrom: str) -> str:
     digest = hashlib.sha256(chrom.encode("utf-8")).hexdigest()[:24]
     return "locus_" + digest
@@ -2202,6 +2198,243 @@ def _parse_structured_meta(line: str, tag: str) -> Dict[str, str]:
         if index < len(body) and body[index] == ",":
             index += 1
     return output
+
+
+# --exact: per-sample reference coverage from ##pseudoLinearMapping, stored
+# per locus as {sample_index: uint32 [s0, e0, s1, e1, ...]} (sorted, disjoint,
+# half-open), so a region test is one binary search.
+_EXACT_COVERAGE_NAME = "exact_coverage.npz"
+_EXACT_REFERENCE_INTERVAL = re.compile(r"(.+):(\d+)-(\d+)[+-]")
+
+
+def read_query_paths(path: str) -> Dict[str, Tuple[str, str]]:
+    """NAME FASTA [FAI] per line; relative paths resolve against the list."""
+    base = os.path.dirname(os.path.abspath(path))
+    output: Dict[str, Tuple[str, str]] = {}
+    with open(path) as handle:
+        for line in handle:
+            fields = line.split()
+            if len(fields) < 2 or fields[0].startswith("#"):
+                continue
+            fasta = os.path.join(base, fields[1])
+            fai = os.path.join(base, fields[2]) if len(fields) > 2 else fasta + ".fai"
+            if fields[0] in output and output[fields[0]] != (fasta, fai):
+                raise ValueError(f"{path}: {fields[0]!r} is listed twice")
+            output[fields[0]] = (fasta, fai)
+    return output
+
+
+def _exact_coverage_array(intervals) -> "np.ndarray":
+    """Union of half-open intervals; touching intervals are joined."""
+    merged: List[List[int]] = []
+    for start, end in sorted(intervals):
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    if merged and merged[-1][1] >= _FAST_U32_LIMIT:
+        raise ValueError("coverage interval exceeds the uint32 layout")
+    return np.asarray(merged, dtype=np.uint32).reshape(-1)
+
+
+def exact_covered(array, start: int, end: int) -> bool:
+    """True when [start, end) lies inside one covered interval."""
+    if array is None or len(array) == 0 or end < start:
+        return False
+    index = int(np.searchsorted(array, start, side="right"))
+    return index % 2 == 1 and end <= int(array[index])
+
+
+_DUP_PIECE = re.compile(r"([<>])([^:<>&]+):((?:\d+[=MXIDHS][A-Za-z]*)+)")
+_DUP_OPS = re.compile(r"(\d+)([=MXIDHS])[A-Za-z]*")
+
+
+def full_locus_dup_source(alternative_cigar: str) -> Optional[Tuple[str, int, int]]:
+    """(path, start, end) spanning every piece of a full-locus-dup
+    ALTERNATIVECIGAR in forward path coordinates; None when the pieces are
+    unparsable, on several paths, or traverse the source in reverse."""
+    path, start, end = None, None, None
+    for piece in (alternative_cigar or "").split("&"):
+        match = _DUP_PIECE.fullmatch(piece.strip())
+        if match is None or match.group(1) != ">":
+            return None
+        ops = [(int(n), op) for n, op in _DUP_OPS.findall(match.group(3))]
+        lead = ops[0][0] if ops and ops[0][1] == "H" else 0
+        span = sum(n for n, op in ops if op in "=MXD")
+        if path not in (None, match.group(2)) or span <= 0:
+            return None
+        path = match.group(2)
+        start = lead if start is None else min(start, lead)
+        end = lead + span if end is None else max(end, lead + span)
+    return None if path is None else (path, start, end)
+
+
+def _dup_parent_spans(path: str, sample_indexes, sample_names):
+    """Pre-pass for --exact: full-locus-dup copies of one input VCF.
+
+    Returns ({line offset: source interval or None},
+             {query contig: [(start, end), ...]}); the query spans cover the
+    copies, so any other call inside them is a source-relative restatement.
+    """
+    parents: Dict[int, Optional[Tuple[str, int, int]]] = {}
+    spans: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    offset = 0
+    with open(path, "rb") as handle:
+        for raw in handle:
+            line_offset = offset
+            offset += len(raw)
+            if raw.startswith(b"#") or b"fulllocusdup" not in raw:
+                continue
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if not is_full_locus_dup_parent_row(line):
+                continue
+            info = parse_info_field(line.split("\t", 8)[7])
+            # A '<' copy's SEQ is normalized to forward-reference orientation
+            # at ingestion while its ALTERNATIVECIGAR still describes the
+            # traversal orientation: merge it as an ordinary insertion.
+            parents[line_offset] = None if _reverse_direction_row(info) else (
+                full_locus_dup_source(vcf_unescape(info.get("ALTERNATIVECIGAR", "")))
+            )
+            observations, _next = _observations_from_row(
+                line, sample_indexes, sample_names, 0,
+            )
+            for observation in observations:
+                if observation.svtype == "INS":
+                    spans[observation.qry_contig].append(
+                        (observation.qry_start, observation.qry_end),
+                    )
+    return parents, spans
+
+
+# --exact SNP index of one input VCF (F3): its SNP observations sorted by
+# (locus, position); names and per-locus offsets live in a JSON sidecar.
+_EXACT_SNP_DTYPE = np.dtype([
+    ("chrom", "<u4"), ("pos", "<u4"), ("alt", "u1"), ("contig", "<u4"),
+    ("qpos", "<u4"), ("minus", "u1"),
+]) if np is not None else None
+
+
+def _exact_dup_spans_path(records_dir: str, file_index: int) -> str:
+    """Query spans of one input's templated full-locus-dup copies."""
+    return os.path.join(records_dir, f"{file_index}.dup_copies.json")
+
+
+def _exact_dup_copy_spans(records_dir: str, file_index: int) -> Dict[str, list]:
+    """{query contig: [[start, end], ...]}; empty for scans made before
+    this file existed."""
+    path = _exact_dup_spans_path(records_dir, file_index)
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as handle:
+        return json.load(handle)
+
+
+def _exact_snp_index_paths(records_dir: str, file_index: int) -> Tuple[str, str]:
+    base = os.path.join(records_dir, f"{file_index}.exact_snps")
+    return base + ".npy", base + ".json"
+
+
+def _exact_snp_observations(line: str, sample_columns) -> List[tuple]:
+    """(chrom, 0-based pos, ALT, contig, raw QUERYCOORD, strand) per SNP
+    observation (TYPE SNP) of one VCF row, for the given sample columns."""
+    fields = line.split("\t")
+    keys = fields[8].split(":")
+    try:
+        type_key, contig_key, coord_key = (
+            keys.index("TYPE"), keys.index("ASSEMBLYCONTIG"), keys.index("QUERYCOORD"),
+        )
+    except ValueError:
+        return []
+    output = []
+    for column in sample_columns:
+        values = fields[9 + column].split(":") if 9 + column < len(fields) else []
+        if len(values) != len(keys) or values[0] != "1":
+            continue
+        types = values[type_key].split(",")
+        contigs = values[contig_key].split(",")
+        for number, coord in enumerate(values[coord_key].split(",")):
+            match = re.fullmatch(r"(\d+)([+-])", coord)
+            if match is None or types[min(number, len(types) - 1)] != "SNP":
+                continue
+            output.append((
+                fields[0], int(fields[1]) - 1, fields[4].upper(),
+                vcf_unescape(contigs[min(number, len(contigs) - 1)]),
+                int(match.group(1)), match.group(2),
+            ))
+    return output
+
+
+# LIFTCATEGORY of calls lifted through a dup PA's secondary alignment: the
+# copy's own source-relative restatements.
+_DUP_LIFT_CATEGORIES = frozenset({"Dup", "DivergeDup"})
+
+
+def _inside_dup_span(spans, contig: str, start: int, end: int,
+                     restated: bool = False) -> bool:
+    """Query interval [start, end) inside a full-locus-dup copy. A point
+    (pure deletion) strictly inside is a restatement; on the copy's edge it
+    is one only when lifted through the dup PA (restated): otherwise it is
+    the neighbouring primary call."""
+    if start == end:
+        return any(a < start < b or (restated and a <= start <= b)
+                   for a, b in spans.get(contig, ()))
+    return any(a <= start and end <= b for a, b in spans.get(contig, ()))
+
+
+def _drop_dup_snp_observations(line: str, spans) -> Optional[str]:
+    """Remove SNP observations inside a full-locus-dup copy; None if empty."""
+    fields = line.split("\t")
+    keys = fields[8].split(":")
+    try:
+        contig_key, coord_key = keys.index("ASSEMBLYCONTIG"), keys.index("QUERYCOORD")
+    except ValueError:
+        return line
+    changed = False
+    for column in range(9, len(fields)):
+        values = fields[column].split(":")
+        if len(values) != len(keys) or values[0] != "1":
+            continue
+        lists = [value.split(",") for value in values]
+        count = len(lists[coord_key])
+        keep = []
+        for index in range(count):
+            contig = vcf_unescape(lists[contig_key][min(index, len(lists[contig_key]) - 1)])
+            match = re.fullmatch(r"(\d+)(?:-(\d+))?([+-]?)", lists[coord_key][index])
+            point = int(match.group(1)) if match else -1
+            # The SNP's base: [point, point+1) on '+', [point-1, point) on '-'
+            # (as the checkers read it); a point on the copy's end is the
+            # base after the copy, not inside it.
+            base = point - 1 if match and match.group(3) == "-" else point
+            if match and _inside_dup_span(spans, contig, base, base + 1):
+                changed = True
+                continue
+            keep.append(index)
+        if len(keep) == count:
+            continue
+        if not keep:
+            fields[column] = ":".join(["0"] + ["."] * (len(keys) - 1))
+            continue
+        fields[column] = ":".join(
+            values[0] if key == 0 else ",".join(
+                items[index] for index in keep
+            ) if len(items) == count else values[key]
+            for key, items in enumerate(lists)
+        )
+    if not changed:
+        return line
+    if not any(field.split(":", 1)[0] == "1" for field in fields[9:]):
+        return None
+    return "\t".join(fields)
+
+
+def _fast_load_exact_coverage(subfolder: str) -> Optional[Dict[int, "np.ndarray"]]:
+    path = os.path.join(subfolder, _EXACT_COVERAGE_NAME)
+    if not os.path.isfile(path):
+        return None
+    with np.load(path) as data:
+        return {int(key): data[key] for key in data.files}
 
 
 def _vcf_meta_quote(value: str) -> str:
@@ -2263,6 +2496,36 @@ def _first_info_size(info: Dict[str, str], names: Sequence[str]) -> int:
     return 0
 
 
+_REVERSE_COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+_REVERSE_BODY = re.compile(r"<((?:\d+[=MXIDHS][A-Za-z]*)+)")
+_REVERSE_OP = re.compile(r"(\d+)([=MXIDHS])([A-Za-z]*)")
+
+
+def _reverse_complement(sequence: str) -> str:
+    return (sequence or "").translate(_REVERSE_COMPLEMENT)[::-1]
+
+
+def _reverse_direction_row(info: Dict[str, str]) -> bool:
+    """graphreftovcf writes a call on a run whose reference is traversed in
+    reverse (direction '<') with a '<' event cigar, SEQ and cigar payloads in
+    that traversal's orientation, and QUERYCOORD on the query's own strand.
+    The row's INFO cigar carries the direction; the sample cigar is often a
+    named template starting with '>'."""
+    return vcf_unescape(info.get("EXTENDGRAPHCIGAR", "")).startswith("<")
+
+
+def _forward_cigar(cigar: str) -> str:
+    """A '<' event cigar as the equivalent '>' one: ops in reverse order,
+    payload bases reverse-complemented. Other cigars are returned as is."""
+    match = _REVERSE_BODY.fullmatch(cigar or "")
+    if match is None:
+        return cigar
+    return ">" + "".join(
+        f"{count}{op}{_reverse_complement(payload)}"
+        for count, op, payload in reversed(_REVERSE_OP.findall(match.group(1)))
+    )
+
+
 def _decomposed_components(
     allele_values: Sequence[str], info: Dict[str, str], sequence: str,
     *, reference_span: Optional[int] = None,
@@ -2276,6 +2539,13 @@ def _decomposed_components(
     )
     cigar = allele_values[3] if len(allele_values) > 3 else ""
     cigar_ins, cigar_del, cigar_sequence = _cigar_component_lengths(cigar)
+    if not (cigar_ins or cigar_del):
+        # A sample cigar on a named template (>ROW@...=) has no I/D counts;
+        # the row's own cigar does (e.g. >1500D400I for a replacement).
+        # Without it a replacement typed DEL lost its inserted bases.
+        cigar_ins, cigar_del, cigar_sequence = _cigar_component_lengths(
+            info.get("EXTENDGRAPHCIGAR", ""),
+        )
     if not sequence:
         sequence = cigar_sequence
     ins_size = max(
@@ -2304,11 +2574,19 @@ def _decomposed_components(
     # component (for example, 3731D3643I is TYPE=DEL). For a reference
     # replacement, split its CIGAR components for merging even if the coarse
     # SVTYPE says DEL or INS.
+    # A full-locus-dup copy with a reference span replaces that span: its
+    # copy goes to the shared template, the span is a deletion (--exact).
+    replacing_copy = (
+        info.get("PACLASS") == "fulllocusdup" and (reference_span or 0) > 0
+    )
     is_sub = (
         "SUB" in typ
         or ("INS" in typ and "DEL" in typ)
         or (cigar_ins > 0 and cigar_del > 0 and not point_insertion)
+        or replacing_copy
     )
+    if replacing_copy and not del_size:
+        del_size = int(reference_span)
     if is_sub:
         fallback = max(
             abs(signed), abs(_parse_int(info.get("MAXSIZE", "0"))),
@@ -2368,6 +2646,12 @@ def _observations_from_row(
     )
     if sequence == ".":
         sequence = ""
+    # Every merge step assumes forward-reference SEQ with QUERYCOORD giving
+    # the query's orientation relative to it; a '<' row is normalized to
+    # that: SEQ reverse-complemented, strand flipped, cigar forward.
+    reverse_row = _reverse_direction_row(info)
+    if reverse_row:
+        sequence = _reverse_complement(sequence)
     output: List[ShardedSvObservation] = []
     for local_index, global_index in enumerate(global_sample_indexes):
         field_text = rec.samples[local_index] if local_index < len(rec.samples) else "."
@@ -2441,6 +2725,9 @@ def _observations_from_row(
             qry_start, qry_end, qry_strand = parse_query_range_required(
                 representative[5], context=observation_context,
             )
+            if reverse_row:
+                qry_strand = "-" if qry_strand == "+" else "+"
+                representative[3] = _forward_cigar(representative[3])
             components = _decomposed_components(
                 representative, info, sequence,
                 reference_span=end - rec.pos,
@@ -2481,6 +2768,18 @@ def _observations_from_row(
                     max(observation_pos, end, observation_pos + size - 1)
                     if svtype == "DEL" else max(observation_pos, end)
                 )
+                component_start, component_stop = qry_start, qry_end
+                if is_split:
+                    # A split replacement: the INS component is a point
+                    # insertion at POS holding all query bases, the DEL
+                    # component the reference span at the query point after
+                    # them. Both spanning everything applied it twice.
+                    if svtype == "INS":
+                        component_end = observation_pos
+                    else:
+                        component_start = component_stop = (
+                            qry_start if qry_strand == "-" else qry_end
+                        )
                 output.append(ShardedSvObservation(
                     id=next_id,
                     chrom=rec.chrom,
@@ -2499,8 +2798,8 @@ def _observations_from_row(
                     size=int(size),
                     sequence=component_sequence if svtype == "INS" else "",
                     qry_contig=qry_contig,
-                    qry_start=qry_start,
-                    qry_end=qry_end,
+                    qry_start=component_start,
+                    qry_end=component_stop,
                     qry_strand=qry_strand,
                     cigar=component_cigar,
                     label=vcf_unescape(representative[6]),
@@ -2514,32 +2813,6 @@ def _observations_from_row(
                     ),
                 ))
     return output, next_id
-
-
-def _core_sv_unit(observation, core):
-    return core.SVUnit(
-        id=observation.id,
-        query=(
-            f"{observation.sample_name}:{observation.qry_contig}:"
-            f"{observation.id}"
-        ),
-        sample=observation.sample_name,
-        allelename=observation.label,
-        ref_contig=observation.chrom,
-        ref_start=observation.pos,
-        ref_end=observation.end,
-        qry_contig=observation.qry_contig,
-        qry_start=observation.qry_start,
-        qry_end=observation.qry_end,
-        qry_strand=observation.qry_strand,
-        label=observation.label,
-        label_h=observation.label_h,
-        ins_size=(observation.size if observation.svtype == "INS" else 0),
-        del_size=(observation.size if observation.svtype == "DEL" else 0),
-        cigar=observation.cigar,
-        raw_ins_seq=observation.sequence,
-        line_no=observation.id,
-    )
 
 
 def _levenshtein_distance(first: str, second: str) -> int:
@@ -2725,14 +2998,6 @@ def _safe_variant_token(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", text or "locus")
 
 
-def _cluster_representative(
-    observations: Sequence[ShardedSvObservation],
-) -> ShardedSvObservation:
-    return max(observations, key=lambda value: (
-        value.size, -value.pos, value.row_id, -value.id,
-    ))
-
-
 def _scored_alignment_middle(body: str, core):
     """Trim to the boundaries selected by the standard alignment score."""
     operations = core.parse_pairwise_ops(body)
@@ -2783,126 +3048,6 @@ def _scored_alignment_middle(body: str, core):
     )
     return (
         query_start, query_end, target_start, target_end, selected_body,
-    )
-
-
-def _partially_annotated_insertion_sequence(
-    plan: MergedSvClusterPlan,
-    earlier_plans: Sequence[MergedSvClusterPlan],
-    core,
-) -> Tuple[str, Tuple[str, ...]]:
-    """Encode accepted partial mappings without changing event grouping.
-
-    Every unassigned query interval is aligned independently to each earlier
-    greedy template.  Accepted middles are subtracted before the next template
-    so a middle hit can leave two separately alignable flanks.
-    """
-    representative = _cluster_representative(plan.members)
-    raw_sequence = representative.sequence
-    if not raw_sequence or not earlier_plans:
-        return raw_sequence, (), ()
-
-    remaining: List[Tuple[int, int]] = [(0, len(raw_sequence))]
-    assigned_chunks: List[Tuple[int, int, str]] = []
-    chunk_mappings: List[Tuple[int, int, str, int, int, str]] = []
-    referenced_templates: List[str] = []
-    for earlier_plan in sorted(
-        earlier_plans, key=lambda value: value.insertion_order,
-    ):
-        template = _cluster_representative(earlier_plan.members)
-        if (
-            not template.sequence
-            or not earlier_plan.row_id
-        ):
-            continue
-        target = core.InsertionSequenceTarget(
-            sv=_core_sv_unit(template, core),
-            sequence=template.sequence,
-            path_name=earlier_plan.row_id,
-            record_length=len(template.sequence),
-            local_start=0,
-            local_end=len(template.sequence),
-            direction=">",
-        )
-        try:
-            aligner = _make_single_thread_insertion_aligner(
-                core, target.sequence,
-            )
-        except Exception:
-            continue
-
-        assigned_to_template: List[Tuple[int, int]] = []
-        # Use a snapshot: intervals split by this template are first considered
-        # independently by the next template, not remapped to the same one.
-        for interval_start, interval_end in list(remaining):
-            query_piece = raw_sequence[interval_start:interval_end]
-            alignment = core._minimap2_insertion_alignment(
-                query_piece, target.sequence, aligner=aligner,
-            )
-            if alignment is None:
-                continue
-            middle = _scored_alignment_middle(str(alignment["body"]), core)
-            if middle is None:
-                continue
-            query_start, query_end, target_start, target_end, body = middle
-            full_query_start = (
-                interval_start + int(alignment["q0"]) + query_start
-            )
-            full_query_end = (
-                interval_start + int(alignment["q0"]) + query_end
-            )
-            full_target_start = int(alignment["target_t0"]) + target_start
-            full_target_end = int(alignment["target_t0"]) + target_end
-            aligned_portion = full_query_end - full_query_start
-            required_portion = max(
-                50,
-                0.5 * (interval_end - interval_start),
-            )
-            if aligned_portion <= required_portion:
-                continue
-            encoded = core._target_chunk(
-                target, full_target_start, full_target_end, body,
-            )
-            if not encoded:
-                continue
-            assigned_to_template.append((full_query_start, full_query_end))
-            assigned_chunks.append((
-                full_query_start, full_query_end, encoded,
-            ))
-            chunk_mappings.append((
-                full_query_start, full_query_end,
-                earlier_plan.row_id,
-                full_target_start, full_target_end,
-                body,
-            ))
-            if earlier_plan.row_id not in referenced_templates:
-                referenced_templates.append(earlier_plan.row_id)
-        if assigned_to_template:
-            remaining = core.subtract_assigned_from_remaining(
-                remaining, assigned_to_template,
-            )
-            if not remaining:
-                break
-
-    if not assigned_chunks:
-        return raw_sequence, (), ()
-    output: List[str] = []
-    cursor = 0
-    for start, end, encoded in sorted(assigned_chunks):
-        if start > cursor:
-            output.append(core.encode_raw_piece_as_insertion(
-                raw_sequence[cursor:start],
-            ))
-        output.append(encoded)
-        cursor = max(cursor, end)
-    if cursor < len(raw_sequence):
-        output.append(core.encode_raw_piece_as_insertion(
-            raw_sequence[cursor:],
-        ))
-    return (
-        "".join(output),
-        tuple(referenced_templates),
-        tuple(chunk_mappings),
     )
 
 
@@ -3025,6 +3170,16 @@ def _fast_scan_input_task(
     coverage_lines: list = []
     metadata_lines: list = []
     by_chrom: Dict[str, bytearray] = {}
+    exact = bool(context.get("exact"))
+    file_samples = {sample_names[index]: index for index in sample_indexes}
+    exact_intervals: Dict[Tuple[str, int], list] = {}
+    dup_parents, dup_spans = (
+        _dup_parent_spans(path, sample_indexes, sample_names)
+        if exact else ({}, {})
+    )
+    dup_dropped = 0
+    templated_copies: Dict[str, list] = defaultdict(list)
+    snp_index = _ExactSnpIndex() if exact else None
     line_ordinal = 0
     offset = 0
     with open(path, "rb") as handle:
@@ -3060,6 +3215,30 @@ def _fast_scan_input_task(
                     "##contig=<", "##alternativeLocus=<",
                 )):
                     metadata_lines.append(line)
+                elif exact and line.startswith("##pseudoLinearMapping=<"):
+                    values = _parse_structured_meta(
+                        line, "pseudoLinearMapping",
+                    )
+                    reference = _EXACT_REFERENCE_INTERVAL.fullmatch(
+                        values.get("Reference", ""),
+                    )
+                    if (
+                        reference is not None
+                        and values.get("Category") in ("PRIMARY", "DELETION")
+                    ):
+                        name = values.get("Sample", "")
+                        if name not in file_samples:
+                            if len(file_samples) != 1:
+                                raise ValueError(
+                                    f"{path}: pseudoLinearMapping sample "
+                                    f"{name!r} is not a column of this VCF"
+                                )
+                            name = next(iter(file_samples))
+                        exact_intervals.setdefault(
+                            (reference.group(1), file_samples[name]), [],
+                        ).append((
+                            int(reference.group(2)), int(reference.group(3)),
+                        ))
                 continue
             if length < 2:
                 continue
@@ -3072,8 +3251,18 @@ def _fast_scan_input_task(
             if snp_writer is not None:
                 fields = line.split("\t", 9)
                 if len(fields) > 8 and is_snp_format(fields[8]):
-                    snp_writer.consume(parse_vcf_record(line, line_ordinal + 1),
-                                       [sample_names[i] for i in sample_indexes])
+                    if dup_spans:
+                        filtered = _drop_dup_snp_observations(line, dup_spans)
+                        dup_dropped += filtered != line
+                        line = filtered
+                    if line is not None:
+                        snp_writer.consume(parse_vcf_record(line, line_ordinal + 1),
+                                           [sample_names[i] for i in sample_indexes])
+                        if exact:
+                            for observation in _exact_snp_observations(
+                                line, range(len(sample_indexes)),
+                            ):
+                                snp_index.add(*observation)
                     line_ordinal += 1
                     continue
             candidate_min = int(context.get("candidate_min_size", 0) or 0)
@@ -3095,6 +3284,60 @@ def _fast_scan_input_task(
                     "the id stride allows"
                 )
             line_ordinal += 1
+            if exact and line_offset in dup_parents:
+                # A full-locus-dup copy is merged on its shared source
+                # template (kind TC, under the template's locus); the
+                # replacement's deletion is part of that templated row.
+                source = dup_parents[line_offset]
+                if source is not None:
+                    for observation in observations:
+                        if observation.svtype == "INS":
+                            templated_copies[observation.qry_contig].append(
+                                [observation.qry_start, observation.qry_end],
+                            )
+                            by_chrom.setdefault((source[0], "TC"), bytearray()).extend(
+                                _FAST_PACK.pack(
+                                    source[1], source[2], observation.size,
+                                    line_offset, observation.sample_index,
+                                ),
+                            )
+                    # A copy that replaces a reference span keeps that
+                    # deletion as an ordinary DEL (the site row is a point
+                    # insertion); dropping it lost the replaced span.
+                    observations = [
+                        observation for observation in observations
+                        if observation.svtype == "DEL"
+                    ]
+                    if not observations:
+                        continue
+            elif dup_spans:
+                # Decide per sample's allele, over all its observations' span:
+                # the INS and DEL halves of a split replacement are kept or
+                # dropped together (the DEL half alone is a point on the edge).
+                spans_by_allele: Dict[tuple, list] = {}
+                for observation in observations:
+                    key = (observation.sample_index, observation.qry_contig,
+                           observation.source_row_id)
+                    allele = spans_by_allele.setdefault(
+                        key, [observation.qry_start, observation.qry_end, False],
+                    )
+                    allele[0] = min(allele[0], observation.qry_start)
+                    allele[1] = max(allele[1], observation.qry_end)
+                    allele[2] = allele[2] or (
+                        getattr(observation, "liftover_category", ".")
+                        in _DUP_LIFT_CATEGORIES
+                    )
+                kept = [
+                    observation for observation in observations
+                    if not _inside_dup_span(
+                        dup_spans, observation.qry_contig,
+                        *spans_by_allele[(observation.sample_index,
+                                          observation.qry_contig,
+                                          observation.source_row_id)],
+                    )
+                ]
+                dup_dropped += len(observations) - len(kept)
+                observations = kept
             seen_types = set()
             for observation in observations:
                 if not (
@@ -3140,7 +3383,64 @@ def _fast_scan_input_task(
         for kinds in sections.values()
         for _off, count in kinds.values()
     )
+    if dup_parents:
+        print(
+            f"[merge:exact] {os.path.basename(path)}: {len(dup_parents)} "
+            f"full-locus-dup copy row(s) "
+            f"({sum(v is not None for v in dup_parents.values())} on a source "
+            f"template); {dup_dropped} source-relative call(s) dropped",
+            file=sys.stderr,
+        )
+    if exact:
+        snp_index.write(records_dir, file_index)
+        # The top-level planner does not see templated copies (they are
+        # merged on their templates): it locks these query intervals.
+        with open(_exact_dup_spans_path(records_dir, file_index), "w") as out:
+            json.dump({contig: sorted(spans) for contig, spans in templated_copies.items()},
+                      out, sort_keys=True)
+        with open(_fast_exact_sidecar_path(records_dir, file_index), "wb") as out:
+            pickle.dump({
+                key: _exact_coverage_array(intervals)
+                for key, intervals in exact_intervals.items()
+            }, out, protocol=pickle.HIGHEST_PROTOCOL)
     return file_index, coverage_lines, metadata_lines, sections, total
+
+
+class _ExactSnpIndex:
+    """Compact accumulator for one input's SNP index (about 18 bytes each)."""
+
+    def __init__(self):
+        self.chroms: Dict[str, int] = {}
+        self.contigs: Dict[str, int] = {}
+        self.columns = {name: array("I") for name in ("chrom", "pos", "contig", "qpos")}
+        self.alt = bytearray()
+        self.minus = bytearray()
+
+    def add(self, chrom, pos, alt, contig, qpos, strand):
+        self.columns["chrom"].append(self.chroms.setdefault(chrom, len(self.chroms)))
+        self.columns["pos"].append(pos)
+        self.columns["contig"].append(self.contigs.setdefault(contig, len(self.contigs)))
+        self.columns["qpos"].append(qpos)
+        self.alt.append(ord(alt[:1] or "N"))
+        self.minus.append(strand == "-")
+
+    def write(self, records_dir: str, file_index: int) -> None:
+        table = np.empty(len(self.alt), dtype=_EXACT_SNP_DTYPE)
+        for name, values in self.columns.items():
+            table[name] = np.frombuffer(values, dtype=np.uint32) if len(values) else []
+        table["alt"] = np.frombuffer(bytes(self.alt), dtype=np.uint8)
+        table["minus"] = np.frombuffer(bytes(self.minus), dtype=np.uint8)
+        table.sort(order=["chrom", "pos"])
+        offsets = np.searchsorted(table["chrom"], np.arange(len(self.chroms) + 1)).tolist()
+        npy, sidecar = _exact_snp_index_paths(records_dir, file_index)
+        np.save(npy, table)
+        with open(sidecar, "w") as out:
+            json.dump({"chroms": list(self.chroms), "contigs": list(self.contigs),
+                       "offsets": offsets}, out)
+
+
+def _fast_exact_sidecar_path(records_dir: str, file_index: int) -> str:
+    return os.path.join(records_dir, f"{file_index}.exact_coverage.pkl")
 
 
 def _fast_load_chrom_columns(
@@ -3472,6 +3772,45 @@ def _fast_link_segments_task(
     )
 
 
+class _FastThreadHandles(OrderedDict):
+    """One thread's open input VCFs; closed when the thread ends."""
+
+    def __del__(self):
+        for handle in self.values():
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+_FAST_INPUT_HANDLES = threading.local()
+_FAST_INPUT_OPEN = 8     # open input VCFs per thread
+
+
+def _fast_input_handle(path):
+    """This thread's open handle on an input VCF, least recently used closed
+    first: fetches do not reopen the same few inputs, and descriptor use
+    stays bounded for any cohort size. Handles are never shared across
+    threads (each seeks), and a forked child opens its own (an inherited one
+    would share its file offset with the parent)."""
+    local = _FAST_INPUT_HANDLES
+    handles = getattr(local, "handles", None)
+    if handles is None or local.pid != os.getpid():
+        if handles is not None:
+            for inherited in handles.values():
+                inherited.close()
+            handles.clear()
+        handles = local.handles = _FastThreadHandles()
+        local.pid = os.getpid()
+    handle = handles.pop(path, None)
+    if handle is None:
+        handle = open(path, "rb")
+    handles[path] = handle
+    while len(handles) > _FAST_INPUT_OPEN:
+        handles.popitem(last=False)[1].close()
+    return handle
+
+
 def _fast_iter_observations(
     refs: Sequence[Tuple[int, int, str]],
 ) -> Iterator[Tuple[Tuple[int, int, str], ShardedSvObservation]]:
@@ -3481,7 +3820,8 @@ def _fast_iter_observations(
     Grouping one task's locators by file avoids an open/close pair per record,
     while sorting offsets changes random seeks into forward reads.  A SUB row
     requested as both INS and DEL is parsed once.  Only one descriptor is held
-    at a time, so descriptor use remains independent of cohort size.
+    at a time per thread (see _fast_input_handle), so descriptor use
+    remains independent of cohort size.
     """
     context = _FAST_CONTEXT
     requested: Dict[int, Dict[int, set]] = defaultdict(
@@ -3492,7 +3832,7 @@ def _fast_iter_observations(
     for file_index in sorted(requested):
         offsets = requested[file_index]
         path = context["input_paths"][file_index]
-        with open(path, "rb") as handle:
+        with contextlib.nullcontext(_fast_input_handle(path)) as handle:
             for offset in sorted(offsets):
                 handle.seek(offset)
                 line = handle.readline().decode(
@@ -3768,7 +4108,7 @@ def _fast_pair_alignment(
         return 0.0, None
     body_parts = []
     if best.r_st > 0:
-        body_parts.append(f"{best.r_st}H")
+        body_parts.append(f"{best.r_st}D")
     if best.q_st > 0:
         body_parts.append(f"{best.q_st}I")
     body_parts.append(best.cigar_str)
@@ -3777,7 +4117,7 @@ def _fast_pair_alignment(
         body_parts.append(f"{query_tail}I")
     template_tail = len(template) - best.r_en
     if template_tail > 0:
-        body_parts.append(f"{template_tail}H")
+        body_parts.append(f"{template_tail}D")
     return _truvari_seqsim(seq_a, seq_b), "".join(body_parts)
 
 
@@ -3790,6 +4130,11 @@ def _final_pair_alignment(
     )
     if body is not None or edlib is None:
         return similarity, body
+    if not seq_a or not seq_b:
+        # edlib gives no path when one side is empty; the only alignment is
+        # all insertions or all deletions.
+        return (1.0 if not (seq_a or seq_b) else 0.0,
+                _pure_insertion_alignment_body(seq_a or "", seq_b or ""))
     result = edlib.align(
         (seq_a or "").upper(), (seq_b or "").upper(),
         mode="NW", task="path",
@@ -3811,15 +4156,14 @@ def _pure_insertion_alignment_body(
     """Lossless no-homology fallback against an implicit representative.
 
     The complete query is retained as an insertion at parent offset zero and
-    the complete representative axis is skipped with H.  H is positional, not
-    a called deletion, so downstream residual discovery sees one pure
-    insertion rather than an artificial replacement event.
+    the complete representative axis is deleted, so the member never maps
+    partially onto the representative and its own bases are fully recovered.
     """
     query_length = len(query_sequence or "")
     representative_length = len(representative_sequence or "")
     return (
         (f"{query_length}I" if query_length else "")
-        + (f"{representative_length}H" if representative_length else "")
+        + (f"{representative_length}D" if representative_length else "")
     )
 
 
@@ -3919,14 +4263,14 @@ def _fast_winnowmap_align_batch(
             query_len = candidate_lens[number]
             body_parts = []
             if t_st > 0:
-                body_parts.append(f"{t_st}H")
+                body_parts.append(f"{t_st}D")
             if q_st > 0:
                 body_parts.append(f"{q_st}I")
             body_parts.append(cg)
             if query_len - q_en > 0:
                 body_parts.append(f"{query_len - q_en}I")
             if rep_len - t_en > 0:
-                body_parts.append(f"{rep_len - t_en}H")
+                body_parts.append(f"{rep_len - t_en}D")
             similarity = (2.0 * matches) / max(
                 1, query_len + rep_len,
             )
@@ -3981,33 +4325,38 @@ def _fast_online_candidates(
     members: list,
     load_rank: Dict[int, int],
     size_threshold: float,
-) -> List[int]:
-    """Fast fallback order: template, nearest size, nearest coordinate."""
+) -> Iterator[int]:
+    """Fast fallback order: template, nearest size, nearest coordinate.
+
+    Lazy: the nearest-coordinate scan over the whole subcluster runs only
+    when the template and the nearest-size member both failed, so a member
+    that matches the template costs O(log n), not O(n). Same candidates in
+    the same order as computing all three first."""
     member = members[member_index]
     size_pick = _nearest_size_member(group, member[2])
     # The closest-size member failing the size gate proves that no member in
     # this subcluster can pass it, so no alignment is useful.
     if _size_similarity(member[2], members[size_pick][2]) < size_threshold:
-        return []
-    eligible = [
-        candidate for candidate in group["members"]
-        if _size_similarity(member[2], members[candidate][2])
-        >= size_threshold
-    ]
-    distance_pick = min(eligible, key=lambda candidate: (
-        _reference_coordinate_distance(member, members[candidate]),
-        -_size_similarity(member[2], members[candidate][2]),
-        load_rank[candidate], candidate,
-    ))
-    ordered = [group["template"], size_pick, distance_pick]
-    unique = []
+        return
+
+    def eligible(candidate):
+        return _size_similarity(member[2], members[candidate][2]) >= size_threshold
+
     seen = set()
-    for candidate in ordered:
-        if candidate in seen or candidate not in eligible:
-            continue
-        seen.add(candidate)
-        unique.append(candidate)
-    return unique
+    for candidate in (group["template"], size_pick):
+        if candidate not in seen and eligible(candidate):
+            seen.add(candidate)
+            yield candidate
+    distance_pick = min(
+        (candidate for candidate in group["members"] if eligible(candidate)),
+        key=lambda candidate: (
+            _reference_coordinate_distance(member, members[candidate]),
+            -_size_similarity(member[2], members[candidate][2]),
+            load_rank[candidate], candidate,
+        ),
+    )
+    if distance_pick not in seen:
+        yield distance_pick
 
 
 def _nearest_online_subclusters(
@@ -4159,8 +4508,11 @@ def _nearest_online_subclusters(
                 # all of its prior members again for every new sequence.
                 passed[0]["members"].append(member_index)
                 bisect.insort(passed[0]["by_size"], this_size_entry)
+                # Incremental: the template is the first maximum of the
+                # members in load order, so comparing it with the newcomer
+                # gives the same result as rescanning every member.
                 passed[0]["template"] = _current_representative_index(
-                    passed[0]["members"], members, row_ids,
+                    (passed[0]["template"], member_index), members, row_ids,
                 )
                 continue
             passed_ids = {id(group) for group in passed}
@@ -4186,8 +4538,13 @@ def _nearest_online_subclusters(
             groups.insert(first_slot, {
                 "members": merged_members,
                 "by_size": merged_sizes,
+                # Each group's template is its first maximum in load order;
+                # the merged group's is the first maximum of those (and of
+                # the newcomer), as a rescan of merged_members would find.
                 "template": _current_representative_index(
-                    merged_members, members, row_ids,
+                    sorted((group["template"] for group in passed),
+                           key=load_rank.__getitem__) + [member_index],
+                    members, row_ids,
                 ),
                 "created": created,
             })
@@ -4251,7 +4608,7 @@ def _final_member_bodies(
         if body is None:
             # A local/native aligner must never leave query bases outside the
             # emitted member CIGAR.  Keep the complete member once, as a pure
-            # insertion plus positional H over the representative, without a
+            # insertion plus a deletion of the representative, without a
             # second alignment attempt.
             body = _pure_insertion_alignment_body(
                 sequences[index], representative_sequence,
@@ -4884,7 +5241,503 @@ def _fast_refine_giant(
     return groups
 
 
-def _fast_emit_task(
+_EXACT_READERS: Dict[str, object] = {}
+
+
+_EXACT_OPEN_FILES = 16      # open assembly FASTAs per thread
+_EXACT_INDEXES = 256        # parsed .fai indexes kept per process
+_EXACT_INDEX_LOCK = threading.Lock()
+_EXACT_LOCAL = threading.local()
+
+
+class _ExactThreadReaders(OrderedDict):
+    """One thread's open readers; closes their files when the thread ends."""
+
+    def __del__(self):
+        for reader in self.values():
+            try:
+                os.close(reader.fd)
+            except OSError:
+                pass
+
+
+def _exact_reader(path: str, index: Optional[str] = None):
+    """Cached FASTA reader of this thread. Thousands of assemblies must not
+    stay open (file descriptors: select() fails above 1024) or parsed (RAM):
+    each thread keeps a few files open (least recently used closed first) over
+    a shared, bounded cache of parsed indexes. Readers are never shared
+    between threads, so closing one cannot break another thread's read."""
+    import graphreftovcf as core
+    readers = getattr(_EXACT_LOCAL, "readers", None)
+    if readers is None:
+        readers = _EXACT_LOCAL.readers = _ExactThreadReaders()
+    reader = readers.pop(path, None)
+    if reader is None:
+        with _EXACT_INDEX_LOCK:
+            template = _EXACT_READERS.pop(path, None)
+        if template is None:
+            template = core.IndexedFastaReader(path, index)
+            os.close(template.fd)
+            template.fd = None
+        with _EXACT_INDEX_LOCK:
+            _EXACT_READERS[path] = template        # most recently used last
+            while len(_EXACT_READERS) > _EXACT_INDEXES:
+                _EXACT_READERS.pop(next(iter(_EXACT_READERS)))
+        # Shares the parsed index; __setstate__ opens this thread's file.
+        reader = copy.copy(template)
+    readers[path] = reader
+    while len(readers) > _EXACT_OPEN_FILES:
+        os.close(readers.pop(next(iter(readers))).fd)
+    return reader
+
+
+def _exact_fetch(paths, name: str, start: int, end: int) -> Optional[str]:
+    """Forward bases of name:[start, end) from the first FASTA holding it."""
+    for path in paths:
+        reader = _exact_reader(path)
+        if name in reader.index:
+            if 0 <= start <= end <= reader.index[name][0]:
+                return reader.fetch(name, start, end, "+")
+            return None
+    return None
+
+
+def _exact_with(item, **changes):
+    """Copy of an observation (dataclass) or nested candidate namespace."""
+    if dataclasses.is_dataclass(item):
+        return dataclasses.replace(item, **changes)
+    return types.SimpleNamespace(**{**vars(item), **changes})
+
+
+def _exact_window(w0, w1, sample, chrom, exact, path_sequence):
+    """Reference (top level) or parent-path (nested) bases of [w0, w1);
+    None when uncovered (top level) or outside the parent path."""
+    if path_sequence is not None:
+        return path_sequence[w0:w1] if 0 <= w0 <= w1 <= len(path_sequence) else None
+    if not exact_covered(exact["coverage"].get(sample), w0, w1):
+        return None
+    return _exact_fetch(exact["references"], chrom, w0, w1)
+
+
+def _exact_edit(observation):
+    """(reference start, end, bases) of an observation on its axis."""
+    if observation.svtype == "DEL":
+        return observation.pos, observation.pos + observation.size, ""
+    return observation.pos, max(observation.pos, observation.end), observation.sequence
+
+
+def _exact_apply(bases, w0, edits):
+    """Window bases [w0, ...) with non-overlapping edits applied."""
+    pieces, cursor = [], w0
+    for start, end, sequence in sorted(edits, key=lambda e: (e[0], e[1])):
+        pieces.append(bases[cursor - w0:start - w0])
+        pieces.append(sequence)
+        cursor = end
+    pieces.append(bases[cursor - w0:])
+    return "".join(pieces)
+
+
+def _exact_query_shift(others, start, end):
+    """Query-minus-reference length of the edits lying in [start, end)."""
+    return sum(
+        len(sequence) - (e - s)
+        for s, e, sequence in map(_exact_edit, others)
+        if start <= s and e <= end
+    )
+
+
+def _exact_walk(body, window, target, first, last, w0, e_r, qa, qb, strand,
+                flank_gaps, flank_snps=False):
+    """Split a window alignment (query window vs flank + representative +
+    flank) at the representative [first, last) of the target.
+
+    Returns (representative ops, query offsets consumed there, flank edits)
+    or a rejection reason. A gap at a junction belongs to the
+    representative; with flank_gaps, other gaps become the sample's variants
+    on the flank axis: ("DEL"|"INS", start, end, bases, query start, end).
+    """
+    def reference_at(position):
+        # Target offset in a flank -> reference (parent path) coordinate.
+        return w0 + position if position < first else e_r + position - last
+
+    def query_at(f0, f1):
+        return (qb - f1, qb - f0) if strand == "-" else (qa + f0, qa + f1)
+
+    flank_edits: List[tuple] = []
+    rep_ops: List[str] = []
+    query_range: List[int] = []
+    junction = None
+    t = q = 0
+    for count_text, op in _FAST_CHUNK_OPS.findall(body):
+        count = int(count_text)
+        if junction is None and t >= first:
+            junction = q
+        if op == "I":
+            if not first <= t <= last:
+                if not flank_gaps:
+                    return "flank_edit"
+                point = reference_at(t)
+                flank_edits.append(("INS", point, point, window[q:q + count],
+                                    *query_at(q, q + count)))
+                q += count
+                continue
+            rep_ops.append(f"{count}I")
+            query_range += [q, q + count]
+            q += count
+            continue
+        if op not in "=MXD":
+            return "alignment"
+        # Split the run at the representative's boundaries.
+        while count:
+            region_end = first if t < first else last if t < last else len(target)
+            step = min(count, region_end - t)
+            inside = first <= t < last
+            if not inside:
+                if op == "D" and flank_gaps:
+                    start = reference_at(t)
+                    flank_edits.append(("DEL", start, start + step, "", *query_at(q, q)))
+                elif op == "D":
+                    return "flank_edit"
+                elif window[q:q + step].upper() != target[t:t + step].upper():
+                    if not flank_snps:
+                        return "flank_edit"
+                    # F3: each flank mismatch is one SNP of the sample.
+                    for offset in range(step):
+                        if window[q + offset].upper() != target[t + offset].upper():
+                            point = reference_at(t + offset)
+                            flank_edits.append((
+                                "SNP", point, point + 1, window[q + offset].upper(),
+                                *query_at(q + offset, q + offset + 1),
+                            ))
+            else:
+                rep_ops.append(f"{step}{op}")
+                if op != "D":
+                    query_range += [q, q + step]
+            t += step
+            if op != "D":
+                q += step
+            count -= step
+            if junction is None and t >= first:
+                junction = q
+    return rep_ops, query_range, flank_edits, q if junction is None else junction
+
+
+def _exact_guard(function):
+    """A realignment that fails to align cancels only that move (reason
+    alignment_error): the member keeps its own record, so the merge stays
+    lossless instead of stopping."""
+    @functools.wraps(function)
+    def guarded(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except RuntimeError:
+            return None, "alignment_error"
+    return guarded
+
+
+@_exact_guard
+def _exact_realign_member(member, representative, exact, aligner_cache, core,
+                          path_sequence=None, flank_gaps=False, others=(),
+                          flank_snps=False):
+    """Move a member inserted at another breakpoint onto the representative.
+
+    Over the window between both breakpoints, the member's assembly bases are
+    aligned to reference flank + representative. The move is accepted only
+    when the sample's mapping covers the window and every edit falls inside
+    the representative (a gap at a junction counts as inside); the member's
+    allele and QUERYCOORD are then the query bases aligned to the
+    representative. Returns (moved observation, body) or (None, reason).
+    """
+    s_m, e_m = member.pos, max(member.pos, member.end)
+    s_r, e_r = representative.pos, max(representative.pos, representative.end)
+    w0, w1 = min(s_m, s_r), max(e_m, e_r)
+    bases = _exact_window(w0, w1, member.sample_index, getattr(representative, "chrom", ""),
+                          exact, path_sequence)
+    if bases is None:
+        return None, "uncovered"
+    left, right = bases[:s_r - w0], bases[e_r - w0:]
+    target = left + representative.sequence + right
+    # F2: the sample's other records inside the window change the query
+    # length between the window edges and the member.
+    lead = s_m - w0 + _exact_query_shift(others, w0, s_m)
+    tail = w1 - e_m + _exact_query_shift(others, e_m, w1)
+    fasta, fai = exact["queries"][member.sample_name]
+    reader = _exact_reader(fasta, fai)
+    if member.qry_strand == "-":
+        qa, qb = member.qry_start - tail, member.qry_end + lead
+    else:
+        qa, qb = member.qry_start - lead, member.qry_end + tail
+    length = reader.index.get(member.qry_contig, (0,))[0]
+    if qa < 0 or qb > length:
+        return None, "query_bounds"
+    window = reader.fetch(member.qry_contig, qa, qb, "+")
+    if member.qry_strand == "-":
+        window = core.revcomp(window)
+    if window[lead:lead + len(member.sequence)].upper() != member.sequence.upper():
+        return None, "query_window"
+    # The sample must have no other variant in the window besides its known
+    # records (others): its bases there are the reference (or parent path)
+    # with exactly those applied.
+    expected = _exact_apply(bases, w0, [_exact_edit(member), *map(_exact_edit, others)])
+    if window.upper() != expected.upper():
+        return None, "other_variant"
+    _similarity, body = _final_pair_alignment(window, target, aligner_cache, core)
+    first, last = len(left), len(left) + len(representative.sequence)
+    walked = (_exact_walk(body, window, target, first, last, w0, e_r, qa, qb,
+                          member.qry_strand, flank_gaps, flank_snps)
+              if body is not None else "alignment")
+    # A shifted pure insertion in non-repeat sequence aligns more cheaply as
+    # mismatches than as the two gaps it really is. The window is exactly the
+    # reference plus this member (purity), so build that alignment directly:
+    # the skipped reference bases join the moved allele at the junction and
+    # are deleted from the flank. SNPs of the sample there travel with them.
+    if (flank_gaps and all(other.svtype == "SNP" for other in others)
+            and s_m == e_m and s_r == e_r and s_m != s_r
+            and (isinstance(walked, str)
+                 or any(edit[0] == "SNP" for edit in walked[2]))):
+        shift = abs(s_m - s_r)
+        _similarity, member_body = _final_pair_alignment(
+            member.sequence, representative.sequence, aligner_cache, core,
+        )
+        if member_body is None:
+            member_body = _pure_insertion_alignment_body(
+                member.sequence, representative.sequence,
+            )
+        canonical = (f"{shift}I{member_body}{shift}D" if s_m > s_r
+                     else f"{shift}D{member_body}{shift}I")
+        canonical_walk = _exact_walk(canonical, window, target, first, last, w0, e_r,
+                                     qa, qb, member.qry_strand, flank_gaps, flank_snps)
+        if not isinstance(canonical_walk, str):
+            walked = canonical_walk
+    if isinstance(walked, str):
+        return None, walked
+    rep_ops, query_range, flank_edits, _junction = walked
+    if not query_range:
+        return None, "empty"
+    f0, f1 = min(query_range), max(query_range)
+    rep_body = "".join(rep_ops)
+    _fast_validate_alignment_body(
+        rep_body, f1 - f0, len(representative.sequence),
+        context="shifted insertion realignment",
+    )
+    if member.qry_strand == "-":
+        new_start, new_end = qb - f1, qb - f0
+    else:
+        new_start, new_end = qa + f0, qa + f1
+    moved = _exact_with(
+        member, pos=s_r, end=e_r, size=f1 - f0, sequence=window[f0:f1],
+        qry_start=new_start, qry_end=new_end,
+    )
+    return moved, ((rep_body, flank_edits, (qa, qb)) if flank_gaps else rep_body)
+
+
+@_exact_guard
+def _exact_realign_deletion(member, representative, exact, core, path_sequence=None,
+                            flank_gaps=False, others=(), flank_snps=False):
+    """Express a member deletion as the representative deletion plus nested
+    insertions of the reference bases the member keeps.
+
+    Over the window spanning both deletions, the member's assembly bases
+    must equal the reference flanks outside the representative's interval;
+    the bases between them are what the member keeps inside it. Returns
+    (moved observation, [(offset, bases, query_start, query_end)]) or
+    (None, reason). Offsets are on the deleted interval: kept bases before
+    the member's deletion sit at 0, those after it at the deletion length.
+    """
+    s_m, e_m = member.pos, member.pos + member.size
+    s_r, e_r = representative.pos, representative.pos + representative.size
+    w0, w1 = min(s_m, s_r), max(e_m, e_r)
+    bases = _exact_window(w0, w1, member.sample_index, getattr(representative, "chrom", ""),
+                          exact, path_sequence)
+    if bases is None:
+        return None, "uncovered"
+    left, right = bases[:s_r - w0], bases[e_r - w0:]
+    lead = s_m - w0 + _exact_query_shift(others, w0, s_m)
+    tail = w1 - e_m + _exact_query_shift(others, e_m, w1)
+    fasta, fai = exact["queries"][member.sample_name]
+    reader = _exact_reader(fasta, fai)
+    point = member.qry_start
+    if member.qry_strand == "-":
+        qa, qb = point - tail, point + lead
+    else:
+        qa, qb = point - lead, point + tail
+    if qa < 0 or qb > reader.index.get(member.qry_contig, (0,))[0]:
+        return None, "query_bounds"
+    window = reader.fetch(member.qry_contig, qa, qb, "+")
+    if member.qry_strand == "-":
+        window = core.revcomp(window)
+    # No other variant of the sample inside the window besides its known
+    # records (see member realignment).
+    expected = _exact_apply(bases, w0, [_exact_edit(member), *map(_exact_edit, others)])
+    if window.upper() != expected.upper():
+        return None, "other_variant"
+
+    def query_interval(f0, f1):
+        return (qb - f1, qb - f0) if member.qry_strand == "-" else (qa + f0, qa + f1)
+
+    if others:
+        if not flank_gaps:
+            return None, "other_variant"
+        # F2: the window also holds the sample's other records, so align it
+        # to the flanks around the representative's (empty) deleted
+        # interval: junction bases are kept inside it, flank gaps replace
+        # the other records.
+        target = left + right
+        if window:
+            _similarity, body = _final_pair_alignment(window, target, {}, core)
+            if body is None:
+                return None, "alignment"
+        else:
+            body = f"{len(target)}D"
+        walked = _exact_walk(body, window, target, len(left), len(left), w0, e_r,
+                             qa, qb, member.qry_strand, True, flank_snps)
+        if isinstance(walked, str):
+            return None, walked
+        _ops, query_range, flank_edits, junction = walked
+        f0, f1 = (min(query_range), max(query_range)) if query_range else (junction, junction)
+        kept = window[f0:f1]
+        offset = 0 if s_m >= s_r else e_r - s_r
+        span = query_interval(f0, f1)
+        moved = _exact_with(member, pos=s_r, end=representative.end,
+                            qry_start=span[0], qry_end=span[1])
+        return moved, ([(offset, kept, *span)] if kept else [], flank_edits, (qa, qb))
+
+    if (len(window) < len(left) + len(right)
+            or window[:len(left)].upper() != left.upper()
+            or window[len(window) - len(right):].upper() != right.upper()):
+        if not flank_gaps:
+            return None, "flank_edit"
+        # F1: the window is exactly the reference minus the member's
+        # deletion (purity), so the representation follows from intervals:
+        # bases kept inside the representative's deletion are nested
+        # insertions, member bases deleted outside it are flank deletions.
+        if not (s_m < e_r and s_r < e_m):
+            return None, "flank_edit"
+        point = s_m - w0                     # deletion point in the window
+        nested, flank_edits = [], []
+        if s_m > s_r:                        # kept before the member's deletion
+            nested.append((0, bases[s_r - w0:s_m - w0],
+                           *query_interval(s_r - w0, point)))
+        if e_m < e_r:                        # kept after it
+            nested.append((e_r - s_r, bases[e_m - w0:e_r - w0],
+                           *query_interval(point, point + e_r - e_m)))
+        if s_m < s_r:
+            flank_edits.append(("DEL", s_m, s_r, "", *query_interval(point, point)))
+        if e_m > e_r:
+            flank_edits.append(("DEL", e_r, e_m, "", *query_interval(point, point)))
+        f0 = s_r - w0 if s_m > s_r else point
+        f1 = point + max(0, e_r - e_m)
+        span = query_interval(f0, f1)
+        moved = _exact_with(
+            member, pos=s_r, end=representative.end,
+            qry_start=span[0], qry_end=span[1],
+        )
+        return moved, (nested, flank_edits, (qa, qb))
+    kept = window[len(left):len(window) - len(right)]
+
+    if s_r <= s_m and e_m <= e_r:
+        split = s_m - s_r
+        pieces = [(0, kept[:split], len(left)),
+                  (e_r - s_r, kept[split:], len(left) + split)]
+    else:
+        pieces = [(0, kept, len(left))]
+    nested = [
+        (offset, bases, *query_interval(start, start + len(bases)))
+        for offset, bases, start in pieces if bases
+    ]
+    span = query_interval(len(left), len(left) + len(kept))
+    moved = _exact_with(
+        member, pos=s_r, end=representative.end,
+        qry_start=span[0], qry_end=span[1],
+    )
+    return moved, ((nested, [], (qa, qb)) if flank_gaps else nested)
+
+
+def _exact_split_shifted(row_id, observations, rep_slot, bodies, exact, decisions,
+                         extras=(), flank_rows=()):
+    """Rows for one refined INS/DEL group under --exact, from the locus plan
+    (see _exact_plan_moves): the kept group with moved members, one row per
+    distinct separated member, and one row per flank gap; superseded
+    members are dropped (their bases are in another move's flank gaps)."""
+    if decisions[rep_slot] == ("drop",):
+        # A superseded single-record group has no row (it owns no flank SVs:
+        # only groups with a moved member do).
+        return []
+    kept, kept_bodies, separate = [], [], []
+    representative = observations[rep_slot]
+    for slot, (observation, body, decision) in enumerate(
+        zip(observations, bodies, decisions),
+    ):
+        if slot == rep_slot and decision is not None and decision[0] == "move":
+            # A single-member row realigned: its new allele represents it.
+            representative = decision[1]
+            kept.append(representative)
+            kept_bodies.append(decision[2])
+        elif slot == rep_slot or decision is None:
+            kept.append(observation)
+            kept_bodies.append(body)
+        elif decision[0] == "drop":
+            continue
+        elif decision[0] == "separate":
+            separate.append(observation)
+        else:
+            _move, moved, result, _edits = decision
+            kept.append(moved)
+            kept_bodies.append(result)
+    # F4: flank SVs of other moves relinked into this group.
+    for observation, body in extras:
+        kept.append(observation)
+        kept_bodies.append(body)
+    groups = [(row_id, kept, kept.index(representative), kept_bodies, None)]
+    # Separated members identical in position, span and bases share a row.
+    identical: Dict[tuple, list] = {}
+    for observation in separate:
+        key = (observation.pos, observation.end, observation.size,
+               observation.sequence.upper())
+        identical.setdefault(key, []).append(observation)
+    for number, members in enumerate(identical.values(), 1):
+        separate_id = f"{row_id}_S{number}"
+        bodies_same = [None] + [
+            (f"{len(member.sequence)}=" if member.sequence else None)
+            for member in members[1:]
+        ]
+        groups.append((separate_id, members, 0, bodies_same,
+                       (separate_id, members[0].size)))
+    # Flank SVs not relinked: one row per distinct allele (all its samples).
+    for number, members in enumerate(flank_rows, 1):
+        flank_id = f"{row_id}_F{number}"
+        bodies_same = [None] + [
+            (f"{len(member.sequence)}=" if member.sequence else None)
+            for member in members[1:]
+        ]
+        groups.append((flank_id, list(members), 0, bodies_same,
+                       (flank_id, members[0].size)))
+    return groups
+
+
+def _exact_flank_observation(member, edit, exact):
+    """One flank gap of a moved member as an observation of its sample."""
+    kind, start, end, bases, query_start, query_end = edit
+    size = end - start if kind == "DEL" else len(bases)
+    anchor = _exact_fetch(exact["references"], member.chrom, start - 1, start) if start else None
+    return dataclasses.replace(
+        member, pos=start, end=end if kind == "DEL" else start,
+        ref=(anchor or "N").upper(), alt=f"<{kind}>", info_text="",
+        svtype=kind, size=size, sequence=bases, qry_start=query_start,
+        qry_end=query_end, cigar=f">{size}D" if kind == "DEL" else f">{size}I",
+        pa_class="primary",
+    )
+
+
+def _fast_emit_task(args):
+    """Emit task with its insertion-SNP spools appended per bundle at the end
+    (one open and lock per bundle, not per insertion)."""
+    import graphvcfmerge_insertion_store as insertion_store
+    with insertion_store.batch():
+        return _fast_emit_task_rows(args)
+
+
+def _fast_emit_task_rows(
     args: Tuple[List[tuple], Dict[int, List[Tuple[int, int]]]],
 ) -> List[Tuple[int, str]]:
     """Build final VCF rows for a batch of refined groups.
@@ -4892,7 +5745,8 @@ def _fast_emit_task(
     Member lines are fetched by byte offset; no alignment happens here -
     each member's own EXTENDGRAPHCIGAR is carried through unchanged.
     """
-    batch, coverage = args
+    batch, coverage = args[:2]
+    exact = args[2] if len(args) > 2 else None
     context = _FAST_CONTEXT
     sample_count = len(context["sample_names"])
     output: List[Tuple[int, str]] = []
@@ -4908,108 +5762,141 @@ def _fast_emit_task(
     ) in batch:
         observations = [fetched[ref] for ref in member_refs]
         rep_slot = member_refs.index(rep_ref)
-        representative = observations[rep_slot]
-        normalized_bodies = list(member_bodies)
-        output_pos = representative.pos
-        events_by_sample: Dict[int, List[List[str]]] = defaultdict(list)
-        for slot, observation in enumerate(observations):
-            if svtype == "INS":
-                if slot == rep_slot:
-                    member_cigar = _sample_self_cigar(
-                        len(representative.sequence),
-                    )
-                else:
-                    if normalized_bodies[slot] is None:
-                        normalized_bodies[slot] = (
-                            _pure_insertion_alignment_body(
-                                observation.sequence,
-                                representative.sequence,
-                            )
+        groups = [(row_id, observations, rep_slot, list(member_bodies), None)]
+        if svtype in ("INS", "DEL") and exact is not None:
+            group_plan = exact.get("plan", {}).get(emit_index, {})
+            groups = _exact_split_shifted(
+                row_id, observations, rep_slot, list(member_bodies), exact,
+                [group_plan.get(ref) for ref in member_refs],
+                group_plan.get("__extra__", ()), group_plan.get("__flank__", ()),
+            )
+        for row_id, observations, rep_slot, member_bodies, extra in groups:
+            representative = observations[rep_slot]
+            # A flank-gap row of an insertion group can be a deletion.
+            svtype = representative.svtype
+            normalized_bodies = list(member_bodies)
+            output_pos = representative.pos
+            events_by_sample: Dict[int, List[List[str]]] = defaultdict(list)
+            for slot, observation in enumerate(observations):
+                if svtype == "INS":
+                    if slot == rep_slot:
+                        member_cigar = _sample_self_cigar(
+                            len(representative.sequence),
                         )
                     else:
-                        _fast_validate_alignment_body(
+                        if normalized_bodies[slot] is None:
+                            normalized_bodies[slot] = (
+                                _pure_insertion_alignment_body(
+                                    observation.sequence,
+                                    representative.sequence,
+                                )
+                            )
+                        else:
+                            _fast_validate_alignment_body(
+                                normalized_bodies[slot],
+                                len(observation.sequence),
+                                len(representative.sequence),
+                                context=(
+                                    f"merged insertion {row_id!r}, sample "
+                                    f"{observation.sample_name!r}"
+                                ),
+                            )
+                        member_cigar = _sample_alignment_cigar(
                             normalized_bodies[slot],
-                            len(observation.sequence),
-                            len(representative.sequence),
-                            context=(
-                                f"merged insertion {row_id!r}, sample "
-                                f"{observation.sample_name!r}"
-                            ),
                         )
-                    member_cigar = _sample_alignment_cigar(
-                        normalized_bodies[slot],
-                    )
+                else:
+                    member_cigar = observation.cigar
+                events_by_sample[observation.sample_index].append(
+                    _observation_event_values(
+                        observation, member_cigar, output_pos,
+                    ),
+                )
+            if svtype == "INS":
+                # Preserve a non-empty reference replacement span (for example,
+                # a net insertion encoded as D+I).  Future merge passes must be
+                # able to apply interval-gap rather than POS-only clustering.
+                end = max(output_pos, representative.end)
+                main_cigar = _named_self_cigar(
+                    row_id, len(representative.sequence),
+                )
+                info_sequence = representative.sequence
             else:
-                member_cigar = observation.cigar
-            events_by_sample[observation.sample_index].append(
-                _observation_event_values(
-                    observation, member_cigar, output_pos,
-                ),
+                end = max(value.end for value in observations)
+                main_cigar = representative.cigar
+                info_sequence = representative.sequence
+            sample_fields = _sample_fields_for_events(
+                events_by_sample, sample_count, coverage,
+                output_pos, end, uncertain_samples,
             )
-        if svtype == "INS":
-            # Preserve a non-empty reference replacement span (for example,
-            # a net insertion encoded as D+I).  Future merge passes must be
-            # able to apply interval-gap rather than POS-only clustering.
-            end = max(output_pos, representative.end)
-            main_cigar = _named_self_cigar(
-                row_id, len(representative.sequence),
+            info = _base_info(
+                representative, svtype, end,
+                len(events_by_sample), representative.size,
+                info_sequence, main_cigar,
             )
-            info_sequence = representative.sequence
-        else:
-            end = max(value.end for value in observations)
-            main_cigar = representative.cigar
-            info_sequence = representative.sequence
-        sample_fields = _sample_fields_for_events(
-            events_by_sample, sample_count, coverage,
-            output_pos, end, uncertain_samples,
-        )
-        info = _base_info(
-            representative, svtype, end,
-            len(events_by_sample), representative.size,
-            info_sequence, main_cigar,
-        )
-        row = "\t".join([
-            representative.chrom, str(output_pos), row_id,
-            representative.ref, f"<{svtype}>", representative.qual,
-            "PASS", info, SV_FORMAT, *sample_fields,
-        ])
-        if svtype == "INS" and context.get("insertion_snps"):
-            from graphvcfmerge_snp_compact import save_insertion
-            save_insertion(
-                context["insertion_snps"], row_id,
-                [value.sequence for value in observations], normalized_bodies,
-                [(value.sample_index, value.qry_contig, value.label, value.label_h,
-                  value.qry_start, value.qry_end, value.qry_strand) for value in observations],
-                rep_slot, context["sample_names"], owner=representative.chrom,
-            )
-        path_info = None
-        if (
-            svtype == "INS"
-            and int(context["var_in_insert"]) > 0
-            and len(events_by_sample) > 1
-            and representative.size > 2 * int(context["minsvsize"])
-        ):
-            path_info = (
-                len(representative.sequence),
-                {value.sample_index for value in observations},
-                _fast_extract_candidates(
-                    normalized_bodies,
-                    [value.sequence for value in observations],
+            row = "\t".join([
+                representative.chrom, str(output_pos), row_id,
+                representative.ref, f"<{svtype}>", representative.qual,
+                "PASS", info, SV_FORMAT, *sample_fields,
+            ])
+            if svtype == "INS" and context.get("insertion_snps"):
+                from graphvcfmerge_snp_compact import save_insertion
+                save_insertion(
+                    context["insertion_snps"], row_id,
+                    [value.sequence for value in observations], normalized_bodies,
+                    [(value.sample_index, value.qry_contig, value.label, value.label_h,
+                      value.qry_start, value.qry_end, value.qry_strand) for value in observations],
+                    rep_slot, context["sample_names"], owner=representative.chrom,
+                )
+            path_info = None
+            if (
+                svtype == "INS"
+                and int(context["var_in_insert"]) > 0
+                # Count observations, not samples: one sample's two nearby
+                # insertions can share a group and still differ.
+                and len(observations) > 1
+            ):
+                path_info = (
+                    len(representative.sequence),
+                    {value.sample_index for value in observations},
+                    _fast_extract_candidates(
+                        normalized_bodies,
+                        [value.sequence for value in observations],
+                        [
+                            (
+                                value.sample_index, value.qry_contig,
+                                value.label, value.label_h,
+                                value.qry_start, value.qry_end,
+                                value.qry_strand,
+                                getattr(value, "liftover_category", "."),
+                                getattr(value, "pa_class", "primary"),
+                            )
+                            for value in observations
+                        ],
+                        rep_slot,
+                        snps=exact is not None,
+                    ),
+                ) + ((representative.sequence,) if exact is not None else ())
+            elif svtype == "DEL" and any(isinstance(body, list) for body in member_bodies):
+                # --exact: bases a member keeps inside the representative
+                # deletion are nested insertions on the deleted interval.
+                path_info = (
+                    representative.size,
+                    {value.sample_index for value in observations},
                     [
-                        (
+                        ("INS", offset, offset, len(bases), bases, (
                             value.sample_index, value.qry_contig,
-                            value.label, value.label_h,
-                            value.qry_start, value.qry_end,
+                            value.label, value.label_h, start, end,
                             value.qry_strand,
                             getattr(value, "liftover_category", "."),
                             getattr(value, "pa_class", "primary"),
-                        )
-                        for value in observations
+                        ))
+                        for value, pieces in zip(observations, member_bodies)
+                        if isinstance(pieces, list)
+                        for offset, bases, start, end in pieces
                     ],
-                    rep_slot,
-                ),
-            )
-        output.append((emit_index, row, path_info))
+                    "",
+                )
+            output.append((emit_index, row, path_info, extra))
     return output
 
 
@@ -5018,6 +5905,7 @@ def _fast_extract_candidates(
     member_sequences: list,
     member_sources: list,
     rep_slot: int,
+    snps: bool = False,
 ) -> list:
     """Residual variant candidates from one merged insertion's member
     alignments: every I run is a candidate insertion (with its
@@ -5038,12 +5926,31 @@ def _fast_extract_candidates(
         )
         _template_shift, body = _fast_split_row_position_shift(body)
         member_seq = member_sequences[slot]
-        source = member_sources[slot]
+        # Field 9: the parent observation (member slot), so a sample with
+        # two copies of this parent (e.g. two dup copies of one template)
+        # keeps their candidates apart in --exact nested planning.
+        source = tuple(member_sources[slot][:9])
+        if len(source) == 9:
+            source += (slot,)
         rep_pos = 0
         query_pos = 0
         for count_text, op in _FAST_CHUNK_OPS.findall(body):
             count = int(count_text)
             if op in "=MX":
+                if snps and op != "=":
+                    # --exact: mismatches (the member's INS_SNPs on this path)
+                    # are known records for nested realignment, not clustered.
+                    template = member_sequences[rep_slot]
+                    for offset in range(count):
+                        ref = template[rep_pos + offset].upper()
+                        alt = member_seq[query_pos + offset].upper()
+                        if ref != alt and ref in "ACGT" and alt in "ACGT":
+                            candidates.append((
+                                "SNP", rep_pos + offset, rep_pos + offset + 1, 1, alt,
+                                _fast_query_source_slice(
+                                    source, query_pos + offset, query_pos + offset + 1,
+                                ),
+                            ))
                 rep_pos += count
                 query_pos += count
             elif op in "DH":
@@ -5096,62 +6003,508 @@ def _fast_query_source_slice(source: tuple, start: int, end: int) -> tuple:
     )
 
 
-def _fast_map_point(body: str, q_start: int, t_start: int, point: int):
-    """Translate a query-axis point through one chunk alignment body to
-    the target axis; None when the point is not reachable."""
-    q_pos = q_start
-    t_pos = t_start
-    for count_text, op in _FAST_CHUNK_OPS.findall(body):
-        count = int(count_text)
-        if op in "=MX":
-            if q_pos <= point < q_pos + count:
-                return t_pos + (point - q_pos)
-            q_pos += count
-            t_pos += count
-        elif op in "DH":
-            t_pos += count
-        elif op in "IS":
-            if q_pos <= point < q_pos + count:
-                return t_pos
-            q_pos += count
-    if point == q_pos:
-        return t_pos
-    return None
+def _exact_round_item(candidates, index):
+    """A nested candidate as an observation-like namespace."""
+    return _exact_round_namespace(candidates[index])
 
 
-def _fast_remap_candidates(
-    candidates: list, mappings: tuple,
-) -> Tuple[list, list]:
-    """Split one path's candidates into (kept, moved): a candidate whose
-    interval falls fully inside a partially-aligned portion moves to the
-    target path with coordinates translated through the chunk body;
-    anything straddling a boundary stays on its original path."""
-    if not mappings:
-        return candidates, []
-    kept: list = []
-    moved: list = []
-    for candidate in candidates:
-        svtype, pos, end, size, seq, source = candidate
-        placed = False
-        for q0, q1, target_id, t0, _t1, body in mappings:
-            if not (q0 <= pos and end <= q1):
-                continue
-            new_pos = _fast_map_point(body, q0, t0, pos)
-            new_end = (
-                new_pos if svtype == "INS"
-                else _fast_map_point(body, q0, t0, end)
-            )
-            if new_pos is None or new_end is None or new_end < new_pos:
-                break
-            moved.append((
-                target_id,
-                (svtype, new_pos, new_end, size, seq, source),
+def _exact_round_namespace(candidate):
+    kind, pos, end, size, sequence, source = candidate
+    return types.SimpleNamespace(
+        svtype=kind, pos=pos, end=end, size=size, sequence=sequence,
+        sample_index=source[0],
+        sample_name=_FAST_CONTEXT["sample_names"][source[0]],
+        qry_contig=source[1], qry_start=source[4], qry_end=source[5],
+        qry_strand=source[6], chrom="",
+    )
+
+
+def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
+    """Decide every shifted-member move of one nested round (--exact).
+
+    Same rules as the top level (_exact_plan_moves), with the parent path's
+    bases as the reference: moves in a fixed order may supersede the
+    sample's other candidates inside their window (except representatives of
+    multi-member groups and already moved ones), and each accepted move locks
+    its moved allele and flank gaps. groups: [(svtype, pick, chosen)].
+    The sample's mismatches on the parent path (its INS_SNPs, SNP
+    candidates) inside a window are known records too: superseded ones are
+    dropped and flank mismatches become new INS_SNPs (records for the SNP
+    concat stage). Returns ({group number: {candidate index: decision}},
+    {"chrom": path, "drops": [...], "adds": [...]}).
+    """
+    import graphreftovcf as core
+    sample_names = _FAST_CONTEXT["sample_names"]
+    snp_records = {"chrom": path_id, "drops": [], "adds": []}
+
+    def owner_of(source):
+        # Records are kept per parent observation: two copies of this parent
+        # in one sample share path offsets but not their edits.
+        return (source[0], source[9] if len(source) > 9 else None)
+
+    snps_by_sample: Dict[tuple, list] = defaultdict(list)
+    for number_, candidate in enumerate(candidates):
+        if candidate[0] == "SNP":
+            snps_by_sample[owner_of(candidate[5])].append((candidate[1], number_))
+    superseded_snps: set = set()
+    for values in snps_by_sample.values():
+        values.sort()
+    snp_positions = {sample: [pos for pos, _index in values]
+                     for sample, values in snps_by_sample.items()}
+
+    def window_snps(sample, contig, w0, w1):
+        values = snps_by_sample.get(sample, ())
+        positions = snp_positions.get(sample, ())
+        return [index for _pos, index in values[bisect.bisect_left(positions, w0):
+                                                 bisect.bisect_left(positions, w1)]
+                if candidates[index][5][1] == contig]
+
+    def spool_point(source):
+        # INS_SNP QUERYCOORD: the base on '+', the base + 1 on '-'.
+        return source[4] if source[6] == "+" else source[5]
+
+    def record_snps(member_sample, contig, strand, snp_indexes, edits):
+        """Drops for superseded INS_SNPs, adds for new flank mismatches."""
+        name = sample_names[member_sample]
+        for snp_index in snp_indexes:
+            superseded_snps.add(snp_index)
+            candidate = candidates[snp_index]
+            snp_records["drops"].append((name, candidate[1] + 1, candidate[4], contig,
+                                         spool_point(candidate[5]), strand))
+        for kind, start, _end, alt, query_start, query_end in edits:
+            if kind == "SNP":
+                snp_records["adds"].append((
+                    name, start + 1, path_sequence[start].upper(), alt, contig,
+                    query_start if strand == "+" else query_end, strand,
+                ))
+
+    def span(index):
+        kind, pos, end, size, _sequence, _source = candidates[index]
+        return (pos, pos + size) if kind == "DEL" else (pos, max(pos, end))
+
+    by_sample: Dict[int, list] = defaultdict(list)
+    moves = []
+    for number, (svtype, pick, chosen) in enumerate(groups):
+        rep_span = span(pick)
+        for index, _body in chosen:
+            member_span = span(index)
+            by_sample[owner_of(candidates[index][5])].append((
+                member_span[0], member_span[1], index, number,
+                index == pick and len(chosen) > 1,
             ))
-            placed = True
+            if index != pick and member_span != rep_span:
+                moves.append((
+                    min(member_span[0], rep_span[0]), max(member_span[1], rep_span[1]),
+                    number, index, pick, svtype,
+                ))
+    moves.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    # One allele per parent observation at a group's breakpoint (as at the
+    # top level): members staying at the representative's span and moves
+    # accepted into the group hold it; members inside the move's window do
+    # not (the move supersedes them).
+    move_indexes = {move[3] for move in moves}
+    group_holders: Dict[tuple, list] = defaultdict(list)
+    for number_, (_svtype, _pick, chosen_) in enumerate(groups):
+        for index_, _body in chosen_:
+            group_holders[(number_, owner_of(candidates[index_][5]))].append(index_)
+
+    def holds_breakpoint(number, holder, index, inside):
+        superseded_here = {record[2] for record in inside}
+        for other in group_holders.get((number, holder), ()):
+            if other == index or other in superseded_here:
+                continue
+            decision = decisions.get(number, {}).get(other)
+            if decision is None:
+                if other not in move_indexes:
+                    return True
+            elif decision[0] == "move":
+                return True
+        return False
+
+    by_sample = {sample: _ExactRecords(records) for sample, records in by_sample.items()}
+    decisions: Dict[int, dict] = defaultdict(dict)
+    moved, superseded = set(), set()
+    locked: Dict[int, _ExactLocks] = defaultdict(_ExactLocks)
+    new_spans: Dict[int, _ExactSpans] = defaultdict(_ExactSpans)
+    flank_owned: List[tuple] = []     # (owning group number, flank candidate)
+    reasons: Dict[str, int] = defaultdict(int)
+    cache: dict = {}
+    for w0, w1, number, index, pick, svtype in moves:
+        if index in superseded:
+            continue
+        sample = owner_of(candidates[index][5])
+
+        def inside_window(record):
+            if record[2] == pick:
+                return True
+            if record[0] == record[1]:
+                return w0 < record[0] < w1
+            return record[0] < w1 and w0 < record[1]
+
+        inside = [record for record in by_sample[sample].near(w0, w1)
+                  if record[2] != index and inside_window(record)]
+        reason = None
+        if any(record[0] < w0 or record[1] > w1 for record in inside):
+            reason = "other_crosses_window"
+        elif any(record[4] for record in inside):
+            reason = "other_is_representative"
+        elif any(record[2] in moved for record in inside):
+            reason = "other_moved"
+        elif any(record[2] in superseded for record in inside):
+            reason = "other_superseded"
+        elif new_spans[sample].touches(w0, w1):
+            reason = "other_new"
+        elif holds_breakpoint(number, sample, index, inside):
+            reason = "same_sample_breakpoint"
+        snp_indexes = []
+        if reason is None:
+            member = _exact_round_item(candidates, index)
+            snp_indexes = window_snps(sample, member.qry_contig, w0, w1)
+            if any(snp_index in superseded_snps for snp_index in snp_indexes):
+                reason = "other_superseded"
+        if reason is None:
+            representative = _exact_round_item(candidates, pick)
+            others = ([_exact_round_item(candidates, record[2]) for record in inside]
+                      + [_exact_round_item(candidates, snp_index) for snp_index in snp_indexes])
+            moved_item, result = (
+                _exact_realign_deletion(member, representative, exact, core, path_sequence,
+                                        flank_gaps=True, others=others, flank_snps=True)
+                if svtype == "DEL" else
+                _exact_realign_member(member, representative, exact, cache, core,
+                                      path_sequence, flank_gaps=True, others=others,
+                                      flank_snps=True)
+            )
+            if moved_item is None:
+                reason = result
+            else:
+                qa, qb = result[2]
+                if locked[sample[0]].overlaps(member.qry_contig, qa, qb):
+                    reason = "locked"
+        if reason is not None:
+            decisions[number][index] = ("separate", reason)
+            reasons[reason] += 1
+            continue
+        body, edits, _window = result
+        decisions[number][index] = ("move", moved_item, body, [])
+        reasons["moved_with_flank_edits" if edits else "moved"] += 1
+        moved.add(index)
+        for record in inside:
+            decisions[record[3]][record[2]] = ("drop",)
+            superseded.add(record[2])
+        locked[sample[0]].add(member.qry_contig, moved_item.qry_start,
+                           max(moved_item.qry_end, moved_item.qry_start + 1))
+        # The row replaces the representative's interval (a moved deletion
+        # deletes all of it; kept bases are nested inside), not the member's.
+        new_spans[sample].add(*span(pick))
+        source = candidates[index][5]
+        record_snps(sample[0], member.qry_contig, member.qry_strand, snp_indexes, edits)
+        reasons["superseded_ins_snp"] += len(snp_indexes)
+        for kind, start, end, bases, query_start, query_end in edits:
+            locked[sample[0]].add(member.qry_contig, query_start, max(query_end, query_start + 1))
+            new_spans[sample].add(start, end)
+            if kind == "SNP":
+                reasons["flank_ins_snp"] += 1
+                continue
+            flank_owned.append((number, _exact_round_flank_candidate(
+                source, (kind, start, end, bases, query_start, query_end))))
+    _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequence, exact, {
+        "by_sample": by_sample, "moved": moved, "superseded": superseded,
+        "locked": locked, "new_spans": new_spans, "cache": cache,
+        "window_snps": window_snps, "superseded_snps": superseded_snps,
+        "record_snps": record_snps, "owner_of": owner_of,
+    }, reasons)
+    if reasons:
+        print("[merge:exact] nested round: shifted member(s) "
+              + ", ".join(f"{key}={value}" for key, value in sorted(reasons.items())),
+              file=sys.stderr)
+    return dict(decisions), snp_records
+
+
+def _exact_round_flank_candidate(source, edit):
+    """A flank gap on the parent path as a nested candidate of its sample."""
+    kind, start, end, bases, query_start, query_end = edit
+    return (kind, start, end if kind == "DEL" else start,
+            end - start if kind == "DEL" else len(bases), bases,
+            (*source[:4], query_start, query_end, *source[6:]))
+
+
+def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequence,
+                        exact, state, reasons):
+    """Nested F4: place one round's flank SVs (shifted joins, up to 8 rounds).
+
+    A flank SV joins a group of this round with the same type, position and
+    span, or the closest similar one within merge_distance through a shifted
+    move on the parent path; that move's flank SVs relink in turn (up to 8
+    rounds). Leftovers share one row per identical allele. Decision entries:
+    "__extra__" -> [(candidate, body or nested pieces)], "__flank__" ->
+    [[candidate, ...]].
+    """
+    if not flank_owned:
+        return
+    import graphreftovcf as core
+    context = _FAST_CONTEXT
+    size_similarity = float(context["size_similarity"])
+    sequence_similarity = float(context["sequence_similarity"])
+    merge_distance = int(context["merge_distance"])
+    locked, new_spans = state["locked"], state["new_spans"]
+
+    def span_of(candidate):
+        kind, pos, end, size = candidate[:4]
+        return (pos, pos + size) if kind == "DEL" else (pos, max(pos, end))
+
+    by_type: Dict[str, list] = defaultdict(list)
+    for number, (svtype, pick, chosen) in enumerate(groups):
+        by_type[svtype].append((*span_of(candidates[pick]), number, pick, chosen))
+    for items in by_type.values():
+        items.sort(key=lambda item: (item[0], item[1], item[2]))
+    type_starts = {svtype: [item[0] for item in items] for svtype, items in by_type.items()}
+    # Samples of each group, built once and kept up to date (see add_extra).
+    group_samples: Dict[int, set] = {}
+
+    def samples_in(number, chosen):
+        if number not in group_samples:
+            group = decisions.get(number, {})
+            group_samples[number] = {
+                candidates[index][5][0] for index, _body in chosen
+                if group.get(index, ("keep",))[0] not in ("drop", "separate")
+            } | {candidate[5][0] for candidate, _body in group.get("__extra__", [])}
+        return group_samples[number]
+
+    def add_extra(number, candidate, body):
+        decisions.setdefault(number, {}).setdefault("__extra__", []).append((candidate, body))
+        if number in group_samples:
+            group_samples[number].add(candidate[5][0])
+
+    def similarity_to(candidate, rep_candidate):
+        smaller, larger = sorted((candidate[3], rep_candidate[3]))
+        if smaller / float(max(1, larger)) < size_similarity:
+            return None
+        if candidate[0] != "INS":
+            return 1.0
+        value = _truvari_seqsim(candidate[4], rep_candidate[4])
+        return value if value >= sequence_similarity else None
+
+    rows: Dict[tuple, list] = {}
+    queue = list(flank_owned)
+    for _round in range(8):
+        if not queue:
             break
-        if not placed:
-            kept.append(candidate)
-    return kept, moved
+        produced = []
+        for owner, candidate in queue:
+            span = span_of(candidate)
+            sample = candidate[5][0]
+            holder = state["owner_of"](candidate[5])
+            placed = False
+            options = []
+            items = by_type.get(candidate[0], ())
+            starts = type_starts.get(candidate[0], ())
+            for rep_start, rep_end, number, pick, chosen in items[
+                    bisect.bisect_left(starts, span[0] - merge_distance):
+                    bisect.bisect_right(starts, span[0] + merge_distance)]:
+                # A superseded representative's group has no row.
+                if pick in state["superseded"]:
+                    continue
+                if sample in samples_in(number, chosen):
+                    continue
+                similarity = similarity_to(candidate, candidates[pick])
+                if similarity is not None:
+                    options.append(((rep_start, rep_end) != span, abs(rep_start - span[0]),
+                                    -similarity, number, pick, (rep_start, rep_end)))
+            for shifted, _distance, _similarity, number, pick, rep_span in sorted(
+                options, key=lambda item: item[:4],
+            )[:3]:
+                rep_candidate = candidates[pick]
+                if not shifted:
+                    body = None
+                    if candidate[0] == "INS":
+                        _value, body = _final_pair_alignment(
+                            candidate[4], rep_candidate[4], state["cache"], core)
+                        if body is None:
+                            body = _pure_insertion_alignment_body(candidate[4], rep_candidate[4])
+                    add_extra(number, candidate, body)
+                    reasons["flank_sv_relinked"] += 1
+                    placed = True
+                    break
+                w0, w1 = min(span[0], rep_span[0]), max(span[1], rep_span[1])
+
+                def inside(start, end):
+                    if start == end:
+                        return w0 < start < w1
+                    return start < w1 and w0 < end
+
+                if new_spans[holder].touches(w0, w1, exclude=span):
+                    continue
+                sample_records = state["by_sample"].get(holder)
+                records = [record for record in (sample_records.near(w0, w1) if sample_records
+                                                 else ())
+                           if inside(record[0], record[1])
+                           and record[2] not in state["moved"]
+                           and record[2] not in state["superseded"]]
+                if any(record[0] < w0 or record[1] > w1 or record[4]
+                       or (record[2] == groups[record[3]][1]
+                           and decisions.get(record[3], {}).get("__extra__"))
+                       for record in records):
+                    continue
+                member = _exact_round_namespace(candidate)
+                snp_indexes = [index for index in state["window_snps"](
+                    holder, member.qry_contig, w0, w1)
+                    if index not in state["superseded_snps"]]
+                others = ([_exact_round_item(candidates, record[2]) for record in records]
+                          + [_exact_round_item(candidates, index) for index in snp_indexes])
+                representative = _exact_round_namespace(rep_candidate)
+                moved_item, result = (
+                    _exact_realign_deletion(member, representative, exact, core, path_sequence,
+                                            flank_gaps=True, others=others, flank_snps=True)
+                    if candidate[0] == "DEL" else
+                    _exact_realign_member(member, representative, exact, state["cache"], core,
+                                          path_sequence, flank_gaps=True, others=others,
+                                          flank_snps=True)
+                )
+                if moved_item is None:
+                    continue
+                qa, qb = result[2]
+                own_lock = (member.qry_contig, member.qry_start,
+                            max(member.qry_end, member.qry_start + 1))
+                if locked[sample].overlaps(member.qry_contig, qa, qb, exclude=own_lock):
+                    continue
+                body, edits, _window = result
+                source = (*candidate[5][:4], moved_item.qry_start, moved_item.qry_end,
+                          *candidate[5][6:])
+                moved_candidate = (
+                    ("DEL", rep_candidate[1], rep_candidate[2], candidate[3], "", source)
+                    if candidate[0] == "DEL" else
+                    ("INS", rep_candidate[1], rep_candidate[2], moved_item.size,
+                     moved_item.sequence, source)
+                )
+                add_extra(number, moved_candidate, body)
+                reasons["flank_sv_relinked_shifted"] += 1
+                for record in records:
+                    decisions.setdefault(record[3], {})[record[2]] = ("drop",)
+                    group_samples.pop(record[3], None)
+                    state["superseded"].add(record[2])
+                new_spans[holder].remove(*span)
+                new_spans[holder].add(*rep_span)   # the row's interval
+                locked[sample].add(member.qry_contig, moved_item.qry_start,
+                                   max(moved_item.qry_end, moved_item.qry_start + 1))
+                state["record_snps"](sample, member.qry_contig, member.qry_strand,
+                                     snp_indexes, edits)
+                for edit in edits:
+                    locked[sample].add(member.qry_contig, edit[4], max(edit[5], edit[4] + 1))
+                    new_spans[holder].add(edit[1], edit[2])
+                    if edit[0] != "SNP":
+                        produced.append((number, _exact_round_flank_candidate(candidate[5], edit)))
+                placed = True
+                break
+            if placed:
+                continue
+            key = (candidate[0], span[0], span[1], candidate[4].upper())
+            if key not in rows:
+                rows[key] = []
+                decisions.setdefault(owner, {}).setdefault("__flank__", []).append(rows[key])
+            rows[key].append(candidate)
+            reasons["flank_sv_row"] += 1
+        queue = produced
+    for owner, candidate in queue:    # recursion limit: keep as rows
+        span = span_of(candidate)
+        key = (candidate[0], span[0], span[1], candidate[4].upper())
+        if key not in rows:
+            rows[key] = []
+            decisions.setdefault(owner, {}).setdefault("__flank__", []).append(rows[key])
+        rows[key].append(candidate)
+
+
+def _exact_round_apply(svtype, pick, chosen, candidates, decisions):
+    """Apply one nested group's decisions: (kept chosen, separated indexes,
+    {index: kept pieces}, flank candidates), or None when the group's own
+    representative was superseded. Moved members replace their candidate."""
+    if decisions.get(pick) == ("drop",):
+        return None
+    rep_event = candidates[pick]
+    kept, separated, pieces, flank = [], [], {}, []
+    for index, body in chosen:
+        decision = decisions.get(index)
+        if index == pick or decision is None:
+            kept.append((index, body))
+        elif decision[0] == "drop":
+            continue
+        elif decision[0] == "separate":
+            separated.append(index)
+        else:
+            _move, moved, result, _edits = decision
+            event = candidates[index]
+            source = event[5]
+            source = (*source[:4], moved.qry_start, moved.qry_end, *source[6:])
+            if svtype == "DEL":
+                candidates[index] = ("DEL", rep_event[1], rep_event[2], event[3], "", source)
+                pieces[index] = result
+                kept.append((index, None))
+            else:
+                candidates[index] = ("INS", rep_event[1], rep_event[2], moved.size,
+                                     moved.sequence, source)
+                kept.append((index, result))
+    # Flank SVs relinked into this group, and shared flank rows it owns.
+    for candidate, body in decisions.get("__extra__", []):
+        candidates.append(candidate)
+        index = len(candidates) - 1
+        if isinstance(body, list):
+            pieces[index] = body
+            kept.append((index, None))
+        else:
+            kept.append((index, body))
+    for row in decisions.get("__flank__", []):
+        flank.extend(row)
+    return kept, separated, pieces, flank
+
+
+def _exact_round_flank(flank, path_id, child_number, sample_count, path_samples,
+                       minsvsize, emit_small, main_rows, small_rows, candidates,
+                       promoted):
+    """Emit moved members' flank gaps as the samples' own nested rows."""
+    for kind in ("INS", "DEL"):
+        indexes = []
+        for candidate in flank:
+            if candidate[0] == kind:
+                candidates.append(candidate)
+                indexes.append(len(candidates) - 1)
+        child_number = _exact_round_separate(
+            indexes, kind, path_id, child_number, sample_count, path_samples,
+            minsvsize, emit_small, main_rows, small_rows, candidates, promoted,
+        )
+    return child_number
+
+
+def _exact_round_separate(indexes, svtype, path_id, child_number, sample_count,
+                          path_samples, minsvsize, emit_small, main_rows,
+                          small_rows, candidates, promoted):
+    """Emit members that cannot move losslessly as their own nested rows;
+    identical ones (position, span, size, bases) share a row."""
+    identical: Dict[tuple, list] = {}
+    for index in indexes:
+        event = candidates[index]
+        identical.setdefault(
+            (event[1], event[2], event[3], event[4].upper()), [],
+        ).append(index)
+    for members in identical.values():
+        index = members[0]
+        child_number += 1
+        event = candidates[index]
+        single = {
+            "svtype": svtype,
+            "child_id": f"{svtype}_{path_id}_{event[1] + 1}_{child_number}",
+            "child_pos": event[1] + 1, "rep_event": event, "pick": index,
+            "chosen": [(index, None)] + [
+                (other, f"{event[3]}=" if svtype == "INS" else None)
+                for other in members[1:]
+            ],
+            "info_sequence": event[4],
+        }
+        _fast_round_emit_group(
+            single, path_id, sample_count, path_samples,
+            minsvsize, emit_small, main_rows, small_rows, candidates,
+        )
+        if svtype == "INS" and single["row_ref"] is not None:
+            promoted[single["child_id"]] = event[3]
+    return child_number
 
 
 def _fast_round_call(
@@ -5169,6 +6522,8 @@ def _fast_round_call(
     pooled_map=None,
     workers: int = 1,
     alignment_scheduler=None,
+    path_sequence: Optional[str] = None,
+    exact=None,
 ) -> Tuple[List[str], List[str], list, Dict[str, int]]:
     """One recursion round on one path: link the candidates, merge them
     with alignment-based refinement and a two-hour KmerMatch fallback,
@@ -5189,6 +6544,81 @@ def _fast_round_call(
     groups_out: list = []
     child_number = 0
     ins_groups: list = []
+    deferred: list = []     # --exact: groups formed, emitted after planning
+
+    def emit_formed(svtype, pick, chosen, separated, pieces, flank):
+        """Emit one formed group, then its separated members and flank gaps."""
+        nonlocal child_number
+        rep_event = candidates[pick]
+        child_number += 1
+        child_pos = rep_event[1] + 1
+        child_id = f"{svtype}_{path_id}_{child_pos}_{child_number}"
+        chosen = sorted(chosen, key=lambda pair: (
+            candidates[pair[0]][1], candidates[pair[0]][2],
+            candidates[pair[0]][3], pair[0],
+        ))
+        group = {
+            "svtype": svtype,
+            "child_id": child_id,
+            "child_pos": child_pos,
+            "rep_event": rep_event,
+            "pick": pick,
+            "chosen": chosen,
+            "info_sequence": rep_event[4],
+        }
+        if svtype == "INS":
+            ins_groups.append(group)
+        _fast_round_emit_group(
+            group, path_id, sample_count, path_samples,
+            minsvsize, emit_small, main_rows, small_rows,
+            candidates,
+        )
+        if svtype == "INS" and group["row_ref"] is not None:
+            # Every emitted insertion is itself a graph path, including a
+            # terminal child for which no later recursion round runs.
+            promoted[child_id] = rep_event[3]
+            if len(chosen) > 1:
+                rep_slot = next(
+                    slot for slot, (index, _body) in enumerate(chosen)
+                    if index == pick
+                )
+                child_candidates = _fast_extract_candidates(
+                    [body for _index, body in chosen],
+                    [candidates[index][4] for index, _body in chosen],
+                    [candidates[index][5] for index, _body in chosen],
+                    rep_slot, snps=exact is not None,
+                )
+                groups_out.append((
+                    child_id, rep_event[3],
+                    {candidates[index][5][0] for index, _body in chosen},
+                    child_candidates,
+                ) + ((rep_event[4],) if exact is not None else ()))
+        if pieces and group["row_ref"] is not None:
+            # Bases a moved deletion keeps are nested insertions on the
+            # deleted interval, recursing like any other path.
+            groups_out.append((
+                child_id, rep_event[3],
+                {candidates[index][5][0] for index, _body in chosen},
+                [
+                    ("INS", offset, offset, len(bases), bases,
+                     (*candidates[index][5][:4], start, end,
+                      *candidates[index][5][6:]))
+                    for index, nested in sorted(pieces.items())
+                    for offset, bases, start, end in nested
+                ],
+                "",
+            ))
+        child_number = _exact_round_separate(
+            separated, svtype, path_id, child_number, sample_count,
+            path_samples, minsvsize, emit_small, main_rows,
+            small_rows, candidates, promoted,
+        )
+        child_number = _exact_round_flank(
+            flank, path_id, child_number, sample_count, path_samples,
+            minsvsize, emit_small, main_rows, small_rows, candidates,
+            promoted,
+        )
+
     for svtype in ("INS", "DEL"):
         picked = [i for i in ordered if candidates[i][0] == svtype]
         if not picked:
@@ -5237,59 +6667,10 @@ def _fast_round_call(
                     pick = representative[4]
                     rep_event = candidates[pick]
                     chosen = [(member[4], member[5]) for member in refined_members]
-                    child_number += 1
-                    child_pos = rep_event[1] + 1
-                    child_id = (
-                        f"{svtype}_{path_id}_{child_pos}_{child_number}"
-                    )
-                    chosen.sort(key=lambda pair: (
-                        candidates[pair[0]][1], candidates[pair[0]][2],
-                        candidates[pair[0]][3], pair[0],
-                    ))
-                    group = {
-                        "svtype": svtype,
-                        "child_id": child_id,
-                        "child_pos": child_pos,
-                        "rep_event": rep_event,
-                        "pick": pick,
-                        "chosen": chosen,
-                        "info_sequence": rep_event[4],
-                        "referenced": (),
-                    }
-                    ins_groups.append(group)
-                    _fast_round_emit_group(
-                        group, path_id, sample_count, path_samples,
-                        minsvsize, emit_small, main_rows, small_rows,
-                        candidates,
-                    )
-                    if group["row_ref"] is not None:
-                        promoted[child_id] = rep_event[3]
-                    if rep_event[3] > 2 * minsvsize:
-                        supporters = {
-                            candidates[index][5][0]
-                            for index, _body in chosen
-                        }
-                        if len(supporters) > 1:
-                            rep_slot = next(
-                                slot for slot, (index, _body)
-                                in enumerate(chosen) if index == pick
-                            )
-                            child_candidates = _fast_extract_candidates(
-                                [body for _index, body in chosen],
-                                [
-                                    candidates[index][4]
-                                    for index, _body in chosen
-                                ],
-                                [
-                                    candidates[index][5]
-                                    for index, _body in chosen
-                                ],
-                                rep_slot,
-                            )
-                            groups_out.append((
-                                child_id, rep_event[3],
-                                supporters, child_candidates,
-                            ))
+                    if exact is not None and path_sequence is not None:
+                        deferred.append((svtype, pick, chosen))
+                        continue
+                    emit_formed(svtype, pick, chosen, [], {}, [])
                 continue
             selection = sorted(local, key=lambda i: (
                 candidates[i][3], -candidates[i][1], -i,
@@ -5357,71 +6738,34 @@ def _fast_round_call(
                         ):
                             chosen.append((other, body))
                             absorbed.add(other)
-                child_number += 1
-                child_pos = rep_event[1] + 1
-                child_id = (
-                    f"{svtype}_{path_id}_{child_pos}_{child_number}"
-                )
-                chosen.sort(key=lambda pair: (
-                    candidates[pair[0]][1], candidates[pair[0]][2],
-                    candidates[pair[0]][3], pair[0],
-                ))
-                group = {
-                    "svtype": svtype,
-                    "child_id": child_id,
-                    "child_pos": child_pos,
-                    "rep_event": rep_event,
-                    "pick": pick,
-                    "chosen": chosen,
-                    "info_sequence": rep_event[4],
-                    "referenced": (),
-                }
-                if svtype == "INS":
-                    ins_groups.append(group)
-                _fast_round_emit_group(
-                    group, path_id, sample_count, path_samples,
-                    minsvsize, emit_small, main_rows, small_rows,
-                    candidates,
-                )
-                # Every emitted insertion is itself a graph path, including
-                # a terminal child for which no later recursion round runs.
-                # Register it now rather than relying on a future round to
-                # register the child as that round's parent path.
-                if svtype == "INS" and group["row_ref"] is not None:
-                    promoted[child_id] = rep_event[3]
-                if (
-                    svtype == "INS"
-                    and rep_event[3] > 2 * minsvsize
-                ):
-                    supporters = {
-                        candidates[index][5][0]
-                        for index, _b in chosen
-                    }
-                    if len(supporters) > 1:
-                        child_candidates = _fast_extract_candidates(
-                            [
-                                body for _index, body in chosen
-                            ],
-                            [
-                                candidates[index][4]
-                                for index, _b in chosen
-                            ],
-                            [
-                                candidates[index][5]
-                                for index, _b in chosen
-                            ],
-                            0,
-                        )
-                        groups_out.append((
-                            child_id, rep_event[3],
-                            supporters, child_candidates,
-                        ))
+                if exact is not None and path_sequence is not None:
+                    deferred.append((svtype, pick, chosen))
+                    continue
+                emit_formed(svtype, pick, chosen, [], {}, [])
+    if deferred:
+        # --exact: plan every shifted move of this round, then emit.
+        decisions, snp_records = _exact_round_plan(
+            deferred, candidates, path_sequence, exact, path_id,
+        )
+        root = _FAST_CONTEXT.get("insertion_snps")
+        if root:
+            from graphvcfmerge_snp_compact import save_insertion_realignment
+            save_insertion_realignment(root, path_id, snp_records)
+        elif snp_records["drops"] or snp_records["adds"]:
+            raise ValueError("--exact nested SNP realignment needs --insertion-snps")
+        for number, (svtype, pick, chosen) in enumerate(deferred):
+            applied = _exact_round_apply(
+                svtype, pick, chosen, candidates, decisions.get(number, {}),
+            )
+            if applied is not None:
+                emit_formed(svtype, pick, *applied)
     return main_rows, small_rows, groups_out, promoted
 
 
 def _fast_nested_path_task(task, alignment_scheduler=None):
     """Coordinate one path and spool its rows; alignments use shared CPU slots."""
-    ordinal, call_args, result_path, chrom, depth = task
+    ordinal, call_args, result_path, chrom, depth = task[:5]
+    options = task[5] if len(task) > 5 else {}
     import graphreftovcf as core
     from graphvcfmerge_nested import close_session
     path_id = call_args[0]
@@ -5440,9 +6784,13 @@ def _fast_nested_path_task(task, alignment_scheduler=None):
             f"candidates={len(call_args[2])} worker={os.getpid()} started",
             file=sys.stderr, flush=True,
         )
-        result = (_fast_round_call(*call_args, core, None, 1) if alignment_scheduler is None
-                  else _fast_round_call(*call_args, core, None, alignment_scheduler.workers,
-                                        alignment_scheduler=alignment_scheduler))
+        import graphvcfmerge_insertion_store as insertion_store
+        # This path's insertion-SNP spools are appended per bundle at the end.
+        with insertion_store.batch():
+            result = (_fast_round_call(*call_args, core, None, 1, **options)
+                      if alignment_scheduler is None
+                      else _fast_round_call(*call_args, core, None, alignment_scheduler.workers,
+                                            alignment_scheduler=alignment_scheduler, **options))
         temporary = result_path + ".tmp"
         with open(temporary, "wb") as out:
             pickle.dump(result, out, protocol=pickle.HIGHEST_PROTOCOL)
@@ -5462,11 +6810,18 @@ def _fast_nested_path_results(
     chrom, depth, rounds, path_lengths, path_samples, sample_count,
     minsvsize, merge_distance, size_similarity, sequence_similarity, emit_small,
     core, pooled_map, pooled_imap_unordered, workers, spool_dir,
+    options=None,
 ):
-    """Run paths concurrently, yielding disk-spooled results in stable order."""
+    """Run paths concurrently, yielding disk-spooled results in stable order.
+
+    options(path_id) -> extra keyword arguments for _fast_round_call (--exact).
+    """
     paths = sorted(path_id for path_id, candidates in rounds.items() if candidates)
     if not paths:
         return
+
+    def extra(path_id):
+        return options(path_id) if options is not None else {}
 
     def arguments(path_id):
         return (
@@ -5490,7 +6845,9 @@ def _fast_nested_path_results(
                 f"candidates={len(rounds[path_id])} worker={os.getpid()} started",
                 file=sys.stderr, flush=True,
             )
-            result = _fast_round_call(*arguments(path_id), core, pooled_map, workers)
+            result = _fast_round_call(
+                *arguments(path_id), core, pooled_map, workers, **extra(path_id),
+            )
             print(
                 f"[merge:nested] {chrom}: round={depth} completed={number}/{len(paths)} "
                 f"path={path_id} seconds={time.monotonic() - started:.1f}",
@@ -5502,6 +6859,7 @@ def _fast_nested_path_results(
     with tempfile.TemporaryDirectory(prefix="nested-paths-", dir=spool_dir) as directory:
         tasks = [
             (ordinal, arguments(path_id), os.path.join(directory, f"{ordinal}.pkl"), chrom, depth)
+            + ((extra(path_id),) if options is not None else ())
             for ordinal, path_id in enumerate(paths)
         ]
         # Queue costly paths first to reduce the long tail; output order is
@@ -5701,58 +7059,6 @@ def _fast_round_emit_group(
         main_rows.append(row)
     elif emit_small:
         small_rows.append(row)
-
-
-def _fast_round_replace_seq(
-    group: dict,
-    new_sequence: str,
-    main_rows: List[str],
-    small_rows: List[str],
-    minsvsize: int,
-) -> None:
-    row_ref = group.get("row_ref")
-    if row_ref is None:
-        return
-    bucket, line_index = row_ref
-    rows = main_rows if bucket == "main" else small_rows
-    fields = rows[line_index].split("\t")
-    info = parse_info_field(fields[7])
-    info["SEQ"] = vcf_escape(new_sequence)
-    fields[7] = format_info_field(info)
-    rows[line_index] = "\t".join(fields)
-
-
-def _fast_replace_task(
-    args: List[tuple],
-) -> List[Tuple[int, str, Tuple[str, ...]]]:
-    """Align smaller representatives into larger neighbors and encode the
-    replacement SEQ (partial annotation), one batch of events."""
-    import graphreftovcf as core
-    output: List[Tuple[int, str, Tuple[str, ...]]] = []
-    refs = []
-    for _emit_index, rep_ref, neighbors in args:
-        refs.append(rep_ref)
-        refs.extend(neighbor_ref for _row_id, neighbor_ref in neighbors)
-    fetched = _fast_fetch_observations(refs)
-    for emit_index, rep_ref, neighbors in args:
-        observation = fetched[rep_ref]
-        plan = MergedSvClusterPlan(members=[observation])
-        earlier: List[MergedSvClusterPlan] = []
-        for order, (n_row_id, n_ref) in enumerate(neighbors):
-            n_observation = fetched[n_ref]
-            earlier.append(MergedSvClusterPlan(
-                members=[n_observation],
-                insertion_order=order,
-                row_id=n_row_id,
-            ))
-        new_sequence, referenced, mappings = (
-            _partially_annotated_insertion_sequence(
-                plan, earlier, core,
-            )
-        )
-        if referenced:
-            output.append((emit_index, new_sequence, referenced, mappings))
-    return output
 
 
 def _fast_pool_batches(items: list, workers: int) -> List[list]:
@@ -6144,6 +7450,854 @@ def _fast_process_chrom_spooled(
     )
 
 
+# --exact full-locus duplications of the locus being merged: TC records
+# (file index, template start, template end, copy size, line offset, sample)
+# and the reference FASTAs holding the source templates.
+_FAST_DUP_STATE: Dict[str, object] = {}
+
+
+def _fast_read_dup_observations(refs):
+    """Copy (INS) observations by (file index, line offset), never filtered
+    by the full-locus-dup ignore setting."""
+    context = _FAST_CONTEXT
+    output = {}
+    by_file: Dict[int, set] = defaultdict(set)
+    for file_index, offset in refs:
+        by_file[int(file_index)].add(int(offset))
+    for file_index in sorted(by_file):
+        with open(context["input_paths"][file_index], "rb") as handle:
+            for offset in sorted(by_file[file_index]):
+                handle.seek(offset)
+                line = handle.readline().decode("utf-8", "replace").rstrip("\n")
+                observations, _next = _observations_from_row(
+                    line, context["file_sample_indexes"][file_index],
+                    context["sample_names"], _fast_line_base(file_index, offset),
+                )
+                for observation in observations:
+                    if observation.svtype == "INS":
+                        output[(file_index, offset, observation.sample_index)] = observation
+    return output
+
+
+class _ExactSpans:
+    """One sample's [start, end) intervals (points allowed), sorted by start:
+    a window query costs O(log n + nearby) instead of a scan of every span."""
+
+    __slots__ = ("starts", "ends", "longest")
+
+    def __init__(self):
+        self.starts, self.ends, self.longest = [], [], 0
+
+    def add(self, start, end):
+        index = bisect.bisect_right(self.starts, start)
+        self.starts.insert(index, start)
+        self.ends.insert(index, end)
+        self.longest = max(self.longest, end - start)
+
+    def remove(self, start, end):
+        index = bisect.bisect_left(self.starts, start)
+        while index < len(self.starts) and self.starts[index] == start:
+            if self.ends[index] == end:
+                del self.starts[index], self.ends[index]
+                return
+            index += 1
+        raise ValueError(f"span {start}-{end} is not recorded")
+
+    def near(self, low, high):
+        """Spans that may meet [low, high]: those starting in [low - longest, high]."""
+        first = bisect.bisect_left(self.starts, low - self.longest)
+        last = bisect.bisect_right(self.starts, high)
+        return zip(self.starts[first:last], self.ends[first:last])
+
+    def touches(self, w0, w1, exclude=None):
+        """A span inside the window [w0, w1); a point counts strictly inside."""
+        return any((w0 < start < w1) if start == end else (start < w1 and w0 < end)
+                   for start, end in self.near(w0, w1) if (start, end) != exclude)
+
+    def overlaps(self, low, high, exclude=None):
+        return any(start < high and low < end
+                   for start, end in self.near(low, high) if (start, end) != exclude)
+
+
+class _ExactLocks:
+    """Locked query intervals of one sample, per query contig."""
+
+    def __init__(self):
+        self.contigs: Dict[str, _ExactSpans] = defaultdict(_ExactSpans)
+
+    def add(self, contig, start, end):
+        self.contigs[contig].add(start, end)
+
+    def overlaps(self, contig, start, end, exclude=None):
+        spans = self.contigs.get(contig)
+        return spans is not None and spans.overlaps(
+            start, end, None if exclude is None or exclude[0] != contig else exclude[1:])
+
+
+class _ExactRecords:
+    """One sample's original records (start, end, ...) sorted by start, for
+    window queries without a scan of the sample's whole chromosome."""
+
+    def __init__(self, records):
+        self.records = sorted(records, key=lambda item: (item[0], item[1]))
+        self.starts = [record[0] for record in self.records]
+        self.longest = max((record[1] - record[0] for record in self.records), default=0)
+
+    def near(self, low, high):
+        first = bisect.bisect_left(self.starts, low - self.longest)
+        last = bisect.bisect_right(self.starts, high)
+        return self.records[first:last]
+
+
+_EXACT_SNP_CACHE: "OrderedDict[tuple, object]" = OrderedDict()
+
+
+def _exact_release():
+    """Close this process's cached --exact files: SNP-index memory maps and
+    this thread's assembly readers and input VCFs. A network filesystem
+    keeps a deleted file that is still open as a hidden .nfs* entry, and
+    the scratch folder holding it cannot be removed."""
+    _EXACT_SNP_CACHE.clear()
+    for local, attribute in ((_EXACT_LOCAL, "readers"), (_FAST_INPUT_HANDLES, "handles")):
+        cached = getattr(local, attribute, None)
+        while cached:
+            _key, item = cached.popitem()
+            try:
+                if attribute == "readers":
+                    os.close(item.fd)
+                else:
+                    item.close()
+            except OSError:
+                pass
+    import gc
+    gc.collect()      # memory maps close when their last reference is freed
+_EXACT_SNP_OPEN = 32   # memory-mapped SNP indexes per process (one file each)
+
+
+def _exact_window_snps(records_dir, chrom, file_index, contig, w0, w1):
+    """F3: one input's SNPs on this query contig inside [w0, w1) of chrom."""
+    key = (records_dir, file_index)
+    if key in _EXACT_SNP_CACHE:
+        _EXACT_SNP_CACHE.move_to_end(key)
+    else:
+        # A memory map holds a file descriptor: keep few, least recently
+        # used first out (thousands of inputs).
+        while len(_EXACT_SNP_CACHE) >= _EXACT_SNP_OPEN:
+            _EXACT_SNP_CACHE.popitem(last=False)
+        npy, sidecar = _exact_snp_index_paths(records_dir, file_index)
+        _EXACT_SNP_CACHE[key] = None
+        if os.path.isfile(npy):
+            with open(sidecar) as handle:
+                info = json.load(handle)
+            _EXACT_SNP_CACHE[key] = (np.load(npy, mmap_mode="r"), info,
+                                     {name: number for number, name in enumerate(info["chroms"])})
+    if _EXACT_SNP_CACHE[key] is None:
+        return []
+    whole, info, chrom_numbers = _EXACT_SNP_CACHE[key]
+    number = chrom_numbers.get(chrom)
+    if number is None:
+        return []
+    table = whole[info["offsets"][number]:info["offsets"][number + 1]]
+    contigs = info["contigs"]
+    first = int(np.searchsorted(table["pos"], w0, side="left"))
+    last = int(np.searchsorted(table["pos"], w1, side="left"))
+    return [
+        types.SimpleNamespace(
+            svtype="SNP", pos=int(row["pos"]), end=int(row["pos"]) + 1, size=1,
+            sequence=chr(int(row["alt"])), qry_contig=contigs[int(row["contig"])],
+            qpos=int(row["qpos"]), strand="-" if row["minus"] else "+",
+        )
+        for row in table[first:last]
+        if contigs[int(row["contig"])] == contig
+    ]
+
+
+@functools.lru_cache(maxsize=64)
+def _exact_dup_copy_spans_cached(records_dir, file_index):
+    return _exact_dup_copy_spans(records_dir, file_index)
+
+
+def _exact_interval_walk(body, window, template, segments, pieces, qa, qb, strand,
+                         fixed=()):
+    """Split one interval alignment (query window vs template) by segment.
+
+    segments: [(first, last)] template intervals of the representative
+    alleles placed in the template (sorted, disjoint); pieces: [(t0, t1, r0)]
+    template intervals copied from the reference starting at r0. A gap at a
+    segment's junction belongs to the segment; where several meet, to a
+    deletion's (zero-length) point first, then to a segment not in fixed
+    (indexes of representatives that must not change). Returns ([[ops, query offsets,
+    junction]] per segment, flank edits); flank edits are ("DEL"|"INS"|"SNP",
+    reference start, end, bases, query start, end) of the sample.
+    """
+    def reference_at(position, point=False):
+        # A template base lies in one piece [t0, t1); an insertion point may
+        # also sit on a piece's end.
+        for t0, t1, r0 in pieces:
+            if t0 <= position < t1 or (point and position == t1):
+                return r0 + position - t0
+        raise RuntimeError("interval template offset outside its pieces")
+
+    def query_at(f0, f1):
+        return (qb - f1, qb - f0) if strand == "-" else (qa + f0, qa + f1)
+
+    def owner(position, inclusive):
+        if not inclusive:
+            for index, (first, last) in enumerate(segments):
+                if first > position:
+                    break
+                if first <= position < last:
+                    return index
+            return None
+        # A fixed representative takes only gaps strictly inside it (none,
+        # as it is aligned as an exact match); on its edges they go to a
+        # neighbour or the flank.
+        touching = [index for index, (first, last) in enumerate(segments)
+                    if first <= position <= last
+                    and (index not in fixed or first < position < last)]
+        if not touching:
+            return None
+        return min(touching, key=lambda index: (
+            segments[index][0] != segments[index][1], index))
+
+    results = [[[], [], None] for _ in segments]
+    edits: List[tuple] = []
+    t = q = 0
+
+    def mark_junctions():
+        for index, (first, _last) in enumerate(segments):
+            if first == t and results[index][2] is None:
+                results[index][2] = q
+
+    for count_text, op in _FAST_CHUNK_OPS.findall(body):
+        count = int(count_text)
+        mark_junctions()
+        if op == "I":
+            index = owner(t, True)
+            if index is None:
+                point = reference_at(t, True)
+                edits.append(("INS", point, point, window[q:q + count],
+                              *query_at(q, q + count)))
+            else:
+                results[index][0].append(f"{count}I")
+                results[index][1] += [q, q + count]
+            q += count
+            continue
+        if op not in "=MXD":
+            raise RuntimeError(f"unexpected alignment operation {op!r}")
+        while count:
+            mark_junctions()
+            index = owner(t, False)
+            if index is not None:
+                region_end = segments[index][1]
+            else:
+                region_end = next((first for first, _last in segments if first > t),
+                                  len(template))
+            step = min(count, region_end - t)
+            if step <= 0:
+                raise RuntimeError("interval walk did not advance")
+            if index is not None:
+                results[index][0].append(f"{step}{op}")
+                if op != "D":
+                    results[index][1] += [q, q + step]
+            elif op == "D":
+                start = reference_at(t)
+                edits.append(("DEL", start, start + step, "", *query_at(q, q)))
+            else:
+                for offset in range(step):
+                    if window[q + offset].upper() != template[t + offset].upper():
+                        point = reference_at(t + offset)
+                        edits.append(("SNP", point, point + 1, window[q + offset].upper(),
+                                      *query_at(q + offset, q + offset + 1)))
+            t += step
+            if op != "D":
+                q += step
+            count -= step
+    mark_junctions()
+    for result in results:
+        if result[2] is None:
+            result[2] = q
+    return results, edits
+
+
+def _exact_realign_interval(chrom, exact, item, cache, core):
+    """Realign one sample's merged interval against one template: the
+    reference with each of the sample's records replaced by its row's
+    representative allele at the representative breakpoint. The alignment is
+    accepted as it is. Returns (key, None, reason) when the interval is left
+    unchanged, else (key, decisions {ref: decision}, leftover SV
+    observations, SNP drops, SNP adds, counts)."""
+    key, file_index, w0, w1, records = item
+    refs = sorted({record[0] for record in records} | {record[2] for record in records})
+    fetched = _fast_fetch_observations(refs)
+    members = [fetched[record[0]] for record in records]
+    anchor = members[0]
+    sample_index, contig, strand = anchor.sample_index, anchor.qry_contig, anchor.qry_strand
+    if any((member.sample_index, member.qry_contig, member.qry_strand)
+           != (sample_index, contig, strand) for member in members):
+        return key, None, "mixed_contigs"
+    bases = _exact_window(w0, w1, sample_index, chrom, exact, None)
+    if bases is None:
+        return key, None, "uncovered"
+    snps = _exact_window_snps(exact["records_dir"], chrom, file_index, contig, w0, w1)
+    others = members[1:] + snps
+    a0, a1, _bases = _exact_edit(anchor)
+    lead = a0 - w0 + _exact_query_shift(others, w0, a0)
+    tail = w1 - a1 + _exact_query_shift(others, a1, w1)
+    if strand == "-":
+        qa, qb = anchor.qry_start - tail, anchor.qry_end + lead
+    else:
+        qa, qb = anchor.qry_start - lead, anchor.qry_end + tail
+    fasta, fai = exact["queries"][anchor.sample_name]
+    reader = _exact_reader(fasta, fai)
+    if qa < 0 or qb > reader.index.get(contig, (0,))[0]:
+        return key, None, "query_bounds"
+    for start, end in _exact_dup_copy_spans_cached(exact["records_dir"], file_index).get(contig, ()):
+        if start < qb and qa < end:
+            return key, None, "locked"
+    window = reader.fetch(contig, qa, qb, "+")
+    if strand == "-":
+        window = core.revcomp(window)
+    # Safety: the assembly must be the reference with exactly the sample's
+    # own records applied, or the query interval above is not this window.
+    expected = _exact_apply(bases, w0, [_exact_edit(item_) for item_ in [anchor, *others]])
+    if window.upper() != expected.upper():
+        return key, None, "other_variant"
+
+    # Template: records already at their representative's breakpoint first
+    # (representatives of other members before all), then shifted ones
+    # (larger rows first); one that would overlap an allele
+    # already placed stays out and its bases come out as leftover edits.
+    order = sorted(range(len(records)), key=lambda index: (
+        records[index][4], not records[index][3], -records[index][5], records[index][1], index))
+    placed = []
+    for index in order:
+        representative = fetched[records[index][2]]
+        start, end, allele = _exact_edit(representative)
+        if start < w0 or end > w1:
+            continue
+        if any((start < p_end and p_start < end)
+               or (start == end and p_start < start < p_end)
+               or (p_start == p_end and start < p_start < end)
+               or (start == end == p_start == p_end)
+               for p_start, p_end, _allele, _index in placed):
+            continue
+        placed.append((start, end, allele, index))
+    placed.sort(key=lambda item_: (item_[0], item_[1], item_[3]))
+    parts, segments, pieces = [], [], []
+    cursor = t = 0
+    cursor = w0
+    for start, end, allele, _index in placed:
+        pieces.append((t, t + start - cursor, cursor))
+        parts.append(bases[cursor - w0:start - w0])
+        t += start - cursor
+        segments.append((t, t + len(allele)))
+        parts.append(allele)
+        t += len(allele)
+        cursor = end
+    pieces.append((t, t + w1 - cursor, cursor))
+    parts.append(bases[cursor - w0:])
+    template = "".join(parts)
+    fixed = {number for number, item_ in enumerate(placed) if records[item_[3]][3]}
+
+    def align(query_part, template_part):
+        if query_part and template_part:
+            _similarity, part_body = _final_pair_alignment(query_part, template_part, cache, core)
+            return part_body or _pure_insertion_alignment_body(query_part, template_part)
+        return ((f"{len(query_part)}I" if query_part else "")
+                + (f"{len(template_part)}D" if template_part else ""))
+
+    # A fixed representative is this sample's own record: its query bases are
+    # known, so it anchors the alignment as an exact match and only the parts
+    # between anchors are aligned.
+    bodies, t_done, q_done = [], 0, 0
+    for number in sorted(fixed, key=lambda number_: segments[number_][0]):
+        first, last = segments[number]
+        own = members[placed[number][3]]
+        if strand == "-":
+            o0, o1 = qb - own.qry_end, qb - own.qry_start
+        else:
+            o0, o1 = own.qry_start - qa, own.qry_end - qa
+        if (o0 < q_done or first < t_done
+                or window[o0:o1].upper() != template[first:last].upper()):
+            return key, None, "representative_changed"
+        bodies.append(align(window[q_done:o0], template[t_done:first]))
+        if last > first:
+            bodies.append(f"{last - first}=")
+        t_done, q_done = last, o1
+    bodies.append(align(window[q_done:], template[t_done:]))
+    body = "".join(bodies)
+    results, edits = _exact_interval_walk(body, window, template, segments, pieces,
+                                          qa, qb, strand, fixed)
+
+    def query_at(f0, f1):
+        return (qb - f1, qb - f0) if strand == "-" else (qa + f0, qa + f1)
+
+    decisions, counts = {}, Counter()
+    placed_records = set()
+    for (start, end, allele, index), (ops, offsets, junction) in zip(placed, results):
+        ref, _slot, rep_ref, protected, shifted, _size = records[index]
+        member, representative = members[index], fetched[rep_ref]
+        if representative.svtype == "DEL":
+            f0, f1 = (min(offsets), max(offsets)) if offsets else (junction, junction)
+            span = query_at(f0, f1)
+            nested = [(0, window[f0:f1], *span)] if f1 > f0 else []
+            moved = _exact_with(member, pos=representative.pos, end=representative.end,
+                                qry_start=span[0], qry_end=span[1])
+            body_out = nested
+            unchanged = (not nested and member.pos == representative.pos
+                         and member.end == representative.end
+                         and (member.qry_start, member.qry_end) == span)
+        else:
+            if not offsets:
+                continue             # nothing of the query aligned to it
+            f0, f1 = min(offsets), max(offsets)
+            body_out = "".join(ops)
+            _fast_validate_alignment_body(
+                body_out, f1 - f0, len(representative.sequence),
+                context="interval realignment",
+            )
+            span = query_at(f0, f1)
+            moved = _exact_with(member, pos=representative.pos, end=representative.end,
+                                size=f1 - f0, sequence=window[f0:f1],
+                                qry_start=span[0], qry_end=span[1])
+            unchanged = ((member.pos, member.end, member.sequence.upper(),
+                          member.qry_start, member.qry_end)
+                         == (moved.pos, moved.end, moved.sequence.upper(), *span))
+        placed_records.add(index)
+        if protected:
+            # A row's representative defines the row: it must come out as itself.
+            if not unchanged or (representative.svtype != "DEL"
+                                 and body_out != f"{len(representative.sequence)}="):
+                return key, None, "representative_changed"
+            continue
+        if unchanged and not shifted:
+            continue
+        if ref == rep_ref and representative.svtype != "DEL":
+            body_out = None          # the row's new representative allele
+        decisions[ref] = ("move", moved, body_out, [])
+        counts["moved" if shifted else "realigned_in_place"] += 1
+    for index, record in enumerate(records):
+        if index in placed_records:
+            continue
+        if record[3]:
+            return key, None, "representative_unplaced"
+        decisions[record[0]] = ("drop",)
+        counts["superseded"] += 1
+    leftovers = [_exact_flank_observation(anchor, edit, exact)
+                 for edit in edits if edit[0] != "SNP"]
+    sample_name = anchor.sample_name
+    originals = {(snp.pos + 1, snp.sequence.upper(), snp.qpos): snp for snp in snps}
+    adds = []
+    for _kind, start, _end, alt, query_start, query_end in (
+            edit for edit in edits if edit[0] == "SNP"):
+        qpos = query_start if strand == "+" else query_end
+        if originals.pop((start + 1, alt.upper(), qpos), None) is not None:
+            continue                 # the sample's own SNP, unchanged
+        base = _exact_fetch(exact["references"], chrom, start, start + 1) or "N"
+        adds.append((sample_name, start + 1, base.upper(), alt, contig, qpos, strand))
+    drops = [(sample_name, snp.pos + 1, snp.sequence, snp.qry_contig, snp.qpos, snp.strand)
+             for snp in originals.values()]
+    counts["leftover_sv"] += len(leftovers)
+    counts["leftover_snp"] += len(adds)
+    counts["superseded_snp"] += len(drops)
+    return key, decisions, leftovers, drops, adds, counts
+
+
+def _exact_interval_task(args):
+    """Realign a batch of per-sample intervals (independent of each other)."""
+    import graphreftovcf as core
+    chrom, exact, items = args
+    cache: dict = {}
+    output = []
+    for item in items:
+        try:
+            output.append(_exact_realign_interval(chrom, exact, item, cache, core))
+        except RuntimeError:
+            output.append((item[0], None, "alignment_error"))
+    return output
+
+
+def _exact_sample_intervals(seeds, records, rep_spans):
+    """Merge one sample's realignment windows: sorted, overlapping ones
+    merged, each widened until every record it touches and that record's
+    row representative lie strictly inside (a point exactly on an edge
+    moves the edge out by one), then merged again. records: the sample's
+    _ExactRecords (start, end, ref, slot, protected)."""
+    def widen(w0, w1):
+        while True:
+            n0, n1 = w0, w1
+            for start, end, _ref, slot, _protected in records.near(w0, w1):
+                if start == end:
+                    if not w0 <= start <= w1:
+                        continue
+                elif not (start <= w1 and w0 <= end):
+                    continue
+                for s, e in ((start, end), rep_spans[slot]):
+                    n0, n1 = min(n0, s), max(n1, e)
+                    if s == e:
+                        n0 = min(n0, s - 1) if s <= n0 else n0
+                        n1 = max(n1, s + 1) if s >= n1 else n1
+            if (n0, n1) == (w0, w1):
+                return w0, w1
+            w0, w1 = max(0, n0), n1
+
+    intervals: List[List[int]] = []
+    for w0, w1 in sorted(seeds):
+        w0, w1 = widen(w0, w1)
+        if intervals and w0 <= intervals[-1][1]:
+            merged = widen(intervals[-1][0], max(w1, intervals[-1][1]))
+            intervals[-1] = list(merged)
+            # A widened interval can reach back over earlier ones.
+            while len(intervals) > 1 and intervals[-1][0] <= intervals[-2][1]:
+                last = intervals.pop()
+                intervals[-1] = list(widen(min(intervals[-1][0], last[0]),
+                                           max(intervals[-1][1], last[1])))
+        else:
+            intervals.append([w0, w1])
+    output = []
+    for w0, w1 in intervals:
+        inside = [record for record in records.near(w0, w1)
+                  if (w0 < record[0] < w1 if record[0] == record[1]
+                      else w0 <= record[0] and record[1] <= w1)]
+        output.append((w0, w1, inside))
+    return output
+
+
+def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
+                      pooled_imap=None, workers=1):
+    """Realign the top-level shifted members of one locus (--exact).
+
+    A member whose breakpoint differs from its row representative's has a
+    breakpoint consistency issue. Per sample, the windows spanning both
+    breakpoints are sorted and merged (each widened over the sample's records
+    it touches and their representatives), so the intervals are disjoint;
+    each is realigned once, independently and in parallel, against the
+    reference with the sample's records replaced by their rows'
+    representative alleles (_exact_realign_interval), and the alignment is
+    accepted. Query bases aligned to a representative allele make the
+    sample's allele on that row; other differences are leftover edits:
+    SNPs replace the sample's SNPs in the interval, SVs join an exactly
+    identical row or form new rows (_exact_place_leftovers). Returns
+    {emit index: {member ref: decision}}, decision one of
+    ("move", moved observation, body or nested pieces, []),
+    ("separate", reason) for a shifted member left as it is, or ("drop",)
+    for a record whose bases are now leftover edits; "__extra__" and
+    "__flank__" as read by _exact_split_shifted.
+    """
+    import graphreftovcf as core
+    context = _FAST_CONTEXT
+    groups = []
+    with open(refined_spool_path, "rb") as handle:
+        for slot, descriptor in enumerate(refined_descriptors):
+            handle.seek(descriptor[2])
+            groups.append((slot, *pickle.load(handle)))
+
+    def span(item, svtype):
+        return ((item[0], item[0] + item[2]) if svtype == "DEL"
+                else (item[0], max(item[0], item[1])))
+
+    by_sample: Dict[int, list] = defaultdict(list)
+    candidates = []
+    rep_spans = {}
+    for slot, svtype, rep, members in groups:
+        rep_span = rep_spans[slot] = span(rep, svtype)
+        for member in members:
+            member_span = span(member, svtype)
+            # A representative is protected only when others depend on it.
+            by_sample[member[3][0]].append(
+                (member_span[0], member_span[1], member[3], slot,
+                 member[3] == rep[3] and len(members) > 1),
+            )
+            if svtype in ("INS", "DEL") and member[3] != rep[3] and member_span != rep_span:
+                candidates.append((
+                    min(member_span[0], rep_span[0]), max(member_span[1], rep_span[1]),
+                    slot, member[3], rep[3], svtype,
+                ))
+    snp_records = {"chrom": chrom, "drops": [], "adds": []}
+    if not candidates:
+        _write_exact_snp_records(exact, chrom, snp_records)
+        return {}
+    # Sorted per sample: window queries do not scan the whole chromosome.
+    by_sample = {file_index: _ExactRecords(records) for file_index, records in by_sample.items()}
+    sample_names = context["sample_names"]
+    group_sizes = {slot: len(members) for slot, _svtype, _rep, members in groups}
+    candidate_refs = {candidate[3] for candidate in candidates}
+    seeds: Dict[int, list] = defaultdict(list)
+    for w0, w1, _slot, ref, _rep_ref, _svtype in candidates:
+        seeds[ref[0]].append((w0, w1))
+    rep_refs = {slot: rep[3] for slot, _svtype, rep, _members in groups}
+    plan: Dict[int, dict] = defaultdict(dict)
+    reasons: Dict[str, int] = defaultdict(int)
+    items, interval_records = [], {}
+    for file_index in sorted(seeds):
+        if len(context["file_sample_indexes"][file_index]) != 1:
+            for _w0, _w1, slot, ref, _rep_ref, _svtype in candidates:
+                if ref[0] == file_index:
+                    plan[slot][ref] = ("separate", "multi_sample_input")
+                    reasons["multi_sample_input"] += 1
+            continue
+        for w0, w1, inside in _exact_sample_intervals(seeds[file_index], by_sample[file_index],
+                                                      rep_spans):
+            key = len(items)
+            # A representative of a row with other members stays as it is:
+            # their intervals, realigned in parallel, use its allele. A
+            # single-member row's representative may change or go.
+            records = [
+                (ref, slot, rep_refs[slot], protected, ref in candidate_refs,
+                 group_sizes[slot])
+                for _start, _end, ref, slot, protected in inside
+            ]
+            interval_records[key] = records
+            items.append((key, file_index, w0, w1, records))
+    started = time.monotonic()
+    batch = max(1, min(64, -(-len(items) // max(1, 4 * int(workers)))))
+    tasks = [(chrom, exact, items[start:start + batch])
+             for start in range(0, len(items), batch)]
+    leftovers: List[tuple] = []           # (owner slot, observation)
+    for results in (pooled_imap(_exact_interval_task, tasks) if pooled_imap is not None
+                    else map(_exact_interval_task, tasks)):
+        for result in results:
+            key, decisions = result[0], result[1]
+            records = interval_records[key]
+            if decisions is None:
+                reason = result[2]
+                reasons[f"interval_{reason}"] += 1
+                for ref, slot, _rep_ref, _protected, shifted, _size in records:
+                    if shifted:
+                        plan[slot][ref] = ("separate", reason)
+                        reasons[reason] += 1
+                continue
+            _key, decisions, interval_leftovers, drops, adds, counts = result
+            reasons["intervals_realigned"] += 1
+            slot_of = {record[0]: record[1] for record in records}
+            for ref, decision in decisions.items():
+                plan[slot_of[ref]][ref] = decision
+            # Leftover rows are emitted with a shifted member's row: its
+            # representative has other members, so that row is never dropped.
+            owner = next(record[1] for record in records if record[4])
+            leftovers.extend((owner, observation) for observation in interval_leftovers)
+            snp_records["drops"].extend(drops)
+            snp_records["adds"].extend(adds)
+            for name, count in counts.items():
+                reasons[name] += count
+    _exact_place_leftovers(groups, plan, leftovers, reasons)
+    print(
+        f"[merge:exact] {chrom}: shifted member(s) in {len(items)} interval(s): "
+        + ", ".join(f"{key}={value}" for key, value in sorted(reasons.items()))
+        + f"; planned {len(candidates)} in {time.monotonic() - started:.1f}s",
+        file=sys.stderr,
+    )
+    _write_exact_snp_records(exact, chrom, snp_records)
+    return dict(plan)
+
+
+def _exact_place_leftovers(groups, plan, leftovers, reasons):
+    """Leftover SVs of the interval realignment: each joins a row whose
+    representative allele is exactly the same (type, interval, bases) and
+    that holds no allele of its sample yet; otherwise one new row per
+    distinct allele, shared by every sample with it."""
+    if not leftovers:
+        return
+    context = _FAST_CONTEXT
+    sample_of_file = context["file_sample_indexes"]
+
+    def rep_span(svtype, rep):
+        return ((rep[0], rep[0] + rep[2]) if svtype == "DEL"
+                else (rep[0], max(rep[0], rep[1])))
+
+    wanted = {(observation.svtype, *_exact_edit(observation)[:2])
+              for _owner, observation in leftovers}
+    matching: Dict[tuple, list] = defaultdict(list)
+    for slot, svtype, rep, members in groups:
+        span = rep_span(svtype, rep)
+        # A realigned or dropped single-member row no longer has rep's allele.
+        if (svtype, *span) in wanted and rep[3] not in plan.get(slot, {}):
+            matching[(svtype, *span)].append((slot, rep, members))
+    reps = _fast_fetch_observations(sorted({rep[3] for values in matching.values()
+                                             for _slot, rep, _members in values}))
+    slot_samples: Dict[int, set] = {}
+
+    def samples_in(slot, members):
+        if slot not in slot_samples:
+            decisions = plan.get(slot, {})
+            slot_samples[slot] = {
+                sample
+                for member in members
+                if decisions.get(member[3], ("keep",))[0] not in ("drop", "separate")
+                for sample in sample_of_file[member[3][0]]
+            } | {observation.sample_index for observation, _body in decisions.get("__extra__", [])}
+        return slot_samples[slot]
+
+    rows: Dict[tuple, list] = {}
+    for owner, observation in sorted(
+            leftovers, key=lambda item: (item[1].pos, item[1].end, item[1].svtype,
+                                         item[1].sample_index, item[1].qry_start)):
+        start, end, bases = _exact_edit(observation)
+        placed = False
+        for slot, rep, members in matching.get((observation.svtype, start, end), ()):
+            if reps[rep[3]].sequence.upper() != bases.upper():
+                continue
+            if observation.sample_index in samples_in(slot, members):
+                continue
+            body = f"{len(bases)}=" if observation.svtype == "INS" else None
+            plan.setdefault(slot, {}).setdefault("__extra__", []).append((observation, body))
+            slot_samples[slot].add(observation.sample_index)
+            reasons["leftover_sv_joined_row"] += 1
+            placed = True
+            break
+        if placed:
+            continue
+        key = (observation.svtype, start, end, bases.upper())
+        if key in rows and observation.sample_index not in {
+                item.sample_index for item in rows[key]}:
+            rows[key].append(observation)
+            reasons["leftover_sv_shared_row"] += 1
+            continue
+        rows[key] = [observation]
+        plan.setdefault(owner, {}).setdefault("__flank__", []).append(rows[key])
+        reasons["leftover_sv_row"] += 1
+
+
+def _write_exact_snp_records(exact, chrom, records) -> None:
+    """Realignment records for the SNP stage: the SNP observations to drop
+    and to add on this locus. Always written in exact mode, so a re-run
+    never leaves a stale file behind."""
+    root = exact.get("snp_shards_dir")
+    if not root:
+        if records["drops"] or records["adds"]:
+            raise ValueError("--exact SNP realignment needs the SNP shards directory")
+        return
+    from graphvcfmerge_snp_compact import chrom_key
+    directory = os.path.join(root, "realign")
+    os.makedirs(directory, exist_ok=True)
+    checkpoints.write_json(Path(directory) / (chrom_key(chrom) + ".json"), records)
+
+
+def _fast_emit_dup_templates(
+    chrom, core, coverage, used_variant_ids, main_out, small_out,
+    path_candidates, path_lengths, path_samples, promoted, path_sequences,
+):
+    """Merge full-locus-dup copies on their shared source template.
+
+    Overlapping source intervals of this locus form one template path
+    DUP_<locus>_<start>_<end> (reference bases). Every copy is aligned end to
+    end to it; each insertion site becomes one INS row pointing at the shared
+    path, and all copies' differences recurse on that path as nested rows.
+    """
+    records = _FAST_DUP_STATE.get("records") or []
+    if not records:
+        return 0, 0
+    context = _FAST_CONTEXT
+    minsvsize = int(context["minsvsize"])
+    emit_small = bool(context.get("emit_small", False))
+    readers = [core.IndexedFastaReader(path) for path in _FAST_DUP_STATE["references"]]
+    reader = next((r for r in readers if chrom in r.index), None)
+    if reader is None:
+        raise ValueError(f"--exact: source locus {chrom!r} is not in --reference")
+    templates: List[List[int]] = []
+    for _file, start, end, _size, _offset, _sample in sorted(records, key=lambda r: (r[1], r[2])):
+        if templates and start <= templates[-1][1]:
+            templates[-1][1] = max(templates[-1][1], end)
+        else:
+            templates.append([start, end])
+    starts = [start for start, _end in templates]
+    observations = _fast_read_dup_observations(
+        [(record[0], record[4]) for record in records],
+    )
+    by_template: Dict[int, list] = defaultdict(list)
+    for file_index, start, _end, _size, offset, sample in records:
+        slot = bisect.bisect_right(starts, start) - 1
+        by_template[slot].append(observations[(file_index, offset, sample)])
+    main_rows = small_rows = 0
+    aligner_cache: dict = {}
+    sample_count = len(context["sample_names"])
+    for slot, copies in sorted(by_template.items()):
+        start, end = templates[slot]
+        template_id = f"DUP_{_safe_variant_token(chrom)}_{start}_{end}"
+        template = reader.fetch(chrom, start, end, "+")
+        if len(template) != end - start:
+            raise ValueError(f"--exact: cannot read template {chrom}:{start}-{end}")
+        copies.sort(key=lambda o: (o.chrom, o.pos, o.end, o.sample_index, o.qry_contig, o.qry_start))
+        bodies = []
+        for copy in copies:
+            _similarity, body = _final_pair_alignment(
+                copy.sequence, template, aligner_cache, core,
+            )
+            if body is None:
+                body = _pure_insertion_alignment_body(copy.sequence, template)
+            _fast_validate_alignment_body(
+                body, len(copy.sequence), len(template),
+                context=f"full-locus-dup copy on {template_id}",
+            )
+            bodies.append(body)
+        sites: Dict[Tuple[str, int, int], list] = defaultdict(list)
+        for copy, body in zip(copies, bodies):
+            sites[(copy.chrom, copy.pos, copy.end)].append((copy, body))
+        for (site_chrom, pos, site_end), members in sorted(sites.items()):
+            events_by_sample: Dict[int, List[List[str]]] = defaultdict(list)
+            for copy, body in members:
+                events_by_sample[copy.sample_index].append(
+                    _observation_event_values(copy, _sample_alignment_cigar(body), pos),
+                )
+            end_pos = max(pos, site_end)
+            base_id = f"INS_{_safe_variant_token(site_chrom)}_{pos}_{template_id}"
+            used_variant_ids[base_id] += 1
+            row_id = (base_id if used_variant_ids[base_id] == 1
+                      else f"{base_id}_{used_variant_ids[base_id]}")
+            info = format_info_field({
+                "SVTYPE": "INS", "END": str(end_pos),
+                "NSUP": str(len(events_by_sample)),
+                "SVLEN": str(len(template)), "MAXSIZE": str(len(template)),
+                "PACLASS": "fulllocusdup", "SEQ": vcf_escape(template),
+                "EXTENDGRAPHCIGAR": vcf_escape(f">{template_id}:{len(template)}="),
+            })
+            sample_fields = _sample_fields_for_events(
+                events_by_sample, sample_count,
+                coverage if site_chrom == chrom else {}, pos, end_pos,
+            )
+            row = "\t".join([
+                site_chrom, str(pos), row_id, members[0][0].ref, "<INS>", ".",
+                "PASS", info, SV_FORMAT, *sample_fields,
+            ])
+            if len(template) >= minsvsize:
+                main_out.write(row + "\n")
+                main_rows += 1
+            elif emit_small:
+                small_out.write(row + "\n")
+                small_rows += 1
+        sources = [
+            (copy.sample_index, copy.qry_contig, copy.label, copy.label_h,
+             copy.qry_start, copy.qry_end, copy.qry_strand,
+             getattr(copy, "liftover_category", "."), "fulllocusdup")
+            for copy in copies
+        ]
+        template_source = (0, "", "", "", 0, 0, "+", ".", "fulllocusdup")
+        promoted[template_id] = len(template)
+        path_sequences[template_id] = template
+        path_lengths[template_id] = len(template)
+        path_samples[template_id] = {copy.sample_index for copy in copies}
+        if int(context["var_in_insert"]) > 0:
+            path_candidates[template_id] = _fast_extract_candidates(
+                bodies + [None], [copy.sequence for copy in copies] + [template],
+                sources + [template_source], len(copies), snps=True,
+            )
+        if context.get("insertion_snps"):
+            from graphvcfmerge_snp_compact import save_insertion
+            save_insertion(
+                context["insertion_snps"], template_id,
+                [copy.sequence for copy in copies] + [template], bodies + [None],
+                [source[:7] for source in sources] + [template_source[:7]],
+                len(copies), context["sample_names"], owner=chrom,
+            )
+    print(
+        f"[merge:exact] {chrom}: {len(records)} full-locus-dup cop(ies) on "
+        f"{len(by_template)} source template(s)",
+        file=sys.stderr,
+    )
+    return main_rows, small_rows
+
+
 def _fast_emit_refined(
     chrom, uncertain_map, coverage_raw, parts_dir, pooled_map, pooled_imap,
     pooled_imap_unordered, workers, core, spool_dir, refined_descriptors, template_groups,
@@ -6199,6 +8353,7 @@ def _fast_emit_refined(
     path_candidates: Dict[str, list] = {}
     path_lengths: Dict[str, int] = {}
     path_samples: Dict[str, set] = {}
+    path_sequences: Dict[str, str] = {}   # --exact: parent bases for nested realignment
     emitted = 0
     emit_progress = time.monotonic()
     descriptor_slot = 0
@@ -6276,8 +8431,18 @@ def _fast_emit_refined(
                 uncertain_samples,
             ))
             metadata[emit_index] = (row_id, svtype, rep)
-        return (entries, coverage), metadata
+        exact_task = _FAST_DUP_STATE.get("exact")
+        if exact_task is not None:
+            exact_task = dict(exact_task, plan={
+                entry[0]: move_plan[entry[0]] for entry in entries if entry[0] in move_plan
+            })
+        return (entries, coverage, exact_task), metadata
 
+    move_plan = (
+        _exact_plan_moves(chrom, refined_spool_path, refined_descriptors,
+                          _FAST_DUP_STATE["exact"], pooled_imap, workers)
+        if _FAST_DUP_STATE.get("exact") is not None else {}
+    )
     # Bound both queued inputs and completed full-width VCF rows to one task
     # per worker.  Results are consumed in task order and written immediately.
     with open(refined_spool_path, "rb") as refined_in, open(
@@ -6298,16 +8463,23 @@ def _fast_emit_refined(
             if not task_window:
                 break
             for batch_rows in pooled_imap(_fast_emit_task, task_window):
-                for emit_index, row, path_info in batch_rows:
-                    row_id, svtype, rep = window_metadata.pop(emit_index)
+                for emit_index, row, path_info, extra in batch_rows:
+                    row_id, svtype, rep = window_metadata[emit_index]
+                    size = rep[2]
+                    if extra is not None:
+                        # A separated member or a flank gap under --exact.
+                        row_id, size = extra
+                        svtype = row.split("\t", 5)[4].strip("<>")
                     if path_info is not None:
-                        length, samples, candidates = path_info
+                        length, samples, candidates = path_info[:3]
                         path_lengths[row_id] = length
                         path_samples[row_id] = samples
                         path_candidates[row_id] = candidates
-                    if rep[2] >= minsvsize:
+                        if len(path_info) > 3:
+                            path_sequences[row_id] = path_info[3]
+                    if size >= minsvsize:
                         if svtype == "INS" and var_in_insert > 0:
-                            path_lengths.setdefault(row_id, rep[2])
+                            path_lengths.setdefault(row_id, size)
                         main_out.write(row + "\n")
                         main_rows += 1
                     else:
@@ -6322,6 +8494,14 @@ def _fast_emit_refined(
                         file=sys.stderr,
                     )
                     emit_progress = now
+        import graphvcfmerge_insertion_store as insertion_store
+        with insertion_store.batch():
+            dup_main, dup_small = _fast_emit_dup_templates(
+                chrom, core, coverage, used_variant_ids, main_out, small_out,
+                path_candidates, path_lengths, path_samples, promoted, path_sequences,
+            )
+        main_rows += dup_main
+        small_rows += dup_small
     # Keep immutable top-level rows separate from nested append output.
     base_part = os.path.join(spool_dir, "top-level.part")
     shutil.copyfile(part_work_path, base_part)
@@ -6334,12 +8514,12 @@ def _fast_emit_refined(
         "chrom": chrom, "main_rows": main_rows, "small_rows": small_rows,
         "promoted": promoted, "skipped_small": skipped_small,
         "path_candidates": path_candidates, "path_lengths": path_lengths,
-        "path_samples": path_samples,
+        "path_samples": path_samples, "path_sequences": path_sequences,
     }, dependencies)
     print(f"[merge:checkpoint] {chrom}: nested-ready saved in {spool_dir}",
           file=sys.stderr, flush=True)
     # Release emission state before loading the durable nested snapshot.
-    del path_candidates, path_lengths, path_samples, promoted
+    del path_candidates, path_lengths, path_samples, promoted, path_sequences
     return _fast_resume_nested(
         chrom, parts_dir, pooled_map, pooled_imap_unordered, workers, core, spool_dir,
     )
@@ -6364,6 +8544,19 @@ def _fast_resume_nested(
     path_candidates, path_lengths, path_samples = (
         state["path_candidates"], state["path_lengths"], state["path_samples"],
     )
+    # --exact: nested members placed elsewhere on their parent path are
+    # realigned with the parent's bases; only the assemblies are needed.
+    path_sequences = state.get("path_sequences", {})
+    exact_state = _FAST_DUP_STATE.get("exact")
+    nested_exact = None if exact_state is None else {
+        "coverage": {}, "references": exact_state["references"],
+        "queries": exact_state["queries"],
+    }
+
+    def round_options(path_id):
+        if nested_exact is None or path_id not in path_sequences:
+            return {}
+        return {"path_sequence": path_sequences[path_id], "exact": nested_exact}
     safe = _safe_locus_key(chrom)
     part_path = os.path.join(parts_dir, safe + ".part")
     part_work_path = os.path.join(spool_dir, safe + ".part")
@@ -6376,7 +8569,8 @@ def _fast_resume_nested(
     # Reuse member CIGARs for residual discovery; never remap representatives.
     if var_in_insert > 0:
         rounds = {
-            key: value for key, value in path_candidates.items() if value
+            key: value for key, value in path_candidates.items()
+            if any(candidate[0] != "SNP" for candidate in value)
         }
         if rounds:
             print(
@@ -6392,13 +8586,19 @@ def _fast_resume_nested(
         with open(part_work_path, "a") as main_out, open(
             small_sink_path, "a",
         ) as small_out:
-            while rounds and depth < 32:
+            while rounds and depth < 256:
                 depth += 1
                 next_rounds: Dict[str, list] = {}
+                if _FAST_CONTEXT.get("insertion_snps"):
+                    # Owners of this round's parent paths (for their nested
+                    # rows' spools), one lookup per bundle instead of per path.
+                    from graphvcfmerge_snp_compact import prefetch_owners
+                    prefetch_owners(_FAST_CONTEXT["insertion_snps"], rounds)
                 for path_id, path_result in _fast_nested_path_results(
                     chrom, depth, rounds, path_lengths, path_samples, sample_count,
                     minsvsize, merge_distance, size_similarity, sequence_similarity,
                     emit_small, core, pooled_map, pooled_imap_unordered, workers, spool_dir,
+                    options=round_options if nested_exact is not None else None,
                 ):
                     (
                         round_main, round_small, groups_next,
@@ -6421,9 +8621,12 @@ def _fast_resume_nested(
                         promoted[name] = length
                     for (
                         child_id, child_length, supporters,
-                        child_cands,
+                        child_cands, *child_sequence,
                     ) in groups_next:
-                        if child_cands:
+                        if child_sequence:
+                            path_sequences[child_id] = child_sequence[0]
+                        # Mismatch-only paths (--exact) need no round.
+                        if any(candidate[0] != "SNP" for candidate in child_cands):
                             next_rounds.setdefault(
                                 child_id, [],
                             ).extend(child_cands)
@@ -6532,6 +8735,8 @@ def _fast_stage_scan(
     input_paths: Sequence[str], shards_dir: str, processes: int,
     snp_shards_dir=None, ignore_full_locus_dup_insertions: bool = True,
     candidate_min_size: int = 0,
+    exact_query_paths: Optional[str] = None,
+    reference_paths: Sequence[str] = (),
 ) -> None:
     """Stage 1 for split SLURM runs: scan every input VCF once and
     persist the record shards plus a manifest under --shards-dir."""
@@ -6540,6 +8745,30 @@ def _fast_stage_scan(
         meta_lines, sample_names, file_sample_indexes,
         sample_index_by_name,
     ) = _fast_prepare_inputs(input_paths)
+    exact_queries: Dict[str, Tuple[str, str]] = {}
+    reference_paths = [os.path.abspath(path) for path in reference_paths]
+    if exact_query_paths:
+        exact_queries = read_query_paths(exact_query_paths)
+        missing = [name for name in sample_names if name not in exact_queries]
+        if missing:
+            raise ValueError(
+                f"--exact {exact_query_paths}: no assembly for sample(s) "
+                f"{missing[:8]}"
+            )
+        if not reference_paths:
+            raise ValueError("--exact requires --reference")
+        indexed = [exact_queries[name] for name in sample_names] + [
+            (path, path + ".fai") for path in reference_paths
+        ]
+        unindexed = [
+            fasta for fasta, fai in indexed
+            if not (os.path.isfile(fasta) and os.path.isfile(fai))
+        ]
+        if unindexed:
+            raise ValueError(
+                "--exact needs indexed FASTA files (samtools faidx); "
+                f"missing FASTA or .fai: {unindexed[:8]}"
+            )
     records_dir = os.path.join(shards_dir, "records")
     os.makedirs(records_dir, exist_ok=True)
     os.makedirs(os.path.join(shards_dir, "parts"), exist_ok=True)
@@ -6554,7 +8783,12 @@ def _fast_stage_scan(
             ignore_full_locus_dup_insertions
         ),
         "candidate_min_size": int(candidate_min_size),
+        "exact": bool(exact_query_paths),
     }
+    if exact_query_paths:
+        # Copies are merged on their source template, never dropped.
+        ignore_full_locus_dup_insertions = False
+        context["ignore_full_locus_dup_insertions"] = False
     _init_fast_worker(context)
     workers = min(max(1, int(processes)), len(input_paths))
     pool = None
@@ -6702,6 +8936,11 @@ def _fast_stage_scan(
         "ignore_full_locus_dup_insertions": bool(
             ignore_full_locus_dup_insertions
         ),
+        "exact_queries": {
+            name: exact_queries[name] for name in sample_names
+        } if exact_queries else None,
+        "reference_paths": list(reference_paths),
+        "snp_shards_dir": os.path.abspath(snp_shards_dir) if snp_shards_dir else None,
     }
     with open(_fast_manifest_path(shards_dir), "wb") as handle:
         pickle.dump(manifest, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -6710,7 +8949,8 @@ def _fast_stage_scan(
         for key in (
             "version", "input_paths", "sample_names",
             "file_sample_indexes", "sample_index_by_name",
-            "ignore_full_locus_dup_insertions",
+            "ignore_full_locus_dup_insertions", "exact_queries",
+            "reference_paths", "snp_shards_dir",
         )
     }
     with open(
@@ -6722,6 +8962,12 @@ def _fast_stage_scan(
     coverage_by_chrom: Dict[str, list] = defaultdict(list)
     for cov_chrom, sample, start, end in coverage_tuples:
         coverage_by_chrom[cov_chrom].append((sample, start, end))
+    exact_by_chrom: Dict[str, Dict[int, list]] = defaultdict(dict)
+    if exact_queries:
+        for file_index in range(len(input_paths)):
+            with open(_fast_exact_sidecar_path(records_dir, file_index), "rb") as handle:
+                for (cov_chrom, sample), array in pickle.load(handle).items():
+                    exact_by_chrom[cov_chrom].setdefault(sample, []).append(array)
     chrom_root = os.path.join(shards_dir, "chroms")
     os.makedirs(chrom_root, exist_ok=True)
     missing_lengths: List[str] = []
@@ -6750,6 +8996,16 @@ def _fast_stage_scan(
                     coverage_by_chrom.get(chrom, []), out,
                     protocol=pickle.HIGHEST_PROTOCOL,
                 )
+            if exact_queries:
+                np.savez(os.path.join(subfolder, _EXACT_COVERAGE_NAME), **{
+                    str(sample): (
+                        arrays[0] if len(arrays) == 1
+                        else _exact_coverage_array(
+                            np.concatenate(arrays).reshape(-1, 2).tolist()
+                        )
+                    )
+                    for sample, arrays in sorted(exact_by_chrom.get(chrom, {}).items())
+                })
             chrom_length = chrom_lengths.get(chrom)
             if chrom_length is None:
                 missing_lengths.append(chrom)
@@ -6872,9 +9128,19 @@ def _fast_stage_chrom(
                 if os.path.isfile(coverage_path):
                     with open(coverage_path, "rb") as fh:
                         chrom_coverage = pickle.load(fh)
+                exact_coverage = _fast_load_exact_coverage(subfolder)
+                if exact_coverage is not None:
+                    print(
+                        f"[merge:exact] {chrom}: coverage for "
+                        f"{len(exact_coverage)} sample(s), "
+                        f"{sum(len(a) // 2 for a in exact_coverage.values())} "
+                        "interval(s)",
+                        file=sys.stderr,
+                    )
             else:
                 chrom = chrom_token
                 chrom_coverage = None
+                exact_coverage = None
                 sections = manifest["chrom_sections"].get(chrom)
             if sections is None:
                 known = ", ".join(sorted(manifest["chrom_sections"])[:8])
@@ -6889,6 +9155,32 @@ def _fast_stage_chrom(
                     print(f"[merge:skip] {chrom}: checked complete", file=sys.stderr, flush=True)
                     continue
                 directory = checkpoints.prepare(shards_dir, chrom, context)
+                _FAST_DUP_STATE.clear()
+                if manifest.get("exact_queries") and exact_coverage is not None:
+                    # Passed to emission tasks for shifted-insertion realignment.
+                    _FAST_DUP_STATE["exact"] = {
+                        "coverage": exact_coverage,
+                        "references": list(manifest.get("reference_paths") or ()),
+                        "queries": dict(manifest["exact_queries"]),
+                        # F3: per-input SNP indexes and the SNP stage's records.
+                        "records_dir": records_dir,
+                        "snp_shards_dir": manifest.get("snp_shards_dir"),
+                    }
+                if manifest.get("exact_queries"):
+                    tc_matrix, tc_ranges = _fast_load_chrom_columns(
+                        records_dir, sections, "TC",
+                    )
+                    if tc_matrix.shape[0]:
+                        tc_files = _fast_row_files(
+                            np.arange(tc_matrix.shape[0]), tc_ranges,
+                        )
+                        _FAST_DUP_STATE["records"] = [
+                            (int(tc_files[row]), *(int(v) for v in tc_matrix[row]))
+                            for row in range(tc_matrix.shape[0])
+                        ]
+                        _FAST_DUP_STATE["references"] = list(
+                            manifest.get("reference_paths") or (),
+                        )
                 resume_nested = checkpoints.has_stage(directory, "nested")
                 resume_refined = checkpoints.has_stage(directory, "refined")
                 scratch = os.path.join(shards_dir, "linkscratch", _safe_locus_key(chrom))
@@ -7004,6 +9296,7 @@ def _fast_stage_chrom(
         if pool is not None:
             pool.terminate()
             pool.join()
+        _exact_release()
 
 
 def _fast_copy_vcf_body(source, out, *, collect_insertions=False, block_size=8 * 1024 * 1024):
@@ -7018,9 +9311,12 @@ def _fast_copy_vcf_body(source, out, *, collect_insertions=False, block_size=8 *
         fields = prefix.rstrip(b"\r\n").split(b"\t")
         if len(fields) != 8 or tabs != 8:
             raise ValueError("invalid VCF part: expected at least nine columns")
-        info = parse_info_field(fields[7].decode("utf-8"))
+        info_text = fields[7].decode("utf-8")
+        info = parse_info_field(info_text)
         if info.get("SVTYPE") == "INS":
-            insertion_ids.add(fields[2].decode("utf-8"))
+            insertion_ids.add(checkpoints.insertion_snp_owner(
+                fields[2].decode("utf-8"), info_text,
+            ))
 
     # readline(size) bounds memory even for very wide cohort rows. When no
     # insertion manifest is needed, copy full blocks without visiting rows.
@@ -7760,6 +10056,8 @@ def merge_locus_vcfs(args) -> None:
                     args.ignore_full_locus_dup_insertions
                 ),
                 candidate_min_size=args.candidate_min_size,
+                exact_query_paths=args.exact,
+                reference_paths=args.reference or (),
             )
         elif args.stage == "chrom":
             if not args.chrom:
@@ -7964,6 +10262,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--size-similarity", type=float, default=0.7, metavar="FRACTION",
         help="minimum min(size)/max(size) for merging [0.7]",
+    )
+    parser.add_argument(
+        "--exact", metavar="QUERY_PATHS", default=None,
+        help="scan: realign merged SVs against the assemblies listed as "
+             "NAME FASTA [FAI] (indexed); requires --reference",
+    )
+    parser.add_argument(
+        "--reference", action="append", default=None, metavar="FASTA",
+        help="indexed reference FASTA for --exact; repeat for the local "
+             "reference templates",
     )
     parser.add_argument("--kmermatch", default=DEFAULT_KMERMATCH,
                         help="KmerMatch executable for longest-first INS partitioning [beside this script]")

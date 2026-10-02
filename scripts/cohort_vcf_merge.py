@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import pickle
 import shutil
+import sys
+import time
 
 import graphvcfmerge as sv
 import graphvcfmerge_snp as snp
@@ -15,8 +17,13 @@ import graphvcfmerge_snp as snp
 
 def add_modes(parser):
     group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--exact', nargs='?', const='auto', default=None, metavar='QUERY_PATHS',
+        help='default: like --all, and realign merged SVs against the indexed '
+             'assemblies (NAME FASTA [FAI] per line; default: the cohort\'s '
+             'inputs/query_paths.normalized.txt)')
     for name, help_text in (
-        ('all', 'merge into separate cohort.sv.vcf, cohort.indel.vcf and cohort.snp.vcf (default)'),
+        ('all', 'merge into separate cohort.sv.vcf, cohort.indel.vcf and cohort.snp.vcf'),
         ('svonly', 'merge SVs at or above --svcutoff into cohort.sv.vcf'),
         ('snp', 'merge only SNPs into cohort.snp.vcf'),
         ('svindel', 'merge SVs and split by size into cohort.sv.vcf and cohort.indel.vcf'),
@@ -27,6 +34,46 @@ def add_modes(parser):
 
 def resolve_mode(args):
     return getattr(args, 'merge_mode', None) or 'all'
+
+
+def resolve_exact(args):
+    """--exact value ('auto' or a query-path list); None for an explicit mode."""
+    if getattr(args, 'merge_mode', None):
+        return None
+    return getattr(args, 'exact', None) or 'auto'
+
+
+def mode_arguments(args):
+    """Command-line form of the resolved mode, for forwarding to a backend."""
+    exact = resolve_exact(args)
+    if exact is None:
+        return ['--' + resolve_mode(args)]
+    return ['--exact'] + ([] if exact == 'auto' else [str(exact)])
+
+
+def exact_inputs(output, exact, references=()):
+    """Query-path list and reference FASTAs for --exact.
+
+    'auto' uses the cohort's normalized query list; without explicit FASTAs,
+    the run configuration's reference and the lifted local templates are used.
+    """
+    output = Path(output)
+    query_paths = (output/'inputs/query_paths.normalized.txt'
+                   if exact == 'auto' else Path(exact))
+    references = [str(path) for path in references]
+    if not references:
+        run_config = output/'inputs/cohort_call.run.json'
+        if run_config.is_file():
+            references.append(json.loads(run_config.read_text())['reference_fasta'])
+        templates = output/'checkpoints/local_reference_templates.fa'
+        if templates.is_file():
+            references.append(str(templates))
+    if not query_paths.is_file() or not references:
+        raise ValueError(
+            f'--exact needs a query-path list ({query_paths}) and reference '
+            'FASTAs (--reference-fasta, or a cohort output folder); '
+            'pass --all to merge without realignment')
+    return str(query_paths), references
 
 
 def output_paths(output, mode):
@@ -128,10 +175,24 @@ def cleanup_merge_directories(output, directories, *, protected=()):
         if path not in candidates:
             candidates.append(path)
     # Validate every target before deleting any of them.
+    sv._exact_release()
     for path in candidates:
         if path.exists():
-            shutil.rmtree(path)
-            print(f'[cohort-merge] removed temporary directory: {path}', flush=True)
+            for attempt in range(2):
+                try:
+                    shutil.rmtree(path)
+                    print(f'[cohort-merge] removed temporary directory: {path}', flush=True)
+                    break
+                except OSError as error:
+                    if attempt:
+                        # The merged VCFs are already published: leftover
+                        # scratch (e.g. an NFS .nfs* file of a file another
+                        # process still has open) must not fail the merge.
+                        print(f'[cohort-merge] warning: could not remove temporary directory '
+                              f'{path}: {error}; remove it once no merge process is running',
+                              file=sys.stderr, flush=True)
+                    else:
+                        time.sleep(5)
 
 
 def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
@@ -153,8 +214,13 @@ def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
 def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=20,
         merge_distance=500, size_similarity=.7, sequence_similarity=.7, var_in_insert=100,
         kmermatch=sv.DEFAULT_KMERMATCH, dry_run=False, keep_merge_tmpdir=False,
-        ignore_full_locus_dup_insertions=True):
+        ignore_full_locus_dup_insertions=True, exact=None, reference_fastas=()):
     paths = list(paths) if paths is not None else input_paths(output, listing)
+    if exact and mode != 'all':
+        raise ValueError('--exact merges like --all')
+    exact_query_paths, reference_fastas = (
+        exact_inputs(output, exact, reference_fastas) if exact else (None, [])
+    )
     if not paths or processes < 1 or cutoff < 1:
         raise ValueError('merge requires input VCFs and positive process count/cutoff')
     print(f'[cohort-merge] mode={mode}; {len(paths)} input VCFs; {processes} workers', flush=True)
@@ -171,6 +237,9 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
             ignore_full_locus_dup_insertions
         ),
     )
+    if exact:
+        identity_settings['exact'] = [str(Path(exact_query_paths).resolve()),
+                                      [str(Path(p).resolve()) for p in reference_fastas]]
     identity = hashlib.sha256(json.dumps([stamps, identity_settings, mode == "all", "worker-snp-v3"]).encode()).hexdigest()[:20]
     root = Path(output)/'tmp'/'merge_only'/identity
     root.mkdir(parents=True, exist_ok=True)
@@ -186,6 +255,8 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
                 ignore_full_locus_dup_insertions=(
                     ignore_full_locus_dup_insertions
                 ),
+                exact_query_paths=exact_query_paths,
+                reference_paths=reference_fastas,
             )
         with open(Path(shards)/'manifest.pkl', 'rb') as handle:
             manifest = pickle.load(handle)
@@ -225,6 +296,8 @@ def main(argv=None):
     parser.add_argument('--sequence-similarity', type=float, default=.7)
     parser.add_argument('--var-in-insert', type=int, default=100)
     parser.add_argument('--kmermatch', default=sv.DEFAULT_KMERMATCH)
+    parser.add_argument('--reference-fasta', action='append', default=[],
+                        help='--exact: indexed reference FASTA; repeat for the local reference templates')
     parser.add_argument('--sv-input')
     parser.add_argument('--snp-input')
     parser.add_argument('--indel-input')
@@ -258,7 +331,7 @@ def main(argv=None):
             keep_merge_tmpdir=args.keep_merge_tmpdir,
             ignore_full_locus_dup_insertions=(
                 args.ignore_full_locus_dup_insertions
-            ))
+            ), exact=resolve_exact(args), reference_fastas=args.reference_fasta)
     return 0
 
 

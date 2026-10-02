@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import functools
+import hashlib
 import math
 import os
 import re
@@ -359,8 +360,8 @@ def _alignment_pair_task(args):
 def mappy_body_once(query, template, aligner):
     """One map() invocation, forward primary hit only; no exact rescue.
 
-    H pads unmatched reference ends, I preserves unmatched query ends, as in
-    the merger's existing representation. A failed mapping is kept separate.
+    D covers unmatched reference ends and I preserves unmatched query ends, so
+    the body spans the whole template. A failed mapping is kept separate.
     """
     if not query or not template:
         return None
@@ -377,10 +378,10 @@ def mappy_body_once(query, template, aligner):
     if not (0 <= best.r_st < best.r_en <= len(template)
             and 0 <= best.q_st < best.q_en <= len(query)):
         raise ValueError("mappy returned invalid alignment coordinates")
-    return ((f"{best.r_st}H" if best.r_st else "")
+    return ((f"{best.r_st}D" if best.r_st else "")
             + (f"{best.q_st}I" if best.q_st else "") + best.cigar_str
             + (f"{len(query) - best.q_en}I" if best.q_en < len(query) else "")
-            + (f"{len(template) - best.r_en}H" if best.r_en < len(template) else ""))
+            + (f"{len(template) - best.r_en}D" if best.r_en < len(template) else ""))
 
 
 def _align_task(args):
@@ -676,7 +677,7 @@ def _bridge_later_groups(partitions, members, locators, store, root, executable,
                     # but has no direct alignment to the surviving template.
                     body = (
                         (f"{locators[index][1]}I" if locators[index][1] else "")
-                        + (f"{locators[pick][1]}H" if locators[pick][1] else "")
+                        + (f"{locators[pick][1]}D" if locators[pick][1] else "")
                     )
                 bodies[index] = body
         merged.append((pick, groups[slot], bodies))
@@ -694,10 +695,13 @@ def refine_loaded(members, sequences, row_ids, context, pooled_map=None, workers
         root = Path(directory)
         store = str(root / "sequences.bin")
         locators = []
+        digests = []
         with open(store, "wb") as out:
             for sequence in sequences:
                 blob = sequence.encode("ascii")
                 locators.append((out.tell(), len(blob)))
+                digests.append(hashlib.blake2b(blob.upper(), digest_size=16).digest()
+                               if blob else None)
                 out.write(blob)
         if len(locators) != len(members):
             raise ValueError("Sequence/member count mismatch")
@@ -705,6 +709,21 @@ def refine_loaded(members, sequences, row_ids, context, pooled_map=None, workers
         selection = sorted(range(len(members)), key=lambda i: (
             locators[i][1], -members[i][0], row_ids.get(members[i][4], ""), -members[i][4],
         ), reverse=True)
+        # Identical sequences align identically: only the first in selection
+        # order is aligned, its twins join its group afterwards. Without this
+        # the per-member alignment budget (2) could leave a twin of a later
+        # template unaligned, splitting one allele across rows.
+        leader_by_digest = {}
+        twins = {}
+        for index in selection:
+            digest = digests[index]
+            if digest is None:
+                continue
+            leader = leader_by_digest.setdefault(digest, index)
+            if leader != index:
+                twins.setdefault(leader, []).append(index)
+        twin_set = {index for group in twins.values() for index in group}
+        selection = [index for index in selection if index not in twin_set]
         remaining = set(selection)
         partitions = []
         score_number = 0
@@ -888,6 +907,11 @@ def refine_loaded(members, sequences, row_ids, context, pooled_map=None, workers
 
         refined = []
         for pick, indexes, bodies in partitions:
+            for index in list(indexes):
+                for twin in twins.get(index, ()):
+                    indexes.append(twin)
+                    bodies[twin] = (f"{locators[twin][1]}=" if index == pick
+                                    else bodies[index])
             group = [members[index] + (bodies[index],) for index in indexes]
             group.sort(key=lambda member: (
                 member[0], member[1], member[2], member[4],

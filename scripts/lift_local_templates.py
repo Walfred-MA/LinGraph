@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Place fixed template sequences or refinable templates with source flanks."""
+"""Place each local template on the backbone by its own stored sequence."""
 from collections import defaultdict
 from dataclasses import replace
 import argparse
@@ -8,10 +8,10 @@ from pathlib import Path
 import tempfile
 
 from assembly_contigs import accepted_contig
-from gfa_query_anchors import read_query_list, reverse_complement
+from gfa_query_anchors import reverse_complement
 from local_reference_templates import read_templates, write_templates
 from minsetref_core import IndexedFasta, wrap_fasta
-from minsetref_localize import LocalizeResult, Placement, anchor_blocks_from_hits, localize_insertion
+from minsetref_localize import LocalizeResult, Placement, anchor_blocks_from_hits
 
 
 def annotate(template, result, backbone, source_forward=True):
@@ -51,46 +51,33 @@ def localize_fixed_template(length, blocks):
 def lift_templates(templates, sources, backbone_fasta, backbone, workdir,
                    threads=1, flank=10000, min_identity=95.0, min_segment=300,
                    collect=None):
+    """Place every template by its own stored sequence.
+
+    A template is an independent piece: input assemblies are never opened, so
+    a different assembly version under the same sample name cannot change or
+    block its lift.  ``sources`` and ``flank`` are kept for call compatibility.
+    """
     templates = [t for t in templates if accepted_contig(t.source_haplotype, t.source_contig)]
     results, queries = {}, {}
-    by_sample = defaultdict(list)
-    for index, template in enumerate(templates):
-        by_sample[template.source_haplotype].append((index, template))
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    anchored = workdir / 'source_flanks.fa'
+    anchored = workdir / 'template_sequences.fa'
     with IndexedFasta(backbone_fasta) as reference, anchored.open('w') as out:
-        for sample, group in sorted(by_sample.items()):
-            for index, template in group:
-                if template.fixed:
-                    query = f'template_{index}'
-                    queries[query] = index, 0, len(template.sequence)
-                    out.write(f'>{query}\n{wrap_fasta(template.sequence)}\n')
-            group = [(index, template) for index, template in group if not template.fixed]
-            if not group:
-                continue
-            source = sources.get(sample)
-            if source is None:
-                for index, _template in group:
-                    results[index] = LocalizeResult('unmapped', [], 'source assembly unavailable')
-                continue
-            with IndexedFasta(*source) as reader:
-                for index, template in group:
-                    contig, start, end = template.source_contig, template.source_start, template.source_end
-                    if contig not in reader.index or not 0 <= start < end <= reader.index[contig][0]:
-                        raise ValueError(f'{template.name}: source interval is outside its assembly')
-                    core = reader.fetch(contig, start, end)
-                    expected = core if template.source_strand == '+' else reverse_complement(core)
-                    if expected.upper() != template.sequence.upper():
-                        raise ValueError(f'{template.name}: template sequence differs from source provenance')
-                    if sample == backbone and contig in reference.index:
-                        if end <= reference.index[contig][0] and reference.fetch(contig, start, end).upper() == core.upper():
-                            results[index] = LocalizeResult('mapped', [Placement(contig, start, end, '+')], 'direct source')
-                            continue
-                    low, high = max(0, start-flank), min(reader.index[contig][0], end+flank)
-                    query = f'template_{index}'
-                    queries[query] = index, start-low, end-low
-                    out.write(f'>{query}\n{wrap_fasta(reader.fetch(contig, low, high))}\n')
+        for index, template in enumerate(templates):
+            sequence = template.sequence.upper()
+            contig, start, end = template.source_contig, template.source_start, template.source_end
+            # A backbone-sourced template is placed directly only when its own
+            # bases equal the backbone at the recorded interval.
+            if (not template.fixed and template.source_haplotype == backbone
+                    and contig in reference.index and 0 <= start < end <= reference.index[contig][0]):
+                core = reference.fetch(contig, start, end).upper()
+                if sequence in (core, reverse_complement(core)):
+                    strand = '+' if sequence == core else '-'
+                    results[index] = LocalizeResult('mapped', [Placement(contig, start, end, strand)], 'direct source')
+                    continue
+            query = f'template_{index}'
+            queries[query] = index, 0, len(template.sequence)
+            out.write(f'>{query}\n{wrap_fasta(template.sequence)}\n')
         if queries:
             # The aligner opens this file separately; flush the final buffered
             # records even when the complete query FASTA is smaller than 8 KiB.
@@ -101,16 +88,15 @@ def lift_templates(templates, sources, backbone_fasta, backbone, workdir,
             hits = collect(str(anchored), backbone_fasta, str(workdir / 'align'), threads,
                            min_identity, min_segment, logging.getLogger('lift-local-templates'),
                            skip_blastn=True, broad_aligner='minimap2',
-                           minimap_params=dict(preset='asm5', p=0.001, N=100, f=0.001, K='100M'))
+                           minimap_params=dict(preset=None, p=0.001, N=100, f=0.001, K='100M'))
             grouped = defaultdict(list)
             for hit in hits:
                 grouped[hit.query_id].append(hit)
             for query, (index, start, end) in queries.items():
                 blocks = [b for b in anchor_blocks_from_hits(grouped[query], query)
                           if b.main in reference.index and accepted_contig(backbone, b.main)]
-                results[index] = (localize_fixed_template(end, blocks) if templates[index].fixed else
-                                  localize_insertion(start, end, blocks, flank, require_unique=True))
-    return [annotate(template, results[index], backbone, source_forward=not template.fixed)
+                results[index] = localize_fixed_template(end, blocks)
+    return [annotate(template, results[index], backbone, source_forward=False)
             for index, template in enumerate(templates)]
 
 
@@ -119,22 +105,21 @@ def main(argv=None):
     parser.add_argument('--input', required=True)
     parser.add_argument('--reference-fasta', required=True)
     parser.add_argument('--reference-haplotype', required=True)
-    parser.add_argument('--assemblies', help='NAME FASTA [FAI] source assembly list')
-    parser.add_argument('--source', action='append', nargs=2, default=[], metavar=('SAMPLE', 'FASTA'))
+    # Accepted for existing pipeline commands; templates never read input assemblies.
+    parser.add_argument('--assemblies', help='ignored: templates are lifted from their own sequence')
+    parser.add_argument('--source', action='append', nargs=2, default=[], metavar=('SAMPLE', 'FASTA'),
+                        help='ignored: templates are lifted from their own sequence')
     parser.add_argument('--output', required=True)
     parser.add_argument('--threads', type=int, default=1)
     parser.add_argument('--flank', type=int, default=10000)
     args = parser.parse_args(argv)
     if args.threads < 1 or args.flank < 1:
         parser.error('threads and flank must be positive')
-    sources = read_query_list(args.assemblies) if args.assemblies else {}
-    sources.update({sample: (fasta, None) for sample, fasta in args.source})
-    sources[args.reference_haplotype] = args.reference_fasta, None
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format='[lift-local-templates] %(message)s')
     with tempfile.TemporaryDirectory(prefix='template-lift-', dir=output.parent) as work:
-        templates = lift_templates(read_templates(args.input, load_sequences=True), sources,
+        templates = lift_templates(read_templates(args.input, load_sequences=True), {},
                                    args.reference_fasta, args.reference_haplotype,
                                    work, args.threads, args.flank)
         write_templates(str(output), templates)

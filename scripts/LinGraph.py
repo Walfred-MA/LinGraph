@@ -205,11 +205,11 @@ def check_fasta(path):
     if any(c.isspace() for c in str(path)):
         raise ValueError(f"FASTA paths cannot contain whitespace: {path}")
     if path.suffix.lower() in {".gz", ".bgz", ".bgzf"}:
-        raise ValueError(f"Use an uncompressed assembly FASTA: {path}; run preparation/prepare_assemblies.py separately")
+        raise ValueError(f"Use an uncompressed assembly FASTA: {path}; run tools/prepare_assemblies.py separately")
 
 
 def check_prepared(name, fasta):
-    """Inspect only the first FASTA record and first FAI row; never modify inputs."""
+    """Inspect the first FASTA record and the FAI names; never modify inputs."""
     native_reference = name in {"CHM13_h1", "HG38_h1"}
 
     def fail(reason):
@@ -220,11 +220,11 @@ def check_prepared(name, fasta):
                 "Regenerate the adjacent index with: "
                 + shlex.join(["samtools", "faidx", str(fasta)])
             )
-        command = [sys.executable, str(ROOT / "preparation" / "prepare_assemblies.py"),
+        command = [sys.executable, str(ROOT / "tools" / "prepare_assemblies.py"),
                    "-i", str(fasta), "--name", name, "-O", "prepared_assemblies",
                    "--remask", "--contignamefix"]
         raise ValueError(f"Assembly {name} is not ready: {reason}.\n"
-                         "Please mask/format/index it separately with preparation/prepare_assemblies.py, for example:\n"
+                         "Please mask/format/index it separately with tools/prepare_assemblies.py, for example:\n"
                          + shlex.join(command) + "\nThen use prepared_assemblies/query_paths.prepared.txt with -I. "
                          "LinGraph has not modified this assembly.")
 
@@ -255,6 +255,19 @@ def check_prepared(name, fasta):
             fail(f"the first entry of {index} is invalid or does not match the FASTA")
         if native_reference:
             return
+        # Every indexed name, not just the first: a collision such as
+        # HG002#1#HG002#2#chr19_MATERNAL can follow a correctly named chrM.
+        with index.open() as fai:
+            for row in fai:
+                indexed = row.split("\t", 1)[0]
+                rest = indexed
+                while rest.startswith(prefix + "#"):
+                    rest = rest[len(prefix) + 1:]
+                collision = re.match(r"([A-Za-z0-9.-]+#[1-9][0-9]*)#", rest)
+                if collision:
+                    fail(f"sequence {indexed!r} carries sample prefix "
+                         f"{collision.group(1)!r}, which collides with {prefix!r}; "
+                         "sample names may not collide")
         masked = False
         for line in handle:
             if line.startswith(b">"):
@@ -407,7 +420,7 @@ def reference(args, cohort, samples):
         with fasta.open() as handle:
             first_fields = handle.readline().lstrip(">").split()
         if not first_fields:
-            raise ValueError(f"Empty reference FASTA header: {fasta}; run preparation/prepare_assemblies.py separately")
+            raise ValueError(f"Empty reference FASTA header: {fasta}; run tools/prepare_assemblies.py separately")
         first = first_fields[0]
         prefix = first.split("#")
         inferred = prefix[0] + "_h" + prefix[1] if len(prefix) >= 2 else sample_pipeline.fasta_stem(fasta)
@@ -484,7 +497,7 @@ def graph_mode(args, runner, graph, output, samples, ref):
               "-j", args.threads, "--snakemake", args.snakemake,
               "--sample-threads", min(16, args.threads), "--match-threads", min(4, args.threads),
               "--io-jobs", min(16, args.threads), "--format-processes", min(16, args.threads),
-              "--svcutoff", args.svcutoff, "--" + cohort_merge.resolve_mode(args)]
+              "--svcutoff", args.svcutoff, *cohort_merge.mode_arguments(args)]
     common += workflow_slurm_options(args)
     common += cli_options.forward(args, 'call')
     if args.dag_dry_run:
@@ -853,7 +866,7 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     inputs += [ROOT / name for name in ("gfa_interval_pipeline.py", "gfa_interval_metadata.py",
                "gfa_query_anchors.py", "gfa_stable_coords.py", "gfa_source_catalog.py",
                "gfa_catalog_paths.py", "gfa_duplications.py", "gfa_topology.py",
-               "gfa_partitioned.py", "minsetref_core.py", "minsetref_segments.py",
+               "gfa_partitioned.py", "gfa_junctions.py", "minsetref_core.py", "minsetref_segments.py",
                "assembly_contigs.py")]
     if args.slurm:
         wrapper = [sys.executable, ROOT / 'graph_build_snakemake/workflow/scripts/pipeline_inputs.py',
@@ -934,7 +947,7 @@ def submit(args, argv):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == 'prepare':
-        return subprocess.call([sys.executable, str(ROOT / 'preparation/prepare_assemblies.py'), *argv[1:]])
+        return subprocess.call([sys.executable, str(ROOT / 'tools/prepare_assemblies.py'), *argv[1:]])
     p = parser(show_advanced="--help-all" in argv)
     args = p.parse_args(argv)
     if args.unlock:
@@ -1023,7 +1036,8 @@ def main(argv=None):
             return submit(args, argv)
         cohort_merge.run(output, cohort_merge.resolve_mode(args),
                          listing=absolute(args.vcf_list) if args.vcf_list else None,
-                         cutoff=args.svcutoff, dry_run=args.dry_run, **cli_options.merge_settings(args))
+                         cutoff=args.svcutoff, dry_run=args.dry_run,
+                         exact=cohort_merge.resolve_exact(args), **cli_options.merge_settings(args))
         if not args.mc_graph:
             return 0
     if args.gfa_only and args.slurm:
@@ -1090,7 +1104,7 @@ def main(argv=None):
         check_fasta(fasta)
         if not Path(str(fasta) + ".fai").is_file():
             raise ValueError(f"Missing adjacent index {fasta}.fai; index the alternative FASTA separately before running LinGraph")
-    say(f"Preparation checks passed for {len(checked)} assemblies (first sequence and adjacent index only)")
+    say(f"Preparation checks passed for {len(checked)} assemblies (first sequence, adjacent index and contig-name collisions)")
     if args.slurm and args.mode == "singular":
         return submit(args, argv)
     runner = Runner(args)
