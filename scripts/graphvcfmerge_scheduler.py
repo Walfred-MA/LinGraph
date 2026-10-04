@@ -11,11 +11,9 @@ from collections import deque
 from concurrent.futures import CancelledError, Future, TimeoutError as FutureTimeout
 from contextlib import contextmanager
 import importlib
-import json
 import math
 import os
 from pathlib import Path
-import pickle
 import queue
 import signal
 import sys
@@ -290,27 +288,22 @@ def worker():
     sys.stdout = sys.stderr
     # Import once before the first request; native thread limits are set at exec.
     import graphvcfmerge as merger
+    from graphvcfmerge_nested import _read_request, _write_result
     import graphreftovcf
     del graphreftovcf
     for command in sys.stdin.buffer:
-        fields = command.decode().rstrip('\n').split('\t')
-        if len(fields) != 2 or fields[0] != 'run':
-            raise ValueError('invalid shared alignment worker request')
-        root = Path(json.loads(fields[1]))
+        request, root, framed = _read_request(command)
         try:
-            with (root / 'request.pkl').open('rb') as source:
-                module, name, payload = pickle.load(source)
+            module, name, payload = request
             result = (True, getattr(importlib.import_module(module), name)(payload))
         except Exception:
             result = (False, traceback.format_exc())
-        with (root / 'result.pkl').open('wb') as out:
-            pickle.dump(result, out, protocol=pickle.HIGHEST_PROTOCOL)
+        _write_result(acknowledgements, root, result, framed)
         del result
+        del request
         if 'payload' in locals():
             del payload
         merger._truvari_seqsim_cached.cache_clear()
-        acknowledgements.write('done\n')
-        acknowledgements.flush()
 
 
 if __name__ == '__main__':

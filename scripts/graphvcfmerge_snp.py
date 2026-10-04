@@ -73,6 +73,7 @@ def _scan_one(task):
     directory = Path(directory) / str(index)
     directory.mkdir()
     handles, chroms, meta, samples = OrderedDict(), {}, [], []
+    alternative_entries = set()
 
     def write(chrom, text):
         key = hashlib.sha256(chrom.encode()).hexdigest()
@@ -93,6 +94,10 @@ def _scan_one(task):
                         if values.get('Sample'):
                             write(values['Chrom'], raw)
                     elif raw.startswith('##'):
+                        if raw.startswith('##pseudoLinearMapping=<'):
+                            entry = vcf.alternative_path_entry(raw.strip())
+                            if entry is not None:
+                                alternative_entries.add(entry)
                         if not raw.startswith('##referenceCoverage'):
                             meta.append(raw.strip())
                     elif raw.startswith('#CHROM\t'):
@@ -103,6 +108,10 @@ def _scan_one(task):
                         if not samples:
                             raise ValueError('missing #CHROM sample header')
                         row = vcf.parse_vcf_record(raw, number)
+                        # A copy's differences against its source (Path=alt
+                        # entries only) are annotations, never merged.
+                        if vcf.alternative_path_record(row.info, alternative_entries):
+                            continue
                         if len(row.samples) != len(samples):
                             raise ValueError('sample column count differs from header')
                         if snp_only and not vcf.is_snp_format(row.fmt):
@@ -257,6 +266,9 @@ def merge_chrom(shards_dir, chrom, processes=1):
                 digest = hashlib.sha256(json.dumps([chrom, allele_key]).encode()).hexdigest()[:20]
                 row.id = f'{kind.upper()}_{vcf._safe_variant_token(chrom)}_{row.pos}_{digest}'
                 row.samples, row.fmt = fields, fmt
+                # PAMAP/PAPATH cite one sample's own header lines: not merged.
+                row.info = ';'.join(item for item in row.info.split(';')
+                                    if item.split('=', 1)[0] not in ('PAMAP', 'PAPATH')) or '.'
                 row.info = vcf.update_info_nsup(row.info, sum(bool(a) for a in site['alleles'].values()))
                 handle.write(vcf.format_vcf_record(row) + '\n')
                 count += 1
@@ -284,7 +296,8 @@ def concat(shards_dir, snp_output, indel_output=None, *, insertion_snps=None):
                 with part.open() as source:
                     shutil.copyfileobj(source, handle)
             if kind == 'snp':
-                append_insertions(handle, manifest, insertions)
+                append_insertions(handle, manifest, insertions,
+                                  root=insertion_snps or manifest.get('insertion_snps'))
 
 
 def merge(paths, snp_output, indel_output=None, *, cutoff=20, processes=1, tmpdir=None, snp_only=False, insertion_snps=None):

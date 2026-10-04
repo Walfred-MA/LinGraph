@@ -168,6 +168,10 @@ LOCUS_DUP_AS_INSERT_OPTION = (
 )
 MERGE_MINSVSIZE = int(MERGE_RUN.get("minsvsize", 20))
 MERGE_MODE = MERGE_RUN.get("merge_mode", "svonly")
+# --exact (default): realign merged SVs against the indexed assemblies.
+MERGE_EXACT = MERGE_RUN.get("exact")
+if MERGE_EXACT and MERGE_MODE != "all":
+    raise ValueError("merge config: exact requires merge_mode all")
 MERGE_EMIT_SMALL = MERGE_MODE in ("all", "svindel")
 MERGE_SMALL_OPTION = "--output-small" if MERGE_EMIT_SMALL else ""
 MERGE_DISTANCE = int(MERGE_RUN.get("merge_distance", 500))
@@ -699,7 +703,7 @@ rule fill_graphcigartoref_gaps_sample:
           --fasta-query {input.query_fasta:q} \
           --reference {input.reference:q} --output {output.graphcigar:q} \
           --local-reference-templates {input.local_templates:q} \
-          --processes {SAMPLE_THREADS}
+          --processes {SAMPLE_THREADS} --strict
         {WAIT_NONEMPTY} {output.graphcigar:q}
         test -s {output.genomeliftfix:q}
         {WAIT_NONEMPTY} {output.pseudolinear:q}
@@ -805,6 +809,14 @@ if MERGE_MODE != "snp":
             stage_config=MERGE_CONFIG_PATH,
             vcf_list=rules.merge_vcf_list.output,
             script=ancient(str(MERGE_SCRIPT)),
+            exact=(
+                [
+                    ancient(str(NORMALIZED_QUERY if MERGE_EXACT == "auto" else MERGE_EXACT)),
+                    ancient(RUN["reference_fasta"]), ancient(RUN["reference_fai"]),
+                    rules.local_reference_templates.output.fasta,
+                    rules.local_reference_templates.output.fai,
+                ] if MERGE_EXACT else []
+            ),
         output:
             chroms=merge_temporary(MERGE_CHROMS),
             raw=[merge_temporary(SMALL_MERGE_TMPDIR / "raw.manifest.json")] if MERGE_MODE == "all" else [],
@@ -817,13 +829,18 @@ if MERGE_MODE != "snp":
                 MERGE_SCAN_MEMORY,
             ),
             snps=shlex.join(["--snp-shards-dir", str(SMALL_MERGE_TMPDIR)]) if MERGE_MODE == "all" else "",
+            exact=shlex.join([
+                "--exact", str(NORMALIZED_QUERY if MERGE_EXACT == "auto" else MERGE_EXACT),
+                "--reference", RUN["reference_fasta"],
+                "--reference", str(LOCAL_TEMPLATES),
+            ]) if MERGE_EXACT else "",
         shell:
             """
             {params.slurm} {PYTHON:q} {input.script:q} \
               -I {input.vcf_list:q} --stage scan \
               --shards-dir {MERGE_TMPDIR:q} --sv --candidate-min-size 0 \
               --processes {MERGE_SCAN_PROCESSES} \
-              {MERGE_LOCUS_DUP_OPTION} {params.snps}
+              {MERGE_LOCUS_DUP_OPTION} {params.snps} {params.exact}
             test -e {output.chroms:q}
             """
 
@@ -904,6 +921,8 @@ if SMALL_VCFS:
         input:
             manifest=lambda wc: checkpoints.graphvcfmerge_small_scan.get().output.shards,
             script=ancient(str(SMALL_MERGE_SCRIPT)),
+            # --exact: the SV chromosome stage writes SNP realignment records.
+            sv_chroms=[rules.graphvcfmerge_chroms.output] if MERGE_EXACT else [],
         output:
             snp=merge_temporary(SMALL_MERGE_TMPDIR / "{generation}" / "parts" / "{chrom}.snp.part"),
             indel=merge_temporary(SMALL_MERGE_TMPDIR / "{generation}" / "parts" / "{chrom}.indel.part"),

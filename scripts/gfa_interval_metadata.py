@@ -10,6 +10,10 @@ from assembly_contigs import accepted_contig
 _CHUNK = re.compile(r'[<>]([^<>]*)')
 _OP = re.compile(r'(\d+)([=MXIDHS])')
 _PAYLOAD = re.compile(r'[A-Za-z]+')
+# --exact full-locus duplication sites point at their shared template path
+# DUP_<locus>_<start>_<end>, the reference interval [start, end) of <locus>.
+_TEMPLATE_SITE = re.compile(r'>(DUP_.+_\d+_\d+):(\d+)=')
+TEMPLATE_PATH = re.compile(r'DUP_(.+)_(\d+)_(\d+)')
 
 
 def graph_runs(text, size):
@@ -256,13 +260,18 @@ def _other_variant(fields, info, samples, samples_available, cutoff,
 
 def rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=None,
          *, insertion_only=False, event_kinds=None, record_indexes=None,
-         dup_alignments=None, select=None, index=None):
+         dup_alignments=None, select=None, index=None, repeated=None,
+         template_sites=None):
     """Stream variant definitions from one or more VCFs.
 
     ``record_indexes`` receives each yielded ID's global data-line index:
     VCF data lines are numbered from 0 across all inputs in order.
     ``dup_alignments`` receives ``ID -> (ALTERNATIVECIGAR, literal SEQ)``
     for full-locus duplication insertions.
+    ``repeated`` receives insertion IDs with two or more alleles of one
+    sample (they may follow each other in that sample's walk).
+    ``template_sites`` (default: rGFA, i.e. with ``sequence_checks``) walks
+    --exact duplication sites on their DUP_ template path.
 
     With ``index`` (a RecordIndex) and no ``select``, every data line's byte
     offset and each file's first data-line index are recorded while
@@ -280,7 +289,9 @@ def rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=N
         yield from _rows(item, samples_available, cutoff, sequence_checks, candidate_sink,
                          insertion_only=insertion_only, event_kinds=event_kinds,
                          record_indexes=record_indexes, dup_alignments=dup_alignments,
-                         source=source)
+                         source=source, repeated=repeated,
+                         template_sites=(sequence_checks is not None if template_sites is None
+                                         else template_sites))
     if index is not None and select is None:
         index.file_starts.append(counter[0])
 
@@ -368,7 +379,8 @@ def _literal_insertion(text, size):
 
 def _rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=None,
           *, insertion_only=False, event_kinds=None, record_indexes=None,
-          dup_alignments=None, counter=None, source=None):
+          dup_alignments=None, counter=None, source=None, repeated=None,
+          template_sites=False):
     """Stream candidates, preferring full representative matches in rGFA mode."""
     samples = ()
     if source is None:
@@ -396,6 +408,12 @@ def _rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=
             if size == 0:
                 continue
             runs = graph_runs(info.get('SEQ', ''), size)
+            if template_sites and info.get('PACLASS') == 'fulllocusdup':
+                # rGFA: a --exact duplication site walks its shared template
+                # path; the copy's differences are nested rows on that path.
+                site = _TEMPLATE_SITE.fullmatch(_unescape(info.get('EXTENDGRAPHCIGAR', '')))
+                if site and int(site[2]) == size:
+                    runs = [(0, size, '=', site[1], 0, size, '+', 0)]
             if (dup_alignments is not None and info.get('PACLASS') == 'fulllocusdup'
                     and info.get('ALTERNATIVECIGAR', '.') != '.'):
                 dup_alignments[identifier] = (
@@ -421,7 +439,9 @@ def _rows(path, samples_available, cutoff, sequence_checks=None, candidate_sink=
                             sample, fields[9][offset:stop], fields[8], include_alignment=True)
                             if sequence_checks is not None else parse_sample_query_intervals(
                                 sample, fields[9][offset:stop], fields[8]))
-                        for observation in observations:
+                        for count, observation in enumerate(observations):
+                            if count and repeated is not None:
+                                repeated.add(identifier)
                             if not accepted_contig(sample, observation[1]):
                                 continue
                             ins_seen = True

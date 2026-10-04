@@ -1064,6 +1064,37 @@ def refine_kmer_first(members, sequences, row_ids, context,
         return refined
 
 
+def exact_small(members, context):
+    """Whether a cluster is merged exactly: every member is below the SV
+    size cutoff (linking already required one POS, END and size)."""
+    cutoff = int(context.get("minsvsize", 0) or 0)
+    return bool(cutoff) and all(member[2] < cutoff for member in members)
+
+
+def refine_exact(members, sequences, row_ids):
+    """Exact merge of a below-cutoff cluster: one group per identical
+    sequence (case-insensitive), no alignment. Same output as refine_loaded:
+    [(representative, members + (body,))], the representative's body None
+    and every other member's an identity body."""
+    sequences = [sequence.upper() for sequence in sequences]
+    selection = sorted(range(len(members)), key=lambda i: (
+        len(sequences[i]), -members[i][0], row_ids.get(members[i][4], ""), -members[i][4],
+    ), reverse=True)
+    groups = {}
+    for index in selection:
+        groups.setdefault(sequences[index], []).append(index)
+    refined = []
+    for indexes in groups.values():
+        pick = indexes[0]
+        group = [members[index] + (
+            None if index == pick or not sequences[index] else f"{len(sequences[index])}=",
+        ) for index in indexes]
+        group.sort(key=lambda member: (member[0], member[1], member[2], member[4]))
+        refined.append((members[pick], group))
+    refined.sort(key=lambda group: (min(m[0] for m in group[1]), min(m[4] for m in group[1])))
+    return refined
+
+
 def refine_cluster(members, context, pooled_map=None, workers=1):
     import graphvcfmerge as merger
     merger._init_fast_worker(context)
@@ -1078,4 +1109,6 @@ def refine_cluster(members, context, pooled_map=None, workers=1):
             row_ids[member[4]] = observation.row_id
             yield observation.sequence
 
+    if exact_small(members, context):
+        return refine_exact(members, list(sequences()), row_ids)
     return refine_loaded(members, sequences(), row_ids, context, pooled_map, workers)

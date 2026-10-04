@@ -2738,21 +2738,29 @@ def _best_payload_hit_alignment(ref_seq, qry_seq, hits, score):
 
     Every candidate consumes both complete sequences, including uncovered
     gaps. The sweep assembler covers each query interval exactly once.
+    Candidates are scored one at a time and only the best is kept: a satellite
+    window can return hundreds of hits, each padded to the full query.  The
+    first candidate with the highest key wins, exactly as with ``max``.
     """
     if not hits:
         raise RuntimeError('minimap2 produced no usable forward payload alignment')
-    candidates = [
-        _payload_ops_from_hit(ref_seq, qry_seq,
-                              ''.join(f'{n}{op}' for n, op, _ in hit.ops),
-                              hit.reference_start, hit.query_start)
-        for hit in hits
-    ]
+    best = best_key = None
+
+    def consider(ops):
+        nonlocal best, best_key
+        key = (score(ops), sum(n for n, op, _ in ops if op in '=M'))
+        if best is None or key > best_key:
+            best, best_key = ops, key
+
+    for hit in hits:
+        consider(_payload_ops_from_hit(
+            ref_seq, qry_seq, ''.join(f'{n}{op}' for n, op, _ in hit.ops),
+            hit.reference_start, hit.query_start,
+        ))
     combined = _assemble_tandem_hit_intervals(ref_seq, qry_seq, hits)
     if combined is not None:
-        candidates.append(combined)
-    return max(candidates, key=lambda ops: (
-        score(ops), sum(n for n, op, _ in ops if op in '=M'),
-    ))
+        consider(combined)
+    return best
 
 
 # minimap.h MM_F_FOR_ONLY (also used by CLI --for-only). Filtering reverse
@@ -2760,10 +2768,10 @@ def _best_payload_hit_alignment(ref_seq, qry_seq, hits, score):
 _MINIMAP_FOR_ONLY = 0x100000
 
 # minimap2 realignment is an optional rescue: every caller keeps its D/I when
-# it is refused.  Above this ref x query length product (10 Mb x 1 Mb, e.g.
-# 3.33 Mb x 3 Mb) a satellite pair can exhaust a worker's memory, so it is
-# not attempted.
-_MINIMAP2_MAX_LENGTH_PRODUCT = 10_000_000 * 1_000_000
+# it is refused.  Above this ref x query length product (1 Mb x 1 Mb) a
+# satellite pair can exhaust a worker's memory (a 7.4 Mb query against 1.35 Mb
+# of chr1q12 satellite passed 12.7 GB), so it is not attempted.
+_MINIMAP2_MAX_LENGTH_PRODUCT = 1_000_000 * 1_000_000
 
 
 def _mappy_payload_ops(
@@ -3512,46 +3520,70 @@ def _assemble_tandem_hit_intervals(ref_seq, qry_seq, hits):
     These operations participate in the final score, including terminal gaps.
     """
     output = []
+    insertion = []  # payload pieces of the trailing I op, joined once
+
+    def add(n, op, payload=''):
+        # Same result as _tm_add_op, but a run of I pieces is joined once
+        # instead of being re-copied on every append: overlapping satellite
+        # hits turn megabases of query into one I built from ~1e6 pieces.
+        if n <= 0:
+            return
+        if op == 'I' and output and output[-1][1] == 'I':
+            output[-1] = (output[-1][0] + n, 'I', '')
+            insertion.append(payload)
+            return
+        settle()
+        _tm_add_op(output, n, op, payload)
+        if op == 'I':
+            insertion.append(output[-1][2])
+            output[-1] = (output[-1][0], 'I', '')
+
+    def settle():
+        if insertion:
+            output[-1] = (output[-1][0], 'I', ''.join(insertion))
+            insertion.clear()
+
     r_cursor = q_cursor = 0
     for start, end, index in _select_tandem_hit_intervals(hits):
         if q_cursor < start:
-            _tm_add_op(output, start - q_cursor, 'I', qry_seq[q_cursor:start])
+            add(start - q_cursor, 'I', qry_seq[q_cursor:start])
         q_cursor = start
         r, ops = _slice_tandem_hit(hits[index], start, end)
         if r is None:
             return None
         for n, op, _payload in ops:
             if op == 'I':
-                _tm_add_op(output, n, 'I', qry_seq[q_cursor:q_cursor + n])
+                add(n, 'I', qry_seq[q_cursor:q_cursor + n])
                 q_cursor += n
                 continue
             if r > r_cursor:
-                _tm_add_op(output, r - r_cursor, 'D', '')
+                add(r - r_cursor, 'D', '')
                 r_cursor = r
             skipped = min(n, max(0, r_cursor - r))
             if op in 'M=X' and skipped:
-                _tm_add_op(output, skipped, 'I', qry_seq[q_cursor:q_cursor + skipped])
+                add(skipped, 'I', qry_seq[q_cursor:q_cursor + skipped])
                 q_cursor += skipped
             take = n - skipped
             if take:
                 if op == 'D':
-                    _tm_add_op(output, take, 'D', '')
+                    add(take, 'D', '')
                 else:
                     fragment = _tm_ops_from_cigar_on_sequences(
                         ref_seq[r + skipped:r + n],
                         qry_seq[q_cursor:q_cursor + take], str(take) + 'M',
                     )
                     for token in fragment:
-                        _tm_add_op(output, *token)
+                        add(*token)
                     q_cursor += take
                 r_cursor = r + n
             r += n
         if q_cursor != end:
             return None
     if q_cursor < len(qry_seq):
-        _tm_add_op(output, len(qry_seq) - q_cursor, 'I', qry_seq[q_cursor:])
+        add(len(qry_seq) - q_cursor, 'I', qry_seq[q_cursor:])
     if r_cursor < len(ref_seq):
-        _tm_add_op(output, len(ref_seq) - r_cursor, 'D', '')
+        add(len(ref_seq) - r_cursor, 'D', '')
+    settle()
     if (sum(ref_consume_pair(op, n) for n, op, _ in output) != len(ref_seq)
             or sum(query_consume(op, n) for n, op, _ in output) != len(qry_seq)):
         return None

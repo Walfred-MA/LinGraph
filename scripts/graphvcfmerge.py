@@ -2205,6 +2205,7 @@ def _parse_structured_meta(line: str, tag: str) -> Dict[str, str]:
 # half-open), so a region test is one binary search.
 _EXACT_COVERAGE_NAME = "exact_coverage.npz"
 _EXACT_REFERENCE_INTERVAL = re.compile(r"(.+):(\d+)-(\d+)[+-]")
+_EXACT_PLACED_INTERVAL = re.compile(r"(.+):(\d+)-(\d+)([+-])")
 
 
 def read_query_paths(path: str) -> Dict[str, Tuple[str, str]]:
@@ -2321,6 +2322,79 @@ def _exact_dup_spans_path(records_dir: str, file_index: int) -> str:
     return os.path.join(records_dir, f"{file_index}.dup_copies.json")
 
 
+def _exact_placement_path(records_dir: str, file_index: int) -> str:
+    return os.path.join(records_dir, f"{file_index}.exact_placement.json")
+
+
+def _exact_placement_chains(lines) -> Dict[str, list]:
+    """{query contig: [[qs, qe, chrom, rs, re, same orientation], ...]} by qs:
+    the stretches of an input's ##pseudoLinearMapping lines in which query
+    bases sit next to reference bases. PRIMARY and DELETION lines and
+    INSERTION lines at one reference point (a large insertion in place)
+    chain while they touch on the query and, in their orientation, on the
+    reference. Copies (an INSERTION with a reference span or an alternative
+    source) and orientation changes end a chain: query bases across them are
+    not the reference's neighbours."""
+    rows = sorted(
+        (contig, qs, qe, chrom, rs, re_, qstrand == rstrand)
+        for category, contig, qs, qe, qstrand, chrom, rs, re_, rstrand in lines
+        if category in ("PRIMARY", "DELETION") or (category == "INSERTION" and rs == re_)
+    )
+    chains: Dict[str, list] = defaultdict(list)
+    for contig, qs, qe, chrom, rs, re_, same in rows:
+        current = chains[contig][-1] if chains[contig] else None
+        if (current is not None and current[1] == qs and current[2] == chrom
+                and current[5] == same
+                and (current[4] == rs if same else current[3] == re_)):
+            current[1] = qe
+            current[3], current[4] = min(current[3], rs), max(current[4], re_)
+            continue
+        chains[contig].append([qs, qe, chrom, rs, re_, same])
+    return dict(chains)
+
+
+@functools.lru_cache(maxsize=64)
+def _exact_placement_cached(records_dir: str, file_index: int):
+    """{query contig: (chain starts, chains)}; empty for scans made before
+    this file existed (nothing is placed: no realignment)."""
+    path = _exact_placement_path(records_dir, file_index)
+    if not os.path.isfile(path):
+        return {}
+    with open(path) as handle:
+        chains = json.load(handle)
+    return {contig: ([chain[0] for chain in values], values) for contig, values in chains.items()}
+
+
+def _exact_placed(records_dir, file_index, chrom, w0, w1, contig, qa, qb, strand) -> bool:
+    """Whether query [qa, qb) of contig sits on reference [w0, w1) of chrom
+    in the sample's own placement: one chain holds both, in the member's
+    orientation ('+' same, '-' opposite). Realignment reads the query bases
+    beside a call as the reference flanks' bases; elsewhere (a copy, a run
+    in the other orientation) they are not."""
+    starts, chains = _exact_placement_cached(records_dir, file_index).get(contig, ((), ()))
+    index = bisect.bisect_right(starts, qa) - 1
+    while index >= 0:
+        qs, qe, chain_chrom, rs, re_, same = chains[index]
+        if (qb <= qe and chain_chrom == chrom and rs <= w0 and w1 <= re_
+                and same == (strand != "-")):
+            return True
+        index -= 1
+        if index >= 0 and chains[index][1] < qa:
+            break
+    return False
+
+
+def _exact_file_of_sample(sample_index: int) -> int:
+    """Input file index of a (single-sample) input's sample."""
+    files = _FAST_CONTEXT["file_sample_indexes"]
+    cache = _FAST_CONTEXT.setdefault("_exact_file_of_sample", {})
+    if not cache:
+        for file_index, samples in enumerate(files):
+            for sample in samples:
+                cache[sample] = file_index
+    return cache[sample_index]
+
+
 def _exact_dup_copy_spans(records_dir: str, file_index: int) -> Dict[str, list]:
     """{query contig: [[start, end], ...]}; empty for scans made before
     this file existed."""
@@ -2364,6 +2438,33 @@ def _exact_snp_observations(line: str, sample_columns) -> List[tuple]:
                 int(match.group(1)), match.group(2),
             ))
     return output
+
+
+_ALTERNATIVE_ENTRY_ID = re.compile(r'(?:<|,)ID="?(\d+)"?(?:,|>)')
+_PAMAP_FIELD = re.compile(r'(?:^|;)PAMAP=([0-9,]+)(?:;|$)')
+
+
+def alternative_path_entry(line: str) -> Optional[int]:
+    """ID of a ##pseudoLinearMapping header line on the sequence-source
+    layer (Path=alt): such an entry places no bases of the haplotype."""
+    if not re.search(r'[<,]Path="?alt"?[,>]', line):
+        return None
+    match = _ALTERNATIVE_ENTRY_ID.search(line)
+    return int(match.group(1)) if match else None
+
+
+def alternative_path_record(info_text: str, alternative_entries) -> bool:
+    """A record made only from Path=alt entries (every INFO/PAMAP ID is one;
+    older files: INFO PAPATH=alt): a full-locus-dup copy's difference
+    against its source, or a call of the sequence-source layer. It adds no
+    bases to the haplotype (the location layer already places them), so it
+    is an annotation of the sample's own VCF, never merged as a call."""
+    if "PAPATH=alt" in info_text:
+        return True
+    match = _PAMAP_FIELD.search(info_text)
+    return bool(match) and all(
+        int(entry) in alternative_entries for entry in match.group(1).split(",")
+    )
 
 
 # LIFTCATEGORY of calls lifted through a dup PA's secondary alignment: the
@@ -2977,6 +3078,9 @@ def _base_info(
             "SVTYPE", "END", "NSUP", "SVLEN", "MAXSIZE", "SEQ",
             "SVINSSEQ", "EXTENDGRAPHCIGAR", "CIGAR",
             "PACLASS",
+            # Per-sample references to that sample's own header lines:
+            # meaningless in a merged row.
+            "PAMAP", "PAPATH",
         }:
             del info[key]
     ordered = {
@@ -3173,11 +3277,14 @@ def _fast_scan_input_task(
     exact = bool(context.get("exact"))
     file_samples = {sample_names[index]: index for index in sample_indexes}
     exact_intervals: Dict[Tuple[str, int], list] = {}
+    placement_lines: list = []
     dup_parents, dup_spans = (
         _dup_parent_spans(path, sample_indexes, sample_names)
         if exact else ({}, {})
     )
     dup_dropped = 0
+    alternative_entries: set = set()
+    alternative_skipped = 0
     templated_copies: Dict[str, list] = defaultdict(list)
     snp_index = _ExactSnpIndex() if exact else None
     line_ordinal = 0
@@ -3189,6 +3296,10 @@ def _fast_scan_input_task(
             offset += length
             if raw.startswith(b"#"):
                 line = raw.decode("utf-8", "replace").rstrip("\n")
+                if line.startswith("##pseudoLinearMapping=<"):
+                    entry = alternative_path_entry(line)
+                    if entry is not None:
+                        alternative_entries.add(entry)
                 if (
                     snp_writer is not None
                     and line.startswith("##")
@@ -3219,9 +3330,24 @@ def _fast_scan_input_task(
                     values = _parse_structured_meta(
                         line, "pseudoLinearMapping",
                     )
+                    if values.get("Path") == "alt":
+                        # A sequence-source entry places no bases: neither
+                        # coverage nor placement.
+                        continue
                     reference = _EXACT_REFERENCE_INTERVAL.fullmatch(
                         values.get("Reference", ""),
                     )
+                    placed_query = _EXACT_PLACED_INTERVAL.fullmatch(values.get("Query", ""))
+                    placed_reference = _EXACT_PLACED_INTERVAL.fullmatch(
+                        values.get("Reference", ""))
+                    if placed_query is not None and placed_reference is not None:
+                        placement_lines.append((
+                            values.get("Category", ""), placed_query.group(1),
+                            int(placed_query.group(2)), int(placed_query.group(3)),
+                            placed_query.group(4), placed_reference.group(1),
+                            int(placed_reference.group(2)), int(placed_reference.group(3)),
+                            placed_reference.group(4),
+                        ))
                     if (
                         reference is not None
                         and values.get("Category") in ("PRIMARY", "DELETION")
@@ -3248,6 +3374,11 @@ def _fast_scan_input_task(
                     "offsets cannot address it"
                 )
             line = raw.decode("utf-8", "replace").rstrip("\n")
+            if (b"PAMAP=" in raw or b"PAPATH=alt" in raw) and alternative_path_record(
+                    line.split("\t", 8)[7], alternative_entries):
+                alternative_skipped += 1
+                line_ordinal += 1
+                continue
             if snp_writer is not None:
                 fields = line.split("\t", 9)
                 if len(fields) > 8 and is_snp_format(fields[8]):
@@ -3383,6 +3514,14 @@ def _fast_scan_input_task(
         for kinds in sections.values()
         for _off, count in kinds.values()
     )
+    if alternative_skipped:
+        print(
+            f"[merge] {os.path.basename(path)}: {alternative_skipped} "
+            "alternative-path record(s) (INFO/PAMAP cites only Path=alt "
+            "entries: a copy's differences against its source) are "
+            "annotations of the sample VCF, not merged",
+            file=sys.stderr,
+        )
     if dup_parents:
         print(
             f"[merge:exact] {os.path.basename(path)}: {len(dup_parents)} "
@@ -3398,6 +3537,8 @@ def _fast_scan_input_task(
         with open(_exact_dup_spans_path(records_dir, file_index), "w") as out:
             json.dump({contig: sorted(spans) for contig, spans in templated_copies.items()},
                       out, sort_keys=True)
+        with open(_exact_placement_path(records_dir, file_index), "w") as out:
+            json.dump(_exact_placement_chains(placement_lines), out, sort_keys=True)
         with open(_fast_exact_sidecar_path(records_dir, file_index), "wb") as out:
             pickle.dump({
                 key: _exact_coverage_array(intervals)
@@ -3507,9 +3648,15 @@ def _fast_size_band(size: int, size_similarity: float) -> int:
 def _fast_link_rows(
     pos: List[int], end: List[int], size: List[int],
     merge_distance: int, size_similarity: float, is_insertion: bool,
-    label: str = "",
+    label: str = "", exact_below: int = 0,
 ) -> List[List[int]]:
     """Single-linkage clustering over pre-sorted per-type rows.
+
+    A pair whose larger row is smaller than exact_below (the SV size cutoff)
+    is merged exactly: it links only with the same POS, END and size (the
+    sequence is compared at refinement), never by distance. When the larger
+    row is at least exact_below, the pair is judged as SVs (distance and size
+    similarity), whatever the smaller one's size.
 
     Returns clusters as lists of positions into the sorted order.  Pairs
     gate on reference-interval gap and size ratio; union happens by ROOT so links
@@ -3586,6 +3733,11 @@ def _fast_link_rows(
                 if root_previous == root_here:
                     continue
                 p_size = size[previous]
+                if max(here_size, p_size) < exact_below and (
+                    here_size != p_size or here_pos != pos[previous]
+                    or here_end != end[previous]
+                ):
+                    continue
                 smaller = here_size if here_size < p_size else p_size
                 larger = here_size if here_size > p_size else p_size
                 if smaller / float(max(1, larger)) < size_similarity:
@@ -3749,6 +3901,7 @@ def _fast_link_segments_task(
             label=(
                 f"{chrom} {key}" if seg_count >= 2_000_000 else ""
             ),
+            exact_below=int(context["minsvsize"]),
         )
         seg_files = range_files[np.maximum(0, np.searchsorted(
             range_starts, rows, side="right",
@@ -5470,6 +5623,11 @@ def _exact_realign_member(member, representative, exact, aligner_cache, core,
     length = reader.index.get(member.qry_contig, (0,))[0]
     if qa < 0 or qb > length:
         return None, "query_bounds"
+    if path_sequence is None and not _exact_placed(
+            exact["records_dir"], _exact_file_of_sample(member.sample_index),
+            getattr(representative, "chrom", ""), w0, w1, member.qry_contig, qa, qb,
+            member.qry_strand):
+        return None, "unplaced"
     window = reader.fetch(member.qry_contig, qa, qb, "+")
     if member.qry_strand == "-":
         window = core.revcomp(window)
@@ -5563,6 +5721,11 @@ def _exact_realign_deletion(member, representative, exact, core, path_sequence=N
         qa, qb = point - lead, point + tail
     if qa < 0 or qb > reader.index.get(member.qry_contig, (0,))[0]:
         return None, "query_bounds"
+    if path_sequence is None and not _exact_placed(
+            exact["records_dir"], _exact_file_of_sample(member.sample_index),
+            getattr(representative, "chrom", ""), w0, w1, member.qry_contig, qa, qb,
+            member.qry_strand):
+        return None, "unplaced"
     window = reader.fetch(member.qry_contig, qa, qb, "+")
     if member.qry_strand == "-":
         window = core.revcomp(window)
@@ -5654,7 +5817,7 @@ def _exact_realign_deletion(member, representative, exact, core, path_sequence=N
 
 
 def _exact_split_shifted(row_id, observations, rep_slot, bodies, exact, decisions,
-                         extras=(), flank_rows=()):
+                         extras=(), flank_rows=(), separate_extras=()):
     """Rows for one refined INS/DEL group under --exact, from the locus plan
     (see _exact_plan_moves): the kept group with moved members, one row per
     distinct separated member, and one row per flank gap; superseded
@@ -5688,6 +5851,8 @@ def _exact_split_shifted(row_id, observations, rep_slot, bodies, exact, decision
     for observation, body in extras:
         kept.append(observation)
         kept_bodies.append(body)
+    # Leftover SVs identical to a separated member share its row.
+    separate.extend(separate_extras)
     groups = [(row_id, kept, kept.index(representative), kept_bodies, None)]
     # Separated members identical in position, span and bases share a row.
     identical: Dict[tuple, list] = {}
@@ -5769,6 +5934,7 @@ def _fast_emit_task_rows(
                 row_id, observations, rep_slot, list(member_bodies), exact,
                 [group_plan.get(ref) for ref in member_refs],
                 group_plan.get("__extra__", ()), group_plan.get("__flank__", ()),
+                group_plan.get("__separate__", ()),
             )
         for row_id, observations, rep_slot, member_bodies, extra in groups:
             representative = observations[rep_slot]
@@ -6022,16 +6188,18 @@ def _exact_round_namespace(candidate):
 def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
     """Decide every shifted-member move of one nested round (--exact).
 
-    Same rules as the top level (_exact_plan_moves), with the parent path's
-    bases as the reference: moves in a fixed order may supersede the
-    sample's other candidates inside their window (except representatives of
-    multi-member groups and already moved ones), and each accepted move locks
-    its moved allele and flank gaps. groups: [(svtype, pick, chosen)].
-    The sample's mismatches on the parent path (its INS_SNPs, SNP
-    candidates) inside a window are known records too: superseded ones are
-    dropped and flank mismatches become new INS_SNPs (records for the SNP
-    concat stage). Returns ({group number: {candidate index: decision}},
-    {"chrom": path, "drops": [...], "adds": [...]}).
+    Nested variants are not realigned: a shifted member only moves onto its
+    group's row by the top level's movement rule (_exact_movement_interval),
+    with the parent path's bases as the reference. Its breakpoint is at most
+    10% of its size and less than 50 bp from the representative's, the
+    sample has no other call (candidate or INS_SNP) between both breakpoints
+    and no other allele on that row, and the moved allele maps at least 70%
+    of the row's; the shift is written as edge I/D (flank SVs, placed by
+    _exact_round_relink) and flank mismatches (new INS_SNPs, records for the
+    SNP concat stage). Nothing is superseded. Any other shifted member stays
+    its own nested row. Each accepted move locks its moved allele and flank
+    gaps. groups: [(svtype, pick, chosen)]. Returns ({group number:
+    {candidate index: decision}}, {"chrom": path, "drops": [], "adds": [...]}).
     """
     import graphreftovcf as core
     sample_names = _FAST_CONTEXT["sample_names"]
@@ -6157,28 +6325,53 @@ def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
         elif holds_breakpoint(number, sample, index, inside):
             reason = "same_sample_breakpoint"
         snp_indexes = []
+        member = _exact_round_item(candidates, index)
+        representative = _exact_round_item(candidates, pick)
+        own, row = _exact_edit(member), _exact_edit(representative)
+        # Movement only: the stretch between both breakpoints holds no other
+        # call of this sample (a candidate, e.g. the other half of a
+        # replacement, or an INS_SNP) and the sample has one allele here.
+        low, high = min(own[0], row[0]) - 1, max(own[1], row[1]) + 1
+        if reason is None and (
+                inside or len(group_holders[(number, sample)]) > 1
+                or any(record[2] != index and _exact_touches(record, low, high)
+                       for record in by_sample[sample].near(low, high))):
+            reason = "other_variant"
+        if reason is None and max(candidates[index][3], candidates[pick][3]) < int(
+                _FAST_CONTEXT["minsvsize"]):
+            # When the larger allele is below the SV size cutoff, a line takes
+            # only exact matches (same breakpoint and bases): never moved.
+            reason = "exact_small"
         if reason is None:
-            member = _exact_round_item(candidates, index)
-            snp_indexes = window_snps(sample, member.qry_contig, w0, w1)
-            if any(snp_index in superseded_snps for snp_index in snp_indexes):
-                reason = "other_superseded"
+            distance = max(abs(own[0] - row[0]), abs(own[1] - row[1]))
+            size = max(own[1] - own[0] + len(own[2]), row[1] - row[0] + len(row[2]))
+            if distance > _EXACT_MOVEMENT_SHARE * size or distance >= _EXACT_MOVEMENT_MAX:
+                reason = "beyond_movement"
+        if reason is None and window_snps(sample, member.qry_contig, max(0, low), high + 1):
+            reason = "other_variant"
         if reason is None:
-            representative = _exact_round_item(candidates, pick)
-            others = ([_exact_round_item(candidates, record[2]) for record in inside]
-                      + [_exact_round_item(candidates, snp_index) for snp_index in snp_indexes])
             moved_item, result = (
                 _exact_realign_deletion(member, representative, exact, core, path_sequence,
-                                        flank_gaps=True, others=others, flank_snps=True)
+                                        flank_gaps=True, others=(), flank_snps=True)
                 if svtype == "DEL" else
                 _exact_realign_member(member, representative, exact, cache, core,
-                                      path_sequence, flank_gaps=True, others=others,
+                                      path_sequence, flank_gaps=True, others=(),
                                       flank_snps=True)
             )
             if moved_item is None:
                 reason = result
             else:
                 qa, qb = result[2]
-                if locked[sample[0]].overlaps(member.qry_contig, qa, qb):
+                body = result[0]
+                if svtype == "DEL":
+                    share = 1.0 - sum(len(piece[1]) for piece in body) / max(1, row[1] - row[0])
+                else:
+                    share = _exact_body_score_matches(
+                        body, moved_item.sequence, representative.sequence,
+                    ) / max(1, len(representative.sequence))
+                if share < _EXACT_MIN_MAPPED:
+                    reason = "low_mapped"
+                elif locked[sample[0]].overlaps(member.qry_contig, qa, qb):
                     reason = "locked"
         if reason is not None:
             decisions[number][index] = ("separate", reason)
@@ -6230,14 +6423,14 @@ def _exact_round_flank_candidate(source, edit):
 
 def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequence,
                         exact, state, reasons):
-    """Nested F4: place one round's flank SVs (shifted joins, up to 8 rounds).
+    """Nested F4: place one round's flank SVs (the edge I/D of its moves).
 
-    A flank SV joins a group of this round with the same type, position and
-    span, or the closest similar one within merge_distance through a shifted
-    move on the parent path; that move's flank SVs relink in turn (up to 8
-    rounds). Leftovers share one row per identical allele. Decision entries:
-    "__extra__" -> [(candidate, body or nested pieces)], "__flank__" ->
-    [[candidate, ...]].
+    Nested variants are not realigned: a flank SV only joins a similar group
+    of this round with the same type, position and span (no shifted joins;
+    when the larger allele is below the SV size cutoff, only an identical
+    allele); otherwise it is its
+    sample's own nested row, one row per identical allele. Decision entries:
+    "__extra__" -> [(candidate, body)], "__flank__" -> [[candidate, ...]].
     """
     if not flank_owned:
         return
@@ -6246,7 +6439,6 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
     size_similarity = float(context["size_similarity"])
     sequence_similarity = float(context["sequence_similarity"])
     merge_distance = int(context["merge_distance"])
-    locked, new_spans = state["locked"], state["new_spans"]
 
     def span_of(candidate):
         kind, pos, end, size = candidate[:4]
@@ -6275,7 +6467,15 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
         if number in group_samples:
             group_samples[number].add(candidate[5][0])
 
+    minsvsize = int(context["minsvsize"])
+
     def similarity_to(candidate, rep_candidate):
+        # When the larger allele is below the SV size cutoff, alleles merge
+        # exactly (as linking does, _fast_link_rows exact_below): same size
+        # and bases; the breakpoint is already the same here.
+        if max(candidate[3], rep_candidate[3]) < minsvsize:
+            return 1.0 if (candidate[3] == rep_candidate[3]
+                           and candidate[4].upper() == rep_candidate[4].upper()) else None
         smaller, larger = sorted((candidate[3], rep_candidate[3]))
         if smaller / float(max(1, larger)) < size_similarity:
             return None
@@ -6293,7 +6493,6 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
         for owner, candidate in queue:
             span = span_of(candidate)
             sample = candidate[5][0]
-            holder = state["owner_of"](candidate[5])
             placed = False
             options = []
             items = by_type.get(candidate[0], ())
@@ -6313,86 +6512,17 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
             for shifted, _distance, _similarity, number, pick, rep_span in sorted(
                 options, key=lambda item: item[:4],
             )[:3]:
+                if shifted:
+                    continue
                 rep_candidate = candidates[pick]
-                if not shifted:
-                    body = None
-                    if candidate[0] == "INS":
-                        _value, body = _final_pair_alignment(
-                            candidate[4], rep_candidate[4], state["cache"], core)
-                        if body is None:
-                            body = _pure_insertion_alignment_body(candidate[4], rep_candidate[4])
-                    add_extra(number, candidate, body)
-                    reasons["flank_sv_relinked"] += 1
-                    placed = True
-                    break
-                w0, w1 = min(span[0], rep_span[0]), max(span[1], rep_span[1])
-
-                def inside(start, end):
-                    if start == end:
-                        return w0 < start < w1
-                    return start < w1 and w0 < end
-
-                if new_spans[holder].touches(w0, w1, exclude=span):
-                    continue
-                sample_records = state["by_sample"].get(holder)
-                records = [record for record in (sample_records.near(w0, w1) if sample_records
-                                                 else ())
-                           if inside(record[0], record[1])
-                           and record[2] not in state["moved"]
-                           and record[2] not in state["superseded"]]
-                if any(record[0] < w0 or record[1] > w1 or record[4]
-                       or (record[2] == groups[record[3]][1]
-                           and decisions.get(record[3], {}).get("__extra__"))
-                       for record in records):
-                    continue
-                member = _exact_round_namespace(candidate)
-                snp_indexes = [index for index in state["window_snps"](
-                    holder, member.qry_contig, w0, w1)
-                    if index not in state["superseded_snps"]]
-                others = ([_exact_round_item(candidates, record[2]) for record in records]
-                          + [_exact_round_item(candidates, index) for index in snp_indexes])
-                representative = _exact_round_namespace(rep_candidate)
-                moved_item, result = (
-                    _exact_realign_deletion(member, representative, exact, core, path_sequence,
-                                            flank_gaps=True, others=others, flank_snps=True)
-                    if candidate[0] == "DEL" else
-                    _exact_realign_member(member, representative, exact, state["cache"], core,
-                                          path_sequence, flank_gaps=True, others=others,
-                                          flank_snps=True)
-                )
-                if moved_item is None:
-                    continue
-                qa, qb = result[2]
-                own_lock = (member.qry_contig, member.qry_start,
-                            max(member.qry_end, member.qry_start + 1))
-                if locked[sample].overlaps(member.qry_contig, qa, qb, exclude=own_lock):
-                    continue
-                body, edits, _window = result
-                source = (*candidate[5][:4], moved_item.qry_start, moved_item.qry_end,
-                          *candidate[5][6:])
-                moved_candidate = (
-                    ("DEL", rep_candidate[1], rep_candidate[2], candidate[3], "", source)
-                    if candidate[0] == "DEL" else
-                    ("INS", rep_candidate[1], rep_candidate[2], moved_item.size,
-                     moved_item.sequence, source)
-                )
-                add_extra(number, moved_candidate, body)
-                reasons["flank_sv_relinked_shifted"] += 1
-                for record in records:
-                    decisions.setdefault(record[3], {})[record[2]] = ("drop",)
-                    group_samples.pop(record[3], None)
-                    state["superseded"].add(record[2])
-                new_spans[holder].remove(*span)
-                new_spans[holder].add(*rep_span)   # the row's interval
-                locked[sample].add(member.qry_contig, moved_item.qry_start,
-                                   max(moved_item.qry_end, moved_item.qry_start + 1))
-                state["record_snps"](sample, member.qry_contig, member.qry_strand,
-                                     snp_indexes, edits)
-                for edit in edits:
-                    locked[sample].add(member.qry_contig, edit[4], max(edit[5], edit[4] + 1))
-                    new_spans[holder].add(edit[1], edit[2])
-                    if edit[0] != "SNP":
-                        produced.append((number, _exact_round_flank_candidate(candidate[5], edit)))
+                body = None
+                if candidate[0] == "INS":
+                    _value, body = _final_pair_alignment(
+                        candidate[4], rep_candidate[4], state["cache"], core)
+                    if body is None:
+                        body = _pure_insertion_alignment_body(candidate[4], rep_candidate[4])
+                add_extra(number, candidate, body)
+                reasons["flank_sv_relinked"] += 1
                 placed = True
                 break
             if placed:
@@ -6628,6 +6758,7 @@ def _fast_round_call(
             [candidates[i][2] for i in picked],
             [candidates[i][3] for i in picked],
             merge_distance, size_similarity, svtype == "INS",
+            exact_below=minsvsize,
         )
         entries = []
         for cluster in clusters:
@@ -7140,10 +7271,13 @@ def _fast_uncertain_samples(
     merge_distance: int,
     size_similarity: float,
     is_insertion: bool,
+    exact_below: int = 0,
 ) -> Tuple[int, ...]:
     """Sample indexes of uncertain events matching any member, by the
     reference-interval-gap and size gates alone (no sequence comparison).  Members
-    and uncertain entries are (pos, end, size, sample) tuples."""
+    and uncertain entries are (pos, end, size, sample) tuples. When the
+    larger of the two is below exact_below (merged exactly) an event matches
+    only the same POS, END and size."""
     if not uncertain:
         return ()
     distance = max(0, int(merge_distance))
@@ -7161,6 +7295,10 @@ def _fast_uncertain_samples(
         if c_sample in matched:
             continue
         for member in members:
+            if max(c_size, member[2]) < exact_below and (
+                (c_pos, c_end, c_size) != (member[0], member[1], member[2])
+            ):
+                continue
             smaller = c_size if c_size < member[2] else member[2]
             larger = c_size if c_size > member[2] else member[2]
             if smaller / float(max(1, larger)) < size_similarity:
@@ -7627,7 +7765,7 @@ def _exact_interval_walk(body, window, template, segments, pieces, qa, qb, stran
     segment's junction belongs to the segment; where several meet, to a
     deletion's (zero-length) point first, then to a segment not in fixed
     (indexes of representatives that must not change). Returns ([[ops, query offsets,
-    junction]] per segment, flank edits); flank edits are ("DEL"|"INS"|"SNP",
+    junction, matched bases]] per segment, flank edits); flank edits are ("DEL"|"INS"|"SNP",
     reference start, end, bases, query start, end) of the sample.
     """
     def reference_at(position, point=False):
@@ -7660,7 +7798,7 @@ def _exact_interval_walk(body, window, template, segments, pieces, qa, qb, stran
         return min(touching, key=lambda index: (
             segments[index][0] != segments[index][1], index))
 
-    results = [[[], [], None] for _ in segments]
+    results = [[[], [], None, 0] for _ in segments]   # ops, query offsets, junction, matches
     edits: List[tuple] = []
     t = q = 0
 
@@ -7700,6 +7838,9 @@ def _exact_interval_walk(body, window, template, segments, pieces, qa, qb, stran
                 results[index][0].append(f"{step}{op}")
                 if op != "D":
                     results[index][1] += [q, q + step]
+                    results[index][3] += sum(
+                        window[q + offset].upper() == template[t + offset].upper()
+                        for offset in range(step))
             elif op == "D":
                 start = reference_at(t)
                 edits.append(("DEL", start, start + step, "", *query_at(q, q)))
@@ -7720,12 +7861,100 @@ def _exact_interval_walk(body, window, template, segments, pieces, qa, qb, stran
     return results, edits
 
 
+_EXACT_PIECE_MAPPY = 10_000         # longer pieces: mappy; up to this: parasail global
+_EXACT_PIECE_MATRIX = None
+
+
+def _exact_piece_alignment(query, template, cache, core):
+    """Alignment body (=XID, query vs template) of one stretch between the
+    anchors of an interval realignment. The identical prefix and suffix are
+    matches; the rest, when neither side is longer than 10 kb, is aligned
+    globally by parasail with assembly-like scores (match 1, mismatch 9, gap
+    open 16, extend 2), so isolated differences stay mismatches and a shifted
+    block becomes one gap pair. Longer pieces (or without parasail) use
+    mappy (_final_pair_alignment)."""
+    global _EXACT_PIECE_MATRIX
+    if not query or not template:
+        return ((f"{len(query)}I" if query else "")
+                + (f"{len(template)}D" if template else ""))
+    upper_q, upper_t = query.upper(), template.upper()
+    limit = min(len(upper_q), len(upper_t))
+    prefix = 0
+    while prefix < limit and upper_q[prefix] == upper_t[prefix]:
+        prefix += 1
+    suffix = 0
+    while (suffix < limit - prefix
+           and upper_q[len(upper_q) - 1 - suffix] == upper_t[len(upper_t) - 1 - suffix]):
+        suffix += 1
+    middle_q = upper_q[prefix:len(upper_q) - suffix]
+    middle_t = upper_t[prefix:len(upper_t) - suffix]
+    if not middle_q or not middle_t:
+        middle = ((f"{len(middle_q)}I" if middle_q else "")
+                  + (f"{len(middle_t)}D" if middle_t else ""))
+    elif parasail is not None and max(len(middle_q), len(middle_t)) <= _EXACT_PIECE_MAPPY:
+        if _EXACT_PIECE_MATRIX is None:
+            _EXACT_PIECE_MATRIX = parasail.matrix_create("ACGTN", 1, -9)
+        clean_q = re.sub(r"[^ACGTN]", "N", middle_q)
+        clean_t = re.sub(r"[^ACGTN]", "N", middle_t)
+        result = parasail.nw_trace_striped_16(clean_q, clean_t, 16, 2, _EXACT_PIECE_MATRIX)
+        if result.saturated:
+            result = parasail.nw_trace_striped_32(clean_q, clean_t, 16, 2, _EXACT_PIECE_MATRIX)
+        middle = result.cigar.decode
+        if isinstance(middle, bytes):
+            middle = middle.decode("ascii")
+    else:
+        _similarity, middle = _final_pair_alignment(middle_q, middle_t, cache, core)
+        middle = middle or _pure_insertion_alignment_body(middle_q, middle_t)
+    return (f"{prefix}=" if prefix else "") + middle + (f"{suffix}=" if suffix else "")
+
+
+_EXACT_MIN_MAPPED = 0.7     # share of a row's allele a moved allele must map
+_EXACT_MOVEMENT_SHARE = 0.1  # breakpoint shift (share of variant size) accepted as a movement
+_EXACT_MOVEMENT_MAX = 50     # and a movement shifts a breakpoint by less than this many bases
+
+
+def _exact_body_score(body, window, template):
+    """Alignment score of the query window against the template: matched
+    bases - 4 mismatches - 4 gap opens - gap bases."""
+    score = t = q = 0
+    for count_text, op in _FAST_CHUNK_OPS.findall(body):
+        count = int(count_text)
+        if op in "ID":
+            score -= 4 + count
+            if op == "I":
+                q += count
+            else:
+                t += count
+            continue
+        for offset in range(count):
+            score += 1 if window[q + offset].upper() == template[t + offset].upper() else -4
+        q += count
+        t += count
+    return score
+
+
+def _exact_calls_score(window_length, shifted_edits, snp_count):
+    """The same score for the sample's own calls in the window: anchored
+    records and reference bases match, each SNP is a mismatch, and each
+    shifted record is a gap (a replacement opens two)."""
+    inserted = opens = gap_bases = 0
+    for start, end, bases in shifted_edits:
+        inserted += len(bases)
+        opens += (end > start) + bool(bases)
+        gap_bases += (end - start) + len(bases)
+    matches = window_length - inserted - snp_count
+    return matches - 4 * snp_count - 4 * opens - gap_bases
+
+
 def _exact_realign_interval(chrom, exact, item, cache, core):
     """Realign one sample's merged interval against one template: the
-    reference with each of the sample's records replaced by its row's
-    representative allele at the representative breakpoint. The alignment is
-    accepted as it is. Returns (key, None, reason) when the interval is left
-    unchanged, else (key, decisions {ref: decision}, leftover SV
+    reference with the sample's records at their rows' breakpoints, each
+    shifted member as its row's representative allele and every other record
+    as its own allele (an exact anchor). The result is kept only when its
+    alignment scores at least as well as the sample's own calls
+    (_exact_body_score vs _exact_calls_score) and every moved allele maps at
+    least 70% of its row's allele. Returns (key, None, reason) when the interval is
+    left unchanged, else (key, decisions {ref: decision}, leftover SV
     observations, SNP drops, SNP adds, counts)."""
     key, file_index, w0, w1, records = item
     refs = sorted({record[0] for record in records} | {record[2] for record in records})
@@ -7752,6 +7981,8 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
     reader = _exact_reader(fasta, fai)
     if qa < 0 or qb > reader.index.get(contig, (0,))[0]:
         return key, None, "query_bounds"
+    if not _exact_placed(exact["records_dir"], file_index, chrom, w0, w1, contig, qa, qb, strand):
+        return key, None, "unplaced"
     for start, end in _exact_dup_copy_spans_cached(exact["records_dir"], file_index).get(contig, ()):
         if start < qb and qa < end:
             return key, None, "locked"
@@ -7764,16 +7995,19 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
     if window.upper() != expected.upper():
         return key, None, "other_variant"
 
-    # Template: records already at their representative's breakpoint first
-    # (representatives of other members before all), then shifted ones
-    # (larger rows first); one that would overlap an allele
+    # Template: records already at their row's breakpoint first (with their
+    # own alleles; representatives of other members before all), then
+    # shifted ones as their rows' representative alleles (larger rows first); one that would overlap an allele
     # already placed stays out and its bases come out as leftover edits.
     order = sorted(range(len(records)), key=lambda index: (
         records[index][4], not records[index][3], -records[index][5], records[index][1], index))
     placed = []
     for index in order:
-        representative = fetched[records[index][2]]
-        start, end, allele = _exact_edit(representative)
+        # A record already at its row's breakpoint keeps its own allele (as
+        # the sample represents it); only a shifted member is placed as its
+        # row's representative allele at the representative's breakpoint.
+        source = fetched[records[index][2]] if records[index][4] else members[index]
+        start, end, allele = _exact_edit(source)
         if start < w0 or end > w1:
             continue
         if any((start < p_end and p_start < end)
@@ -7798,18 +8032,17 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
     pieces.append((t, t + w1 - cursor, cursor))
     parts.append(bases[cursor - w0:])
     template = "".join(parts)
-    fixed = {number for number, item_ in enumerate(placed) if records[item_[3]][3]}
+    # Records kept with their own allele have known query bases: they anchor
+    # the alignment as exact matches, so only the stretches around shifted
+    # members are aligned.
+    fixed = {number for number, item_ in enumerate(placed) if not records[item_[3]][4]}
 
     def align(query_part, template_part):
-        if query_part and template_part:
-            _similarity, part_body = _final_pair_alignment(query_part, template_part, cache, core)
-            return part_body or _pure_insertion_alignment_body(query_part, template_part)
-        return ((f"{len(query_part)}I" if query_part else "")
-                + (f"{len(template_part)}D" if template_part else ""))
+        return _exact_piece_alignment(query_part, template_part, cache, core)
 
-    # A fixed representative is this sample's own record: its query bases are
-    # known, so it anchors the alignment as an exact match and only the parts
-    # between anchors are aligned.
+    # An anchored record is this sample's own allele: its query bases are
+    # known, so it is an exact match and only the parts between anchors are
+    # aligned.
     bodies, t_done, q_done = [], 0, 0
     for number in sorted(fixed, key=lambda number_: segments[number_][0]):
         first, last = segments[number]
@@ -7820,7 +8053,7 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
             o0, o1 = own.qry_start - qa, own.qry_end - qa
         if (o0 < q_done or first < t_done
                 or window[o0:o1].upper() != template[first:last].upper()):
-            return key, None, "representative_changed"
+            return key, None, "anchor_mismatch"
         bodies.append(align(window[q_done:o0], template[t_done:first]))
         if last > first:
             bodies.append(f"{last - first}=")
@@ -7835,9 +8068,13 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
 
     decisions, counts = {}, Counter()
     placed_records = set()
-    for (start, end, allele, index), (ops, offsets, junction) in zip(placed, results):
+    mapped = []                        # per moved allele: share of the row allele mapped
+    for (start, end, allele, index), (ops, offsets, junction, matches) in zip(placed, results):
         ref, _slot, rep_ref, protected, shifted, _size = records[index]
         member, representative = members[index], fetched[rep_ref]
+        if not shifted:
+            placed_records.add(index)      # anchored on its own allele: unchanged
+            continue
         if representative.svtype == "DEL":
             f0, f1 = (min(offsets), max(offsets)) if offsets else (junction, junction)
             span = query_at(f0, f1)
@@ -7845,6 +8082,8 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
             moved = _exact_with(member, pos=representative.pos, end=representative.end,
                                 qry_start=span[0], qry_end=span[1])
             body_out = nested
+            deleted = _exact_edit(representative)
+            share = 1.0 - (f1 - f0) / max(1, deleted[1] - deleted[0])
             unchanged = (not nested and member.pos == representative.pos
                          and member.end == representative.end
                          and (member.qry_start, member.qry_end) == span)
@@ -7861,6 +8100,7 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
             moved = _exact_with(member, pos=representative.pos, end=representative.end,
                                 size=f1 - f0, sequence=window[f0:f1],
                                 qry_start=span[0], qry_end=span[1])
+            share = matches / max(1, len(representative.sequence))
             unchanged = ((member.pos, member.end, member.sequence.upper(),
                           member.qry_start, member.qry_end)
                          == (moved.pos, moved.end, moved.sequence.upper(), *span))
@@ -7876,6 +8116,7 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
         if ref == rep_ref and representative.svtype != "DEL":
             body_out = None          # the row's new representative allele
         decisions[ref] = ("move", moved, body_out, [])
+        mapped.append(share)
         counts["moved" if shifted else "realigned_in_place"] += 1
     for index, record in enumerate(records):
         if index in placed_records:
@@ -7884,8 +8125,32 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
             return key, None, "representative_unplaced"
         decisions[record[0]] = ("drop",)
         counts["superseded"] += 1
-    leftovers = [_exact_flank_observation(anchor, edit, exact)
+    # A leftover is a new call of this sample, not a lifted restatement of
+    # the anchor record it borrows sample fields from.
+    leftovers = [_exact_with(_exact_flank_observation(anchor, edit, exact),
+                             liftover_category=".")
                  for edit in edits if edit[0] != "SNP"]
+    # A shifted member that could not move and comes back unchanged as a
+    # leftover stays a separated member of its row (as without realignment),
+    # so it keeps sharing the _S row with other samples' copies of it.
+    unmoved = {}
+    for index, record in enumerate(records):
+        if record[4] and decisions.get(record[0], ("",))[0] == "drop":
+            unmoved.setdefault(_exact_edit(members[index]), []).append(record[0])
+    kept_leftovers = []
+    for observation in leftovers:
+        refs_here = unmoved.get(_exact_edit(observation))
+        if refs_here:
+            decisions[refs_here.pop()] = ("separate", "not_moved")
+            counts["superseded"] -= 1
+            counts["not_moved"] += 1
+        else:
+            kept_leftovers.append(observation)
+    leftovers = kept_leftovers
+    if not any(decision[0] == "move" for decision in decisions.values()):
+        # Nothing moved onto its row: the realignment would only re-place
+        # the sample's other calls (equal score, different positions).
+        return key, None, "nothing_moved"
     sample_name = anchor.sample_name
     originals = {(snp.pos + 1, snp.sequence.upper(), snp.qpos): snp for snp in snps}
     adds = []
@@ -7898,10 +8163,129 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
         adds.append((sample_name, start + 1, base.upper(), alt, contig, qpos, strand))
     drops = [(sample_name, snp.pos + 1, snp.sequence, snp.qry_contig, snp.qpos, snp.strand)
              for snp in originals.values()]
+    # Keep the realignment only when (1) its alignment of the window against
+    # the template scores at least as well as the sample's own calls do
+    # (matches - 4 mismatches - 4 gap opens - gap bases), and (2) every moved
+    # allele maps at least 70% of its row's allele. Otherwise the movement
+    # fallback (_exact_movement_interval) may still move single members.
+    shifted_edits = [_exact_edit(members[index]) for index, record in enumerate(records)
+                     if record[4]]
+    original_score = _exact_calls_score(len(window), shifted_edits, len(snps))
+    new_score = _exact_body_score(body, window, template)
+    if new_score < original_score:
+        return key, None, "worse_score"
+    if any(share < _EXACT_MIN_MAPPED for share in mapped):
+        return key, None, "low_mapped"
     counts["leftover_sv"] += len(leftovers)
     counts["leftover_snp"] += len(adds)
     counts["superseded_snp"] += len(drops)
     return key, decisions, leftovers, drops, adds, counts
+
+
+def _exact_movement_interval(chrom, exact, item, cache, core, reason):
+    """Movement fallback for an interval whose realignment was not kept.
+
+    Each shifted member whose breakpoint is at most 10% of its size and
+    less than 50 bp away from its row's is moved onto the row on its own,
+    with the shift written as edge I/D: an insertion takes the reference bases between both
+    breakpoints into its allele and leaves their deletion as a leftover; a
+    deletion keeps the row's interval, the bases it keeps inside become a
+    nested insertion and the bases it deletes outside a leftover deletion
+    (_exact_realign_member / _exact_realign_deletion). Only when the
+    sample has no other call between the breakpoints (checked against its
+    assembly), no other allele on that row, and the moved allele maps at
+    least 70% of the row's. Other shifted members stay separate rows."""
+    key, file_index, _w0, _w1, records = item
+    if reason == "locked":
+        return key, None, reason
+    fetched = _fast_fetch_observations(
+        sorted({record[0] for record in records} | {record[2] for record in records}))
+    on_slot = Counter(record[1] for record in records)
+    decisions, leftovers, adds, counts = {}, [], [], Counter()
+    for ref, slot, rep_ref, _protected, shifted, _size in records:
+        if not shifted:
+            continue
+        member, representative = fetched[ref], fetched[rep_ref]
+        own, row = _exact_edit(member), _exact_edit(representative)
+        distance = max(abs(own[0] - row[0]), abs(own[1] - row[1]))
+        size = max(own[1] - own[0] + len(own[2]), row[1] - row[0] + len(row[2]))
+        if (on_slot[slot] > 1 or distance > _EXACT_MOVEMENT_SHARE * size
+                or distance >= _EXACT_MOVEMENT_MAX):
+            continue
+        # The helpers below see only this member: the sample must have no
+        # other call (another record, e.g. the other half of a replacement,
+        # or a SNP) touching the stretch between both breakpoints.
+        low, high = min(own[0], row[0]) - 1, max(own[1], row[1]) + 1
+        if any(other_ref != ref and _exact_touches(_exact_edit(fetched[other_ref]), low, high)
+               for other_ref, *_rest in records):
+            continue
+        if _exact_window_snps(exact["records_dir"], chrom, file_index, member.qry_contig,
+                              max(0, low), high):
+            continue
+        if representative.svtype == "DEL":
+            moved, result = _exact_realign_deletion(
+                member, representative, exact, core, flank_gaps=True, others=(),
+                flank_snps=True)
+        else:
+            moved, result = _exact_realign_member(
+                member, representative, exact, cache, core, flank_gaps=True, others=(),
+                flank_snps=True)
+        if moved is None:
+            continue
+        body, edits, (qa, qb) = result
+        if any(start < qb and qa < end for start, end in _exact_dup_copy_spans_cached(
+                exact["records_dir"], file_index).get(member.qry_contig, ())):
+            continue
+        if representative.svtype == "DEL":
+            share = 1.0 - sum(len(piece[1]) for piece in body) / max(1, row[1] - row[0])
+        else:
+            share = _exact_body_score_matches(body, moved.sequence, representative.sequence) \
+                / max(1, len(representative.sequence))
+        if share < _EXACT_MIN_MAPPED:
+            continue
+        decisions[ref] = ("move", moved, body, [])
+        for kind, start, end, bases, query_start, query_end in edits:
+            if kind == "SNP":
+                qpos = query_start if member.qry_strand == "+" else query_end
+                base = _exact_fetch(exact["references"], chrom, start, start + 1) or "N"
+                adds.append((member.sample_name, start + 1, base.upper(), bases,
+                             member.qry_contig, qpos, member.qry_strand))
+            else:
+                leftovers.append(_exact_with(_exact_flank_observation(
+                    member, (kind, start, end, bases, query_start, query_end), exact),
+                    liftover_category="."))
+        counts["movement"] += 1
+    if not decisions:
+        return key, None, reason
+    for ref, _slot, _rep_ref, _protected, shifted, _size in records:
+        if shifted and ref not in decisions:
+            decisions[ref] = ("separate", reason)
+    counts["leftover_sv"] += len(leftovers)
+    counts["leftover_snp"] += len(adds)
+    return key, decisions, leftovers, [], adds, counts
+
+
+def _exact_touches(edit, low, high):
+    """An edit (start, end, bases) meets [low, high] (a point inclusively)."""
+    start, end = edit[0], max(edit[0], edit[1])
+    return low <= start <= high if start == end else (start <= high and low <= end)
+
+
+def _exact_body_score_matches(body, query, template):
+    """Matched bases of an alignment body (query vs template)."""
+    matches = q = t = 0
+    for count_text, op in _FAST_CHUNK_OPS.findall(body or ""):
+        count = int(count_text)
+        if op == "I":
+            q += count
+        elif op == "D":
+            t += count
+        else:
+            matches += sum(query[q + i].upper() == template[t + i].upper()
+                           for i in range(count) if q + i < len(query) and t + i < len(template))
+            q += count
+            t += count
+    return matches
 
 
 def _exact_interval_task(args):
@@ -7912,9 +8296,18 @@ def _exact_interval_task(args):
     output = []
     for item in items:
         try:
-            output.append(_exact_realign_interval(chrom, exact, item, cache, core))
-        except RuntimeError:
-            output.append((item[0], None, "alignment_error"))
+            result = _exact_realign_interval(chrom, exact, item, cache, core)
+        except (RuntimeError, ValueError, KeyError, IndexError) as error:
+            result = (item[0], None, f"error_{type(error).__name__}")
+        if result[1] is None:
+            # The realignment did not keep the members on their rows: try a
+            # movement for each one shifted by at most 10% of its size and
+            # less than 50 bp.
+            try:
+                result = _exact_movement_interval(chrom, exact, item, cache, core, result[2])
+            except (RuntimeError, ValueError, KeyError, IndexError):
+                pass
+        output.append(result)
     return output
 
 
@@ -7938,9 +8331,10 @@ def _exact_sample_intervals(seeds, records, rep_spans):
                     if s == e:
                         n0 = min(n0, s - 1) if s <= n0 else n0
                         n1 = max(n1, s + 1) if s >= n1 else n1
+            n0 = max(0, n0)
             if (n0, n1) == (w0, w1):
                 return w0, w1
-            w0, w1 = max(0, n0), n1
+            w0, w1 = n0, n1
 
     intervals: List[List[int]] = []
     for w0, w1 in sorted(seeds):
@@ -7999,6 +8393,7 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
 
     by_sample: Dict[int, list] = defaultdict(list)
     candidates = []
+    shifts: Dict[tuple, int] = {}      # shifted member -> breakpoint distance to its rep
     rep_spans = {}
     for slot, svtype, rep, members in groups:
         rep_span = rep_spans[slot] = span(rep, svtype)
@@ -8010,6 +8405,8 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
                  member[3] == rep[3] and len(members) > 1),
             )
             if svtype in ("INS", "DEL") and member[3] != rep[3] and member_span != rep_span:
+                shifts[member[3]] = max(abs(member_span[0] - rep_span[0]),
+                                        abs(member_span[1] - rep_span[1]))
                 candidates.append((
                     min(member_span[0], rep_span[0]), max(member_span[1], rep_span[1]),
                     slot, member[3], rep[3], svtype,
@@ -8050,6 +8447,20 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
             ]
             interval_records[key] = records
             items.append((key, file_index, w0, w1, records))
+            # Which reference intervals realignment covers, logged in both
+            # modes so a run with realignment off can be compared on them.
+            print(f"[merge:exact-interval] {chrom}\t{w0}\t{w1}\t"
+                  f"{sample_names[context['file_sample_indexes'][file_index][0]]}\t"
+                  f"{sum(1 for record in records if record[4])}",
+                  file=sys.stderr)
+    if os.environ.get("GRAPHVCFMERGE_EXACT_REALIGN", "1") == "0":
+        # Comparison mode: no realignment, every shifted member keeps its own row.
+        for key, records in interval_records.items():
+            for ref, slot, _rep_ref, _protected, shifted, _size in records:
+                if shifted:
+                    plan[slot][ref] = ("separate", "realign_disabled")
+                    reasons["realign_disabled"] += 1
+        items = []
     started = time.monotonic()
     batch = max(1, min(64, -(-len(items) // max(1, 4 * int(workers)))))
     tasks = [(chrom, exact, items[start:start + batch])
@@ -8075,13 +8486,16 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
                 plan[slot_of[ref]][ref] = decision
             # Leftover rows are emitted with a shifted member's row: its
             # representative has other members, so that row is never dropped.
-            owner = next(record[1] for record in records if record[4])
+            owner = max((record for record in records if record[4]),
+                        key=lambda record: (rep_spans[record[1]][1] - rep_spans[record[1]][0],
+                                            group_sizes[record[1]], -record[1]))[1]
             leftovers.extend((owner, observation) for observation in interval_leftovers)
             snp_records["drops"].extend(drops)
             snp_records["adds"].extend(adds)
             for name, count in counts.items():
                 reasons[name] += count
     _exact_place_leftovers(groups, plan, leftovers, reasons)
+    _exact_report_rescue(chrom, candidates, shifts, plan)
     print(
         f"[merge:exact] {chrom}: shifted member(s) in {len(items)} interval(s): "
         + ", ".join(f"{key}={value}" for key, value in sorted(reasons.items()))
@@ -8090,6 +8504,33 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
     )
     _write_exact_snp_records(exact, chrom, snp_records)
     return dict(plan)
+
+
+def _exact_report_rescue(chrom, candidates, shifts, plan):
+    """Log, by breakpoint distance to the row representative, how many shifted
+    members were moved onto their row and why the others were not."""
+    bins = ((5, "<=5bp"), (20, "6-20bp"), (100, "21-100bp"), (None, ">100bp"))
+    tally: Dict[str, Counter] = defaultdict(Counter)
+    for _w0, _w1, slot, ref, _rep_ref, _svtype in candidates:
+        distance = shifts.get(ref, 0)
+        label = next(name for limit, name in bins if limit is None or distance <= limit)
+        decision = plan.get(slot, {}).get(ref)
+        outcome = ("moved" if decision and decision[0] == "move" else
+                   f"not:{decision[1]}" if decision and decision[0] == "separate" else
+                   "not:superseded" if decision and decision[0] == "drop" else "not:none")
+        tally[label][outcome] += 1
+    parts = []
+    for _limit, name in bins:
+        counts = tally.get(name)
+        if not counts:
+            continue
+        total = sum(counts.values())
+        why = ", ".join(f"{key[4:]}={value}" for key, value in counts.most_common()
+                        if key != "moved")
+        parts.append(f"{name}: {counts['moved']}/{total} moved"
+                     f" ({100.0 * counts['moved'] / total:.1f}%)" + (f" [not: {why}]" if why else ""))
+    if parts:
+        print(f"[merge:exact-rescue] {chrom}: " + "; ".join(parts), file=sys.stderr)
 
 
 def _exact_place_leftovers(groups, plan, leftovers, reasons):
@@ -8129,6 +8570,25 @@ def _exact_place_leftovers(groups, plan, leftovers, reasons):
             } | {observation.sample_index for observation, _body in decisions.get("__extra__", [])}
         return slot_samples[slot]
 
+    # Separated members keep their own allele on a row of their group
+    # (_exact_split_shifted, keyed like identical separated members there).
+    def separate_key(observation):
+        return (observation.svtype, observation.pos, observation.end, observation.size,
+                observation.sequence.upper())
+
+    separated_refs = {slot: [ref for ref, decision in decisions.items()
+                             if isinstance(ref, tuple) and decision[0] == "separate"]
+                      for slot, decisions in plan.items()}
+    separated_obs = _fast_fetch_observations(sorted(
+        {ref for refs in separated_refs.values() for ref in refs}))
+    separated: Dict[tuple, list] = defaultdict(list)    # key -> [(slot, samples)]
+    for slot, refs in sorted(separated_refs.items()):
+        by_key: Dict[tuple, set] = defaultdict(set)
+        for ref in refs:
+            by_key[separate_key(separated_obs[ref])].add(separated_obs[ref].sample_index)
+        for key, samples in by_key.items():
+            separated[key].append((slot, samples))
+
     rows: Dict[tuple, list] = {}
     for owner, observation in sorted(
             leftovers, key=lambda item: (item[1].pos, item[1].end, item[1].svtype,
@@ -8144,6 +8604,16 @@ def _exact_place_leftovers(groups, plan, leftovers, reasons):
             plan.setdefault(slot, {}).setdefault("__extra__", []).append((observation, body))
             slot_samples[slot].add(observation.sample_index)
             reasons["leftover_sv_joined_row"] += 1
+            placed = True
+            break
+        if placed:
+            continue
+        for slot, samples in separated.get(separate_key(observation), ()):
+            if observation.sample_index in samples:
+                continue
+            plan.setdefault(slot, {}).setdefault("__separate__", []).append(observation)
+            samples.add(observation.sample_index)
+            reasons["leftover_sv_joined_separate_row"] += 1
             placed = True
             break
         if placed:
@@ -8423,6 +8893,7 @@ def _fast_emit_refined(
             uncertain_samples = _fast_uncertain_samples(
                 members, u_entries, u_positions, u_prefix,
                 merge_distance, size_similarity, svtype == "INS",
+                exact_below=minsvsize,
             )
             entries.append((
                 emit_index, row_id, svtype, rep[3],

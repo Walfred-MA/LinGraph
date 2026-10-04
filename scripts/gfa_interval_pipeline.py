@@ -349,6 +349,16 @@ def _reachable_events(events, include_parents=False):
     return reachable
 
 
+def _needed_targets(events, reachable):
+    """Names reachable variants are placed on that are not variants."""
+    needed = set()
+    for name in reachable:
+        event = events[name]
+        needed.add(event.chrom)
+        needed.update(run.target for run in event.runs if run.target)
+    return needed - set(events)
+
+
 def _query_coordinate(event, run):
     if event.query is None:
         return None
@@ -628,6 +638,8 @@ def _write_source_sidecars(bed, source_aliases, roots):
 
 
 def _path_leaves(spec, roots, resolver, anchor):
+    if spec.kind == 'junction':
+        return resolver.junction_leaves(spec.start, max(1, anchor))
     if spec.kind in ('reference', 'alternative', 'novel', 'duplication'):
         return resolver.expand(spec.source, spec.start, spec.end)
     if hasattr(resolver, 'ranks') and spec.kind == 'deletion':
@@ -640,6 +652,8 @@ def _path_leaves(spec, roots, resolver, anchor):
 
 
 def _link_leaves(spec, roots, resolver, anchor):
+    if spec.kind == 'junction':
+        return resolver.junction_leaves(spec.start, max(1, anchor))
     if hasattr(resolver, 'ranks') and spec.source in roots and roots[spec.source].lift:
         return resolver.local_path(spec.source, spec.start, spec.end, max(1, anchor))
     if hasattr(resolver, 'ranks') and spec.kind in ('insertion', 'snp', 'substitution', 'deletion'):
@@ -759,6 +773,8 @@ def _write_part(task):
             return path
         for index in range(low, high):
             spec = specs[index]
+            if spec.kind == 'junction':
+                continue  # link-only walk
             text = topology.path_text(index, leaves, first, last, numbers, prefix)
             if not text:
                 raise ValueError(f'{spec.name}: empty GFA path')
@@ -877,12 +893,13 @@ def _run(args, candidates, bed, log):
     event_kinds = {}
     record_indexes = {}
     dup_alignments = {} if args.gfa_mode == 'rgfa' else None
+    repeated = set()
     for order, record in enumerate(rows(args.vcf, sources, args.size_cutoff,
                                        sequence_checks=sequence_checks,
                                        candidate_sink=candidates.add if sequence_checks is not None else None,
                                        insertion_only=getattr(args, 'insertion_only', None) is not None,
                                        event_kinds=event_kinds, record_indexes=record_indexes,
-                                       dup_alignments=dup_alignments)):
+                                       dup_alignments=dup_alignments, repeated=repeated)):
         identifier, chrom, pos, ref_end, length, values, query, query_reason, retained = record
         if identifier in events:
             raise ValueError(f'duplicate insertion ID or variant ID {identifier!r}')
@@ -909,14 +926,21 @@ def _run(args, candidates, bed, log):
                                               list(_flatten(args.local_path_fasta)), log,
                                               template_catalogs=args.local_reference_templates,
                                               backbone=getattr(args, 'reference_haplotype', None))
+        from gfa_duplications import add_template_roots
+        from gfa_interval_metadata import TEMPLATE_PATH
+        needed = _needed_targets(events, reachable)
+        add_template_roots(needed, roots, source_aliases, Root, strict=False)
         catalog = getattr(args, 'alternative_catalog', None)
         if catalog:
             from gfa_catalog_paths import resolve_catalog_paths
             from gfa_interval_metadata import vcf_paths
+            # DUP_ templates are not catalog records; their loci may be.
             source_aliases.update(resolve_catalog_paths(
                 events, roots, reachable, catalog, list(vcf_paths(args.vcf)),
                 getattr(args, 'reference_haplotype', None), args.reference_fasta, args.output or bed,
-                Root, log, threads=args.processes))
+                Root, log, threads=args.processes,
+                needed={name for name in needed if not TEMPLATE_PATH.fullmatch(name)}))
+        add_template_roots(needed, roots, source_aliases, Root)
         from gfa_duplications import add_duplication_paths
         add_duplication_paths(events, roots, dup_alignments, source_aliases, Run, Root, log)
         resolver = StableResolver(events, roots, header_lengths, hits, reachable,
@@ -978,6 +1002,10 @@ def _run(args, candidates, bed, log):
                         run.qend-run.qstart >= unique_minimum):
                     specs.append(PathSpec(f'{alias}#unique{run.unique}', 'unique',
                                           event.identifier, run.qstart, run.qend))
+        if stable:
+            from gfa_junctions import junction_specs
+            specs.extend(junction_specs(args.vcf, events, resolver, aliases, PathSpec, log,
+                                        repeated=repeated))
 
         names = set()
         for spec in specs:
@@ -1039,6 +1067,7 @@ def _run(args, candidates, bed, log):
 
 
 def _write_variant_index(path, events, record_indexes, aliases, resolver):
+    from gfa_interval_metadata import TEMPLATE_PATH
     """Map each VCF data line to its GFA allele path and parent breakpoints.
 
     ``vcf_index`` numbers VCF data lines from 0 across the -v inputs in order.
@@ -1051,14 +1080,25 @@ def _write_variant_index(path, events, record_indexes, aliases, resolver):
     for event in events.values():
         exported = event.identifier in resolver.ranks
         parent = start = end = strand = '.'
+        allele_path = aliases.get(event.identifier, event.identifier) if exported else '.'
         if exported:
             start, end = resolver.breakpoints(event.identifier)
             parent, strand = event.chrom, '+'
+            if parent in events and events[parent].kind == 'deletion':
+                # Rows nested in a deletion keep their offset (allele order).
+                start = end = event.pos - resolver.nested_pos_base
             if parent not in events:
                 parent, start, end, strand = resolver.canonical_interval(parent, start, end)
             parent = aliases.get(parent, parent)
-        rows.append((record_indexes.get(event.identifier, -1), event.identifier,
-                     aliases.get(event.identifier, event.identifier) if exported else '.',
+            runs = event.runs
+            if (len(runs) == 1 and runs[0].operation == '=' and runs[0].target in resolver.roots
+                    and TEMPLATE_PATH.fullmatch(runs[0].target)
+                    and resolver.roots[runs[0].target].kind == 'duplication'
+                    and runs[0].rend - runs[0].rstart == resolver.roots[runs[0].target].length):
+                # A duplication site's allele is its template path, which
+                # carries the copy's nested rows.
+                allele_path = runs[0].target
+        rows.append((record_indexes.get(event.identifier, -1), event.identifier, allele_path,
                      event.kind, parent, start, end, strand))
     rows.sort(key=lambda row: row[0])
     with open(path, 'w', buffering=CHUNK) as out:

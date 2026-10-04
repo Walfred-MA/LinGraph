@@ -2636,6 +2636,77 @@ def _attach_alternative_targets(
             alternative["insertion_anchor_end"] = reference_end
 
 
+def _placed_query(rows: Sequence[dict]) -> Dict[str, List[List[int]]]:
+    """{query contig: merged [start, end]} of the query bases the location
+    layer describes: PRIMARY rows and every INSERTION row. An insertion's
+    reference anchor may only be resolved later (resolve_insertion_anchors),
+    so it counts whether or not it has one yet. UNMAPPED pieces describe
+    nothing."""
+    spans: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for row in rows:
+        if not (isinstance(row.get("query_start"), int)
+                and isinstance(row.get("query_end"), int)
+                and row["query_end"] > row["query_start"]):
+            continue
+        if row.get("kind") in ("PRIMARY", "INSERTION"):
+            spans[row["query_contig"]].append((row["query_start"], row["query_end"]))
+    merged: Dict[str, List[List[int]]] = {}
+    for contig, values in spans.items():
+        values.sort()
+        out: List[List[int]] = []
+        for start, end in values:
+            if out and start <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], end)
+            else:
+                out.append([start, end])
+        merged[contig] = out
+    return merged
+
+
+def _unplaced_spans(spans: Sequence[Span], placed: Mapping[str, List[List[int]]]):
+    """The parts of each span outside the placed query; (spans, bases cut).
+    Sorted placed intervals are walked from a bisected start, so the whole
+    subtraction is O((n + m) log m)."""
+    output: List[Span] = []
+    removed = 0
+    for span in spans:
+        intervals = placed.get(span.contig, ())
+        starts = [interval[0] for interval in intervals] if intervals else []
+        cursor = span.start
+        index = max(0, bisect.bisect_right(starts, span.start) - 1) if starts else 0
+        while index < len(intervals) and intervals[index][0] < span.end:
+            low, high = intervals[index]
+            if high > cursor:
+                if low > cursor:
+                    output.append(Span(span.contig, cursor, min(low, span.end), span.owner_id))
+                removed += min(high, span.end) - max(low, cursor)
+                cursor = max(cursor, high)
+            index += 1
+        if cursor < span.end:
+            output.append(Span(span.contig, cursor, span.end, span.owner_id))
+    return output, removed
+
+
+def _self_copy(row: dict) -> bool:
+    """A sequence-source insertion whose source is its own location.
+
+    After _attach_alternative_targets an alternative row carries the
+    reference span its query occupies in the location layer. When at least
+    half of its source span lies inside that span, the "copy" is the
+    segment's own placement lifted a second time (another local graph's
+    secondary lift of the same locus): one copy, not two. A real extra copy
+    is located at a reference point, so it never overlaps its source."""
+    path = row.get("alternative_path")
+    start, end = row.get("alternative_start"), row.get("alternative_end")
+    if (path in {None, "", "."} or row.get("reference_path") != path
+            or not isinstance(start, int) or not isinstance(end, int) or end <= start
+            or not isinstance(row.get("reference_start"), int)
+            or not isinstance(row.get("reference_end"), int)):
+        return False
+    overlap = min(end, row["reference_end"]) - max(start, row["reference_start"])
+    return 2 * overlap >= end - start
+
+
 def _separate_mapping_assignment_rows(
     intervals: Sequence[AlignmentInterval],
 ) -> List[dict]:
@@ -2690,12 +2761,37 @@ def _separate_mapping_assignment_rows(
     main_rows = _materialize_interval_assignment_rows(
         intervals, main_query, main_reference,
     )
+    # Location wins: a sequence-source (alternative) row describes only
+    # query bases the location layer does not place, so no query base is
+    # described by both layers (as a placed insertion and again as a copy of
+    # its source).
+    alternative_query, removed = _unplaced_spans(
+        alternative_query, _placed_query(main_rows),
+    )
+    if removed:
+        print(
+            f"[pseudolinear] trimmed {removed} sequence-source query base(s) "
+            "already placed by the location layer",
+            file=sys.stderr, flush=True,
+        )
     alternative_rows = _materialize_interval_assignment_rows(
         intervals, alternative_query, (),
     )
+    for row in main_rows:
+        row["pa_path"] = "pri"
+    for row in alternative_rows:
+        row["pa_path"] = "alt"
     _attach_alternative_targets(main_rows, alternative_rows)
+    kept = [row for row in alternative_rows if not _self_copy(row)]
+    if len(kept) != len(alternative_rows):
+        print(
+            f"[pseudolinear] dropped {len(alternative_rows) - len(kept)} "
+            "sequence-source insertion(s) whose source is their own location "
+            "(self copies)",
+            file=sys.stderr, flush=True,
+        )
     return _finish_assignment_rows(
-        main_rows + alternative_rows, main_query, intervals,
+        main_rows + kept, main_query, intervals,
     )
 
 
@@ -3094,10 +3190,13 @@ def _assign_duplication_groups(rows: List[dict]) -> None:
                     member["reference_start"] = reference_start
                     member["reference_end"] = reference_end
                     # Parent sequence is rendered in the common main-path
-                    # orientation; alternative source CIGARs retain their own
-                    # strand independently.
-                    member["query_strand"] = left.get(
-                        "query_strand", member.get("query_strand", "+"),
+                    # orientation. A member's source-locus CIGAR walks the
+                    # query in the member's own orientation, so when that
+                    # changes the CIGAR is turned around with it (reversed
+                    # operations, complemented payloads, flipped source
+                    # strand); otherwise its calls land mirrored in the copy.
+                    _orient_member_to_query_strand(
+                        member, left.get("query_strand", member.get("query_strand", "+")),
                     )
                     member["reference_strand"] = ">"
                     member["anchor"] = reference_start
@@ -3107,6 +3206,35 @@ def _assign_duplication_groups(rows: List[dict]) -> None:
             # run, valid or not.  Continue after its last duplicated member;
             # an invalid run must not be reconsidered from its second PA.
             position = max(position + 1, last_dup_position + 1)
+
+
+_FLIP_STRAND = {"+": "-", "-": "+", ">": "<", "<": ">"}
+
+
+def _orient_member_to_query_strand(member: dict, strand: str) -> None:
+    """Set a duplication member's query strand, keeping its CIGAR consistent."""
+    original = member.get("query_strand") or "+"
+    if (
+        original != strand
+        and member.get("alternative_path") not in {None, "", "."}
+    ):
+        cigar = _assignment_alignment_cigar(member)
+        if cigar not in {None, "", "."}:
+            try:
+                member["alignment_cigar"] = (
+                    core.reverse_mapping_gcigar_for_reverse_path(cigar)
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"{member.get('source_line', '.')}: cannot reorient the "
+                    f"source-locus CIGAR of duplication member "
+                    f"{member.get('query_contig')}:{member.get('query_start')}-"
+                    f"{member.get('query_end')}: {error}"
+                ) from error
+            member["alternative_strand"] = _FLIP_STRAND.get(
+                member.get("alternative_strand", "+"), "-",
+            )
+    member["query_strand"] = strand
 
 
 def _assign_insertion_anchor_intervals(rows: List[dict]) -> None:
@@ -3192,10 +3320,47 @@ def _assign_insertion_anchor_intervals(rows: List[dict]) -> None:
                     == rows[indexes[position]]["query_start"]
                     and rows[indexes[member_positions[-1]]]["query_end"]
                     == right["query_start"]
+                    # graphreftovcf places the merged call on a member's
+                    # contig, so a member already anchored on another
+                    # reference path cannot join these flanks' group.
+                    and all(
+                        rows[indexes[member_position]].get("reference_path")
+                        in {None, "", ".", left["reference_path"]}
+                        for member_position in member_positions
+                    )
                 )
             if valid:
                 left_anchor = _reference_edge_at_query_side(left, "right")
                 right_anchor = _reference_edge_at_query_side(right, "left")
+                # A gap between the flanks, in the mapping's direction, is the
+                # reference span the insertion replaces. When the flanks
+                # overlap instead (the right flank re-reads reference the left
+                # one already covered, e.g. a tandem duplication), nothing is
+                # replaced: the insertion attaches at one flank's edge, the
+                # point its rows are materialized at (the flank whose
+                # neighbouring inserted bases the caller joins to it), or,
+                # for unresolved rows, the edge resolve_insertion_anchors
+                # will give them (the higher-priority flank's).
+                if _same_mapping_orientation(_row_owner(left)):
+                    gap = right_anchor >= left_anchor
+                else:
+                    gap = right_anchor <= left_anchor
+                if not gap:
+                    points = {
+                        rows[indexes[member_position]].get("reference_start")
+                        for member_position in member_positions
+                    }
+                    if points <= {left_anchor, right_anchor} and len(points) == 1:
+                        point, = points
+                    elif all(not isinstance(item, int) for item in points):
+                        chosen = max(
+                            (left, right),
+                            key=lambda flank: _row_owner(flank).priority,
+                        )
+                        point = left_anchor if chosen is left else right_anchor
+                    else:
+                        point = left_anchor
+                    left_anchor = right_anchor = point
                 group_number += 1
                 group_id = str(first.get("dup_group") or (
                     f"I{group_number}:{first['query_contig']}:"
@@ -3554,7 +3719,7 @@ FIELDS = (
     "anchor", "dependency", "dup_group", "insertion_group",
     "insertion_anchor_interval", "region_tier", "trimmed", "encoded",
     "lift_stage", "secondary_lift", "lift_kind", "lift_role",
-    "alignment_score", "resurrected_lift",
+    "alignment_score", "resurrected_lift", "pa_path",
 )
 
 
@@ -3627,6 +3792,10 @@ def write_rows(path: str, rows: Sequence[dict]) -> None:
                     "resurrected_lift", atom.resurrected_lift,
                 )),
                 "alignment_score": f"{float(row.get('alignment_score', atom.score)):.6f}",
+                # pri: location layer (the haplotype's bases at this place);
+                # alt: sequence-source layer (where bases placed elsewhere
+                # came from; never places bases itself).
+                "pa_path": row.get("pa_path", "pri"),
             })
     os.replace(temporary, path)
 

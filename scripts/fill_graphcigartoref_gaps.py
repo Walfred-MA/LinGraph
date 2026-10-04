@@ -1377,7 +1377,10 @@ def _reference_window(
     contig_size = reference_reader.index[path][0]
     start = max(0, min(start, contig_size))
     end = max(start, min(end, contig_size))
-    if end <= start:
+    # A one-sided window is empty when the selected boundary sits at a
+    # reference contig end and the search extends past it.  There is no
+    # reference to align, so the gap stays a pure insertion at that boundary.
+    if end <= start and task.mode == "bounded":
         raise ValueError(f"{task.name}: empty reference alignment window")
     return path, start, end, strand
 

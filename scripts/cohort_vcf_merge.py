@@ -51,6 +51,25 @@ def mode_arguments(args):
     return ['--exact'] + ([] if exact == 'auto' else [str(exact)])
 
 
+def file_stamp(path):
+    """Resolved path, size and mtime: a file edited in place gets a new stamp."""
+    path = Path(path)
+    if not path.is_file():
+        return [str(path)]
+    stat = path.stat()
+    return [str(path.resolve()), stat.st_size, stat.st_mtime_ns]
+
+
+def exact_input_stamps(query_paths, references):
+    """Stamps of every --exact input the merge reads: the query-path list,
+    each assembly FASTA (and index) it names, and the reference FASTAs."""
+    queries = sv.read_query_paths(query_paths)
+    return [file_stamp(query_paths),
+            [[name, file_stamp(fasta), file_stamp(fai)]
+             for name, (fasta, fai) in sorted(queries.items())],
+            [[file_stamp(path), file_stamp(str(path) + '.fai')] for path in references]]
+
+
 def exact_inputs(output, exact, references=()):
     """Query-path list and reference FASTAs for --exact.
 
@@ -238,8 +257,10 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
         ),
     )
     if exact:
-        identity_settings['exact'] = [str(Path(exact_query_paths).resolve()),
-                                      [str(Path(p).resolve()) for p in reference_fastas]]
+        identity_settings['exact'] = exact_input_stamps(exact_query_paths, reference_fastas)
+    if mode != 'snp':
+        # The SV stage scores sequences with this executable.
+        identity_settings['kmermatch'] = file_stamp(shutil.which(str(kmermatch)) or kmermatch)
     identity = hashlib.sha256(json.dumps([stamps, identity_settings, mode == "all", "worker-snp-v3"]).encode()).hexdigest()[:20]
     root = Path(output)/'tmp'/'merge_only'/identity
     root.mkdir(parents=True, exist_ok=True)

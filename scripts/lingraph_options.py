@@ -13,7 +13,7 @@ MANAGED = {
         'bed_grouped', 'graph_folder', 'output_folder', 'continue_cohort_call',
         'cohort_call_args', 'cores', 'alignment_mode', 'compressgraph', 'static_block'},
     'call': COMMON | {'reference', 'graph_folder', 'output_folder', 'assemblies',
-        'partition_list', 'cores', 'sv_only_size', 'minsvsize', 'merge_mode',
+        'partition_list', 'cores', 'sv_only_size', 'minsvsize', 'merge_mode', 'exact',
         'mc_graph', 'merge_only', 'recall_only'},
     'sample': COMMON | {'sample', 'fasta_query', 'hotspot_query', 'reference_sample',
         'fasta_reference', 'reference_align', 'reference_blocks', 'graph_folder',
@@ -50,7 +50,8 @@ def tuning_actions(stage):
     if stage == 'merge':
         return [action for action in tuning_actions('call') if action.dest in {
             'merge_distance', 'size_similarity', 'sequence_similarity', 'merge_processes',
-            'var_in_insert', 'kmermatch', 'keep_merge_tmpdir'}]
+            'var_in_insert', 'kmermatch', 'keep_merge_tmpdir',
+            'keep_full_locus_dup_insertions'}]
     return [action for action in backend_parser(stage)._actions
             if action.option_strings and action.dest not in MANAGED[stage]]
 
@@ -117,6 +118,10 @@ def forward(args, stage):
 
 def merge_settings(args):
     settings = values(args, 'merge')
+    if 'keep_full_locus_dup_insertions' in settings:
+        settings['ignore_full_locus_dup_insertions'] = not settings.pop(
+            'keep_full_locus_dup_insertions'
+        )
     settings['processes'] = settings.pop('merge_processes', args.threads)
     if settings['processes'] < 1:
         raise ValueError('--merge-processes must be positive')

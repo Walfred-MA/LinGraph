@@ -30,6 +30,7 @@ import multiprocessing as mp
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
@@ -4715,6 +4716,12 @@ def _worker_build_column10_candidates(
 ) -> Tuple[int, Optional[List[str]], Optional[str]]:
     index, candidate_group = task
     base_pair = candidate_group[0][0]
+    stop_report = None
+    if (_group_span(candidate_group) > _HUGE_GROUP_SPAN
+            or _group_product(candidate_group) >= _HUGE_GROUP_PRODUCT):
+        stop_report = _start_memory_report(
+            base_pair.query_name or base_pair.label or f"line {base_pair.line_no}",
+        )
     try:
         rows, stats = _evaluate_column10_candidate_rows(
             candidate_group,
@@ -4739,6 +4746,52 @@ def _worker_build_column10_candidates(
             f"failed on column-10 candidate group index={index} "
             f"line={base_pair.line_no} label={label}:\n{traceback.format_exc()}",
         )
+    finally:
+        if stop_report is not None:
+            stop_report.set()
+
+
+_MEMORY_REPORT_SECONDS = 60.0
+
+
+def _resident_gb() -> float:
+    try:
+        with open("/proc/self/status") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024 ** 2
+    except OSError:
+        pass
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1024 ** 3 if sys.platform == "darwin" else 1024 ** 2)
+
+
+def _start_memory_report(label: str) -> threading.Event:
+    """Log this worker's RSS and current call stack until the event is set.
+
+    Only deferred huge groups use it, so an out-of-memory kill leaves the
+    function that was running, and the memory it held, in the log.
+    """
+    stop = threading.Event()
+    target = threading.get_ident()
+
+    def report() -> None:
+        started = time.monotonic()
+        while not stop.wait(_MEMORY_REPORT_SECONDS):
+            frame = sys._current_frames().get(target)
+            stack = " <- ".join(
+                f"{os.path.basename(entry.filename)}:{entry.name}:{entry.lineno}"
+                for entry in reversed(traceback.extract_stack(frame)[-8:])
+            ) if frame is not None else "?"
+            sys.stderr.write(
+                f"[graphcigartoref_persample] huge group {label}: "
+                f"{time.monotonic() - started:.0f}s rss={_resident_gb():.2f} GB in {stack}\n"
+            )
+            sys.stderr.flush()
+
+    threading.Thread(target=report, daemon=True).start()
+    return stop
 
 
 def is_grouped_pair(pair: core.PairRow) -> bool:

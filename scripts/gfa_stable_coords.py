@@ -11,6 +11,8 @@ class StableResolver(Resolver):
         super().__init__(events, roots, header_lengths, hits)
         self.source_aliases = source_aliases or {}
         self.nested_pos_base = nested_pos_base
+        # Link-only walks through carriers' abutting alleles (gfa_junctions).
+        self.junctions = []
         self.ranks = {name: 0 if root.kind == 'reference' else 1
                       for name, root in roots.items()}
         self.order = self._dependency_order(reachable)
@@ -72,7 +74,22 @@ class StableResolver(Resolver):
             if not 0 <= start < end <= length:
                 raise ValueError(f'{name}: SNP coordinate is outside parent {event.chrom!r}')
             return start, end
-        nested = event.chrom in self.events
+        parent = self.events.get(event.chrom)
+        if parent is not None and getattr(parent, 'kind', 'insertion') == 'deletion':
+            # A deletion row has no bases: rows nested in it (--exact: a
+            # member's kept bases) replace the deleted interval, entering
+            # from its left flank and leaving to its right flank.
+            if getattr(event, 'kind', 'insertion') != 'insertion':
+                raise ValueError(f'{name}: only insertions can be nested in deletion '
+                                 f'{event.chrom!r}')
+            offset = event.pos - self.nested_pos_base
+            deleted = sum(run.rend - run.rstart for run in parent.runs if run.operation == 'D')
+            if not 0 <= offset <= max(deleted, parent.ref_end - parent.pos):
+                raise ValueError(f'{name}: offset {offset} is outside deletion {event.chrom!r}')
+            return 0, 0
+        # Rows on a --exact duplication template path use nested POS too.
+        nested = parent is not None or (event.chrom in self.roots and
+                                         self.roots[event.chrom].kind == 'duplication')
         start = event.pos - (self.nested_pos_base if nested else 0)
         # The cohort writer uses POS = offset + 1 for nested events. For a
         # pure insertion END == POS; a nonempty replacement ends at END.
@@ -144,6 +161,35 @@ class StableResolver(Resolver):
                     outside = self.reverse(outside)
                 leaves = outside + leaves if side == 'left' else leaves + outside
         return leaves
+
+    def junction_leaves(self, number, flank):
+        """Link walk of one junction: the parent's flank, the carrier's
+        alleles of abutting variants in its order, the parent's flank."""
+        parent, start, end, items = self.junctions[number]
+        leaves = self._flank(parent, start, flank, 'left')
+        for item in items:
+            leaves.extend(self.allele_leaves(item))
+        return leaves + self._flank(parent, end, flank, 'right')
+
+    def allele_leaves(self, item):
+        """Leaves of one carrier's allele: (variant, nested items) with the
+        nested items already in the carrier's order."""
+        name, nested = item
+        event = self.events[name]
+        leaves = []
+        if getattr(event, 'kind', 'insertion') == 'deletion':
+            for child in nested:
+                leaves.extend(self.allele_leaves(child))
+            return leaves
+        cursor = 0
+        for child in nested:
+            start, end = self.breakpoints(child[0])
+            if start < cursor:
+                continue
+            leaves.extend(self.expand(name, cursor, start))
+            leaves.extend(self.allele_leaves(child))
+            cursor = end
+        return leaves + self.expand(name, cursor, event.length)
 
     def local_path(self, name, start, end, flank):
         return (self._flank(name, start, flank, 'left') +

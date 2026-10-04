@@ -506,6 +506,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--SVonly SIZE must be positive")
     if args.sv_only_size is not None:
         args.merge_mode = 'svonly'
+    args.exact = cohort_merge.resolve_exact(args)
     args.merge_mode = cohort_merge.resolve_mode(args)
     if args.minsvsize < 1:
         parser.error("--minsvsize must be positive")
@@ -590,7 +591,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          keep_merge_tmpdir=args.keep_merge_tmpdir,
                          ignore_full_locus_dup_insertions=(
                              not args.keep_full_locus_dup_insertions
-                         ))
+                         ), exact=args.exact)
         return 0
 
     graph = Path(absolute(args.graph_folder))
@@ -823,6 +824,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "size_similarity": args.size_similarity, "sequence_similarity": args.sequence_similarity,
         "var_in_insert": args.var_in_insert, "emit_small": args.merge_mode in ('all', 'svindel'),
         "keep_full_locus_dup_insertions": args.keep_full_locus_dup_insertions,
+        # Realign against the assemblies; "auto" uses inputs/query_paths.normalized.txt.
+        "exact": (None if args.exact is None else
+                  "auto" if args.exact == "auto" else absolute(args.exact)),
     }
     merge_signature = hashlib.sha256(json.dumps([merge_settings, args.merge_mode == "all", "worker-snp-v3"], sort_keys=True).encode()).hexdigest()[:16]
     merge_tmpdir = Path(absolute(

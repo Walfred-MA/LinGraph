@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import io
 import json
 import math
 from multiprocessing.util import Finalize
@@ -12,6 +13,7 @@ import pickle
 import select
 import signal
 import subprocess
+import struct
 import sys
 import tempfile
 import time
@@ -19,6 +21,68 @@ import traceback
 
 NESTED_CLUSTER_SECONDS = 2 * 60 * 60
 NESTED_PROGRESS_SECONDS = 30
+PIPE_PAYLOAD_LIMIT = 1024 * 1024
+_RESPONSE_HEADER = struct.Struct('!cQ')
+
+
+def _encode_payload(value, path):
+    """Keep small pickles in RAM; spill large ones without a full byte copy."""
+    buffer = io.BytesIO()
+    disk = None
+
+    class Sink:
+        def write(self, blob):
+            nonlocal disk
+            if disk is None and buffer.tell() + len(blob) > PIPE_PAYLOAD_LIMIT:
+                disk = Path(path).open('wb')
+                disk.write(buffer.getbuffer())
+                buffer.close()
+            return (disk if disk is not None else buffer).write(blob)
+
+    try:
+        pickle.dump(value, Sink(), protocol=pickle.HIGHEST_PROTOCOL)
+        return buffer.getvalue() if disk is None else None
+    finally:
+        if disk is not None:
+            disk.close()
+        buffer.close()
+
+
+def _read_request(command, default_root=None):
+    fields = command.decode().rstrip('\n').split('\t')
+    if fields[0] == 'pipe' and len(fields) == 3:
+        size, root = int(fields[1]), Path(json.loads(fields[2]))
+        if not 0 <= size <= PIPE_PAYLOAD_LIMIT:
+            raise ValueError('invalid nested pipe request size')
+        blob = sys.stdin.buffer.read(size)
+        if len(blob) != size:
+            raise EOFError('truncated nested pipe request')
+        return pickle.loads(blob), root, True
+    if fields[0] == 'file' and len(fields) == 2:
+        root, framed = Path(json.loads(fields[1])), True
+    elif fields[0] == 'run' and len(fields) in (1, 2):
+        root, framed = (Path(json.loads(fields[1])) if len(fields) == 2 else default_root), False
+        if root is None:
+            raise ValueError('nested worker request has no spool directory')
+    else:
+        raise ValueError('invalid nested worker request')
+    with (root / 'request.pkl').open('rb') as source:
+        return pickle.load(source), root, framed
+
+
+def _write_result(stream, root, result, framed):
+    if framed:
+        blob = _encode_payload(result, root / 'result.pkl')
+        stream.buffer.write(_RESPONSE_HEADER.pack(b'F' if blob is None else b'D',
+                                                   0 if blob is None else len(blob)))
+        if blob is not None:
+            stream.buffer.write(blob)
+        stream.buffer.flush()
+    else:
+        with (root / 'result.pkl').open('wb') as out:
+            pickle.dump(result, out, protocol=pickle.HIGHEST_PROTOCOL)
+        stream.write('done\n')
+        stream.flush()
 
 
 class AlignmentSession:
@@ -27,6 +91,10 @@ class AlignmentSession:
         self.temp = tempfile.TemporaryDirectory(prefix="merge-nested-", dir=directory)
         self.root = Path(self.temp.name)
         self.closed = False
+        # Custom/older worker commands retain the original file protocol.
+        self.pipe_protocol = command is None or (
+            len(command) > 1 and Path(command[1]).name in
+            ('graphvcfmerge_nested.py', 'graphvcfmerge_scheduler.py'))
         try:
             self.process = subprocess.Popen(
                 command or [sys.executable, str(Path(__file__).resolve()), "--worker", str(self.root)],
@@ -53,6 +121,8 @@ class AlignmentSession:
         self.temp.cleanup()
 
     def run(self, payload, seconds, check_cancelled=None):
+        if self.pipe_protocol:
+            return self._run_pipe(payload, seconds, check_cancelled)
         started = time.monotonic()
         report = started + NESTED_PROGRESS_SECONDS
         if check_cancelled is not None:
@@ -102,6 +172,82 @@ class AlignmentSession:
             raise RuntimeError(f"nested alignment failed:\n{result}")
         return result
 
+    def _run_pipe(self, payload, seconds, check_cancelled):
+        """Cancellable pipe I/O, including request writes and result reads."""
+        started = time.monotonic()
+        report = started + NESTED_PROGRESS_SECONDS
+
+        def check():
+            nonlocal report
+            if check_cancelled is not None:
+                check_cancelled()
+            elapsed = time.monotonic() - started
+            if elapsed >= seconds:
+                raise TimeoutError(f'nested cluster exceeded {seconds:g} seconds')
+            if check_cancelled is None and time.monotonic() >= report:
+                print(f'[merge:nested:waiting] alignment_worker={self.process.pid} '
+                      f'elapsed={elapsed:.0f}s limit={seconds:g}s', file=sys.stderr, flush=True)
+                report = time.monotonic() + NESTED_PROGRESS_SECONDS
+
+        def wait(fd, writing=False):
+            while True:
+                check()
+                timeout = min(.1, max(0, seconds - (time.monotonic() - started)))
+                readable, writable, _ = select.select([] if writing else [fd],
+                                                      [fd] if writing else [], [], timeout)
+                if readable or writable:
+                    return
+
+        def send(blob):
+            view = memoryview(blob)
+            fd = self.process.stdin.fileno()
+            while view:
+                wait(fd, writing=True)
+                try:
+                    count = os.write(fd, view[:65536])
+                except BlockingIOError:
+                    continue
+                if not count:
+                    raise EOFError('nested worker stopped reading requests')
+                view = view[count:]
+
+        def receive(size):
+            result = bytearray()
+            fd = self.process.stdout.fileno()
+            while len(result) < size:
+                wait(fd)
+                chunk = os.read(fd, min(65536, size - len(result)))
+                if not chunk:
+                    raise EOFError('nested alignment worker exited without a result')
+                result.extend(chunk)
+            return result
+
+        try:
+            check()
+            blob = _encode_payload(payload, self.root / 'request.pkl')
+            os.set_blocking(self.process.stdin.fileno(), False)
+            root = json.dumps(str(self.root))
+            send((f'file\t{root}\n' if blob is None else f'pipe\t{len(blob)}\t{root}\n').encode())
+            if blob is not None:
+                send(blob)
+            tag, size = _RESPONSE_HEADER.unpack(receive(_RESPONSE_HEADER.size))
+            if tag == b'D' and size <= PIPE_PAYLOAD_LIMIT:
+                success, result = pickle.loads(receive(size))
+            elif tag == b'F' and size == 0:
+                with (self.root / 'result.pkl').open('rb') as source:
+                    success, result = pickle.load(source)
+                (self.root / 'result.pkl').unlink()
+            else:
+                raise ValueError('invalid nested worker response frame')
+            check()
+            if not success:
+                raise RuntimeError(f'nested alignment failed:\n{result}')
+            return result
+        except BaseException:
+            # A partial frame cannot be reused; kill native descendants too.
+            self.close()
+            raise
+
 
 _session = None
 _owner = None
@@ -124,6 +270,9 @@ def refine_nested(members, sequences, row_ids, context, pooled_map=None, workers
     global _session, _owner, _finalizer
     if len(members) == 1:
         return [(members[0], [members[0] + (None,)])]
+    from graphvcfmerge_kmer import exact_small, refine_exact
+    if exact_small(members, context):
+        return refine_exact(members, list(sequences), row_ids)
     if alignment_scheduler is not None:
         return _refine_shared(members, sequences, row_ids, context, alignment_scheduler)
     seconds = float(context.get("nested_cluster_timeout", NESTED_CLUSTER_SECONDS))
@@ -270,21 +419,15 @@ def worker(root):
     acknowledgements = sys.stdout
     sys.stdout = sys.stderr
     for command in sys.stdin.buffer:
-        if command != b"run\n":
-            raise ValueError("invalid nested worker command")
+        payload, request_root, framed = _read_request(command, root)
         try:
-            with (root / "request.pkl").open("rb") as source:
-                payload = pickle.load(source)
             result = (True, _aligned_groups(payload))
         except Exception:
             result = (False, traceback.format_exc())
-        with (root / "result.pkl").open("wb") as out:
-            pickle.dump(result, out, protocol=pickle.HIGHEST_PROTOCOL)
+        _write_result(acknowledgements, request_root, result, framed)
         del result
         if "payload" in locals():
             del payload
-        acknowledgements.write("done\n")
-        acknowledgements.flush()
 
 
 if __name__ == "__main__":

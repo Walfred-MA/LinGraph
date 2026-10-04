@@ -1645,6 +1645,16 @@ class SVUnit:
     pseudolinear_group_ref_start: int = -1
     pseudolinear_group_ref_end: int = -1
     pseudolinear_group_pa_class: str = "primary"
+    # Which elected layer this call describes: "pri" (the location layer:
+    # the haplotype's own bases at this reference position) or "alt" (the
+    # sequence-source layer: a copy's source, or calls along it). An alt
+    # record never adds bases to the haplotype at its position; the same
+    # query bases are described by pri records. Recorded in the header
+    # entries (Path) that INFO/PAMAP points to.
+    pa_path: str = "pri"
+    # Indexes (ID) of the ##pseudoLinearMapping header entries this call was
+    # made from; their Path says pri or alt. Written as INFO/PAMAP.
+    pa_map: Tuple[int, ...] = ()
 
     @property
     def max_size(self) -> int:
@@ -1694,6 +1704,8 @@ class SNPUnit:
     type_prefix: str = ""
     qry_local_start: int = -1
     qry_local_end: int = -1
+    pa_path: str = "pri"                # see SVUnit.pa_path
+    pa_map: Tuple[int, ...] = ()        # see SVUnit.pa_map
 
 
 @dataclass(frozen=True)
@@ -1730,6 +1742,7 @@ class RowParseResult:
     seen_queries: List[str]
     row_filter_reason: str = ""
     edge_filtered_events: int = 0
+    contig_edge_filtered_events: int = 0
     alternative_filtered_events: int = 0
     main_path_evidence: List[MainPathAlignmentEvidence] = field(
         default_factory=list,
@@ -2647,6 +2660,31 @@ def query_edge_distance(q0: int, q1: int, query_length: int) -> int:
     return min(q0, query_length - q1)
 
 
+def contig_edge_keep_interval(
+    query_rec: SeqRecord,
+    contig_length: int,
+    filter_edge: int,
+) -> Optional[Tuple[int, int]]:
+    """Query-local interval more than ``filter_edge`` bp from both contig ends.
+
+    An assembly interval [g0, g1) is kept only when
+    min(g0, contig_length - g1) > filter_edge, i.e. it lies inside
+    [filter_edge + 1, contig_length - filter_edge - 1].  Returns None when no
+    base of this query record lies inside that window.
+    """
+    keep0 = int(filter_edge) + 1
+    keep1 = int(contig_length) - int(filter_edge) - 1
+    if query_rec.strand == "+":
+        local0, local1 = keep0 - query_rec.start, keep1 - query_rec.start
+    else:
+        local0, local1 = query_rec.end - keep1, query_rec.end - keep0
+    local0 = max(0, local0)
+    local1 = min(max(0, query_rec.end - query_rec.start), local1)
+    if local1 < local0:
+        return None
+    return local0, local1
+
+
 def parse_coord_list(text: str) -> List[Tuple[str, int, int, str]]:
     return [
         coord
@@ -3319,6 +3357,8 @@ def parse_row_events(
     score_main_alignment: bool = False,
     separate_adjacent_indels: bool = False,
     call_insertion_snps: bool = True,
+    filter_edge: int = 0,
+    query_contig_lengths: Optional[Mapping[str, int]] = None,
 ) -> RowParseResult:
     pa_metadata_only = bool(row.get("pseudolinear"))
     query_name = row["query"]
@@ -3371,6 +3411,32 @@ def parse_row_events(
         source_rec = query_rec
     elif sequence_lookup is not query_lookup and resolve_record(query_name, sequence_lookup) is None:
         pass
+    # --filter-edge: query-local window more than filter_edge bp from both
+    # ends of the assembly contig.  Events outside it are dropped and match/
+    # deletion coverage is clipped to it.
+    filter_edge = max(0, int(filter_edge or 0))
+    contig_keep: Optional[Tuple[int, int]] = None
+    if filter_edge:
+        contig_length = (query_contig_lengths or {}).get(q_contig)
+        if contig_length is None:
+            raise ValueError(
+                f"line {row.get('line_no', '.')}: --filter-edge needs the "
+                f"length of query contig {q_contig!r}, which is absent from "
+                "the -s/--seq (or --query) FASTA index"
+            )
+        contig_keep = contig_edge_keep_interval(
+            query_rec, contig_length, filter_edge,
+        )
+
+    def inside_contig_keep(local0: int, local1: int) -> bool:
+        if not filter_edge or local0 < 0:
+            return True
+        if contig_keep is None:
+            return False
+        if local1 < local0:
+            local0, local1 = local1, local0
+        return contig_keep[0] <= local0 and local1 <= contig_keep[1]
+
     if filter_non_acgt_sequences:
         observed_query_sequence = query_rec.fetch_local(0, query_rec.seqlen, "+")
         if has_non_acgt(observed_query_sequence):
@@ -3510,6 +3576,11 @@ def parse_row_events(
         )
         if owned is None:
             owned = [(query_start_local, query_end_local)]
+        if filter_edge:
+            owned = (
+                intersect_intervals(owned, [contig_keep])
+                if contig_keep is not None else []
+            )
         for owned_start, owned_end in owned:
             if owned_end <= owned_start:
                 continue
@@ -3619,6 +3690,7 @@ def parse_row_events(
                 if (
                     not synthetic_reference_deletion
                     and deletion_owned is not False
+                    and inside_contig_keep(qpos, qpos)
                 ):
                     _add_coverage_span(coverage_spans, query_rec.name, ref_rec, f0, f1)
                 lf0, lf1 = min(f0, f1), max(f0, f1)
@@ -3963,6 +4035,32 @@ def parse_row_events(
         next_id += 1
     svs.extend(accepted_nested)
 
+    contig_edge_filtered_events = 0
+    if filter_edge:
+        retained_svs: List[SVUnit] = []
+        for sv in svs:
+            if inside_contig_keep(sv.qry_local_start, sv.qry_local_end):
+                retained_svs.append(sv)
+                continue
+            filtered_spans.append((
+                query_rec.name,
+                sv.ref_contig,
+                sv.ref_start,
+                max(sv.ref_end, sv.ref_start + 1),
+            ))
+            contig_edge_filtered_events += 1
+        svs = retained_svs
+        retained_snps: List[SNPUnit] = []
+        for snp in snps:
+            if inside_contig_keep(snp.qry_local_start, snp.qry_local_end):
+                retained_snps.append(snp)
+                continue
+            filtered_spans.append((
+                query_rec.name, snp.chrom, snp.pos0, snp.pos0 + 1,
+            ))
+            contig_edge_filtered_events += 1
+        snps = retained_snps
+
     edge_filtered_events = 0
     edge_blackregion = 0 if pa_metadata_only else max(0, int(edge_blackregion))
     if edge_blackregion:
@@ -4063,15 +4161,48 @@ def parse_row_events(
             sv.main_gap_lengths = evidence.main_gap_lengths
 
     from alternative_intervals import filter_result
-    return filter_result(RowParseResult(
+    return drop_snps_inside_interval_replacements(filter_result(RowParseResult(
         svs,
         snps,
         coverage_spans,
         filtered_spans,
         [query_rec.name],
         edge_filtered_events=edge_filtered_events,
+        contig_edge_filtered_events=contig_edge_filtered_events,
         main_path_evidence=main_path_evidence,
-    ), row.get('alternative_intervals'))
+    ), row.get('alternative_intervals')))
+
+
+def drop_snps_inside_interval_replacements(result: RowParseResult) -> RowParseResult:
+    """Drop the row's SNPs inside one of its kept interval replacements.
+
+    Every mismatch is written as a SNP while the CIGAR is walked; a scored
+    interval replacement made afterwards replaces its whole reference span
+    with all query bases of its window, mismatches included, so a SNP whose
+    query base lies in that window would describe the same base twice.
+    Only top-level calls of one row (one query-local frame) are compared, and
+    only replacements that survived every row filter.
+    """
+    spans = sorted(
+        (sv.qry_local_start, sv.qry_local_end)
+        for sv in result.svs
+        if not sv.type_prefix and 0 <= sv.qry_local_start < sv.qry_local_end
+        and any(token.get("_interval_replacement") for token in sv.tokens)
+    )
+    if not spans:
+        return result
+    starts = [start for start, _end in spans]
+    kept: List[SNPUnit] = []
+    for snp in result.snps:
+        index = bisect.bisect_right(starts, snp.qry_local_start) - 1
+        if (
+            not snp.type_prefix and snp.qry_local_start >= 0 and index >= 0
+            and snp.qry_local_end <= spans[index][1]
+        ):
+            continue
+        kept.append(snp)
+    result.snps = kept
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -4927,7 +5058,7 @@ def deduplicate_cross_graph_snps(
         index = site_end
 
     snps.sort(key=lambda snp: (
-        snp.sample, snp.chrom, snp.pos0, snp.ref_base, snp.alt_base,
+        snp.sample, snp.chrom, snp.pos0, snp.ref_base, snp.alt_base, snp.pa_path,
         snp.qry_contig, snp.qry_pos, snp.query, snp.label,
     ))
     output: List[SNPUnit] = []
@@ -4937,12 +5068,12 @@ def deduplicate_cross_graph_snps(
     while index < total:
         run_key = (
             snps[index].sample, snps[index].chrom, snps[index].pos0,
-            snps[index].ref_base, snps[index].alt_base,
+            snps[index].ref_base, snps[index].alt_base, snps[index].pa_path,
         )
         run_end = index
         while run_end < total and (
             snps[run_end].sample, snps[run_end].chrom, snps[run_end].pos0,
-            snps[run_end].ref_base, snps[run_end].alt_base,
+            snps[run_end].ref_base, snps[run_end].alt_base, snps[run_end].pa_path,
         ) == run_key:
             run_end += 1
         members = snps[index:run_end]
@@ -4994,7 +5125,7 @@ def merge_cross_row_deletions(
     The returned FORMAT labels retain every contributing local block in order,
     joined by ``&`` in both the block-name and block-coordinate fields.
     """
-    candidates: Dict[Tuple[str, str, str, str, str], List[SVUnit]] = defaultdict(list)
+    candidates: Dict[Tuple[str, ...], List[SVUnit]] = defaultdict(list)
     passthrough: List[SVUnit] = []
     for sv in svs:
         direction = sv.cigar[:1] if sv.cigar[:1] in {">", "<"} else ""
@@ -5006,7 +5137,7 @@ def merge_cross_row_deletions(
         ):
             candidates[(
                 sv.sample, sv.ref_contig, sv.qry_contig,
-                sv.qry_strand, direction,
+                sv.qry_strand, direction, sv.pa_path,
             )].append(sv)
         else:
             passthrough.append(sv)
@@ -5582,39 +5713,225 @@ def _pseudolinear_interval_text(row: Mapping[str, object], prefix: str) -> str:
     return f"{path}:{start}-{end}{strand}"
 
 
+def _joined_insertion_pieces(rows) -> Dict[int, Optional[dict]]:
+    """Pieces of one inserted copy as one mapping.
+
+    A full-locus duplication (or other grouped insertion) elected as several
+    INSERTION pieces of one insertion/dup group repeats, on every piece, the
+    reference interval the whole copy replaces; only its alternative (source)
+    interval is per piece. The VCF writes the copy as ONE row over the joined
+    query span (its source pieces are in ALTERNATIVECIGAR), so the mapping is
+    written the same way: one INSERTION line over the joined query span and
+    that reference interval. Otherwise a reader takes each piece as aligned to
+    the whole replaced interval, a piece joins the neighbouring PRIMARY run
+    and the copy row falls across run boundaries. Returns {id(piece): joined
+    row for the group's first piece, None for its other pieces}; pieces that
+    are not part of such a group are absent.
+    """
+    joined, _leaders = _joined_insertion_groups(rows)
+    return joined
+
+
+def _joined_insertion_groups(rows):
+    """_joined_insertion_pieces plus {id(piece): id(group's first piece)}."""
+    groups = defaultdict(list)
+    leaders: Dict[int, int] = {}
+    for row in rows:
+        group = str(row.get("insertion_group") or row.get("dup_group") or "").strip()
+        if row.get("kind") != "INSERTION" or group in {"", "."}:
+            continue
+        if not all(isinstance(row.get(key), int) for key in (
+                "query_start", "query_end", "reference_start", "reference_end")):
+            continue
+        key = (group, row.get("query_contig"), row.get("query_strand"),
+               row.get("reference_path"), row["reference_start"], row["reference_end"],
+               row.get("reference_strand"), _alternative_assignment(row))
+        groups[key].append(row)
+    joined: Dict[int, Optional[dict]] = {}
+    for pieces in groups.values():
+        pieces.sort(key=lambda piece: (piece["query_start"], piece["query_end"]))
+        chain = [pieces[0]]
+        for piece in pieces[1:] + [None]:
+            if piece is not None and piece["query_start"] == chain[-1]["query_end"]:
+                chain.append(piece)
+                continue
+            if len(chain) > 1:
+                merged = dict(chain[0], query_end=chain[-1]["query_end"],
+                              alternative_path=None)
+                joined[id(chain[0])] = merged
+                for other in chain[1:]:
+                    joined[id(other)] = None
+                    leaders[id(other)] = id(chain[0])
+            if piece is not None:
+                chain = [piece]
+    return joined, leaders
+
+
+def _alternative_assignment(row: dict) -> bool:
+    """A sequence-source (alt) assignment row: the table's pa_path column,
+    or for tables written before it, lift_role."""
+    path = str(row.get("pa_path") or "").strip()
+    if path in {"pri", "alt"}:
+        return path == "alt"
+    return row.get("lift_role") == "alternative"
+
+
+def _elect_gapfill_deletions(input_path: str, indexed_assignments) -> Tuple[int, int]:
+    """Admit gapfill deletion rows (query ``DEL...``, inferred from the graph
+    annotations before the election) into the elected map.
+
+    A row is kept only when the elected location layer brackets it: the rows
+    ending and starting at its query point have reference edges equal to the
+    deletion's two ends. It then gets a DELETION assignment (its own header
+    line, and its record cites it). Any other such row contradicts the
+    elected map (e.g. one elected alignment runs through its breakpoint and
+    covers the reference it would delete) or lacks an elected anchor; it gets
+    no assignment and is not called. Returns (kept, dropped)."""
+    def strand(value):
+        return '-' if value in {'-', '<'} else '+'
+
+    ends, starts = defaultdict(list), defaultdict(list)
+    for rows in indexed_assignments.values():
+        for row in rows:
+            row = _header_location(row)
+            if (row.get('kind') in {'PRIMARY', 'INSERTION'}
+                    and not _alternative_assignment(row)
+                    and isinstance(row.get('query_start'), int)
+                    and isinstance(row.get('query_end'), int)
+                    and row['query_end'] > row['query_start']
+                    and isinstance(row.get('reference_start'), int)
+                    and isinstance(row.get('reference_end'), int)):
+                same = strand(row.get('query_strand')) == strand(row.get('reference_strand'))
+                path = row.get('reference_path')
+                # reference coordinate at the row's query end / query start
+                ends[(row['query_contig'], row['query_end'])].append(
+                    (path, row['reference_end'] if same else row['reference_start']))
+                starts[(row['query_contig'], row['query_start'])].append(
+                    (path, row['reference_start'] if same else row['reference_end']))
+    kept = dropped = 0
+    with open_text(input_path) as handle:
+        for line_no, raw in enumerate(handle, start=1):
+            if not raw.startswith('DEL') or line_no in indexed_assignments:
+                continue
+            fields = raw.rstrip('\n').split('\t')
+            if len(fields) < 7:
+                continue
+            query = parse_coord_token(fields[2])
+            reference = parse_coord_token(fields[3])
+            if query is None or reference is None:
+                continue
+            contig, point = query[0], query[1]
+            path, start, end = reference[0], reference[1], reference[2]
+            bracketed = any(
+                left_path == right_path == path
+                and {left_edge, right_edge} == {start, end}
+                for left_path, left_edge in ends.get((contig, point), ())
+                for right_path, right_edge in starts.get((contig, point), ())
+            )
+            if not bracketed:
+                dropped += 1
+                continue
+            kept += 1
+            indexed_assignments[line_no] = [{
+                'kind': 'DELETION', 'query_contig': contig,
+                'query_start': point, 'query_end': point,
+                'query_strand': query[3], 'reference_path': path,
+                'reference_start': start, 'reference_end': end,
+                'reference_strand': reference[3],
+                'reference_alignment_cigar': fields[6],
+                'alternative_path': None, 'alternative_start': None,
+                'alternative_end': None, 'alternative_strand': None,
+                'alternative_alignment_cigar': '.', 'pa_name': '',
+                'lift_stage': '1', 'secondary_lift': '0',
+                'lift_kind': 'location', 'lift_role': 'main', 'encoded': '0',
+                'pa_path': 'pri', 'dup_group': '', 'insertion_group': '',
+                'insertion_anchor_path': None, 'insertion_anchor_start': None,
+                'insertion_anchor_end': None,
+            }]
+    return kept, dropped
+
+
+def _header_location(row: dict) -> dict:
+    """The row located as its VCF record is: a grouped INSERTION's record is
+    placed at the group's insertion anchor (the reference span between the
+    pieces next to it in the assembly), which can differ from the row's own
+    reference interval (its alignment's anchor point)."""
+    # Same group test as the record (call_run): insertion_group, else dup_group.
+    group = str(row.get("insertion_group") or row.get("dup_group") or "").strip()
+    if (row.get("kind") == "INSERTION"
+            and group not in {"", "."}
+            and isinstance(row.get("insertion_anchor_start"), int)
+            and isinstance(row.get("insertion_anchor_end"), int)):
+        return dict(row,
+                    reference_path=row.get("insertion_anchor_path") or row.get("reference_path"),
+                    reference_start=row["insertion_anchor_start"],
+                    reference_end=row["insertion_anchor_end"])
+    return row
+
+
+def _mapping_entries(indexed_assignments):
+    """The header's mapping lines in order: [(query row, reference text,
+    path)]; a line's ID is its index. Each assignment row gets "map_index",
+    the ID of its location line (pieces of one joined copy share their
+    group's line), and, with a source interval, "map_source_index", the ID of
+    its source line. Location lines are pri for the location layer and alt
+    for the sequence-source layer; source lines are always alt (they say
+    where bases came from; calls along a source cite them)."""
+    every = [row for rows in indexed_assignments.values() for row in rows]
+    written = {id(row): _header_location(row) for row in every}
+    joined, leaders = _joined_insertion_groups(list(written.values()))
+    members = defaultdict(list)          # id(first piece shown) -> rows
+    for row in every:
+        shown = id(written[id(row)])
+        members[leaders.get(shown, shown)].append(row)
+    lines = []
+    for row in every:
+        shown = written[id(row)]
+        if id(shown) in leaders:
+            continue                      # written with its group's first piece
+        location = joined.get(id(shown)) or shown
+        path = "alt" if _alternative_assignment(row) else "pri"
+        index = len(lines)
+        lines.append((location, _pseudolinear_interval_text(location, "reference"), path))
+        for piece in members[id(shown)]:
+            piece["map_index"] = index
+            if _pseudolinear_interval_text(piece, "alternative") != ".":
+                piece["map_source_index"] = len(lines)
+                lines.append((piece, _pseudolinear_interval_text(piece, "alternative"), "alt"))
+    return lines
+
+
 def write_pseudolinear_mapping_header(
     handle, indexed_assignments, sample_names: Sequence[str],
 ) -> None:
-    """Write the elected query-to-reference map as compact VCF metadata."""
+    """Write the elected query-to-reference map as compact VCF metadata.
+
+    Every line has an ID (its index; records cite the line they were called
+    from in INFO/PAMAP) and a Path: pri lines place the haplotype's bases (the
+    location layer), alt lines never do (the sequence-source layer's
+    locations, and every source interval, which follows its location line).
+    A grouped insertion is located at its insertion anchor, as its record is."""
     if not indexed_assignments:
         return
     handle.write("##pseudoLinearMappingCoordinateSystem=0-based-half-open\n")
-    for rows in indexed_assignments.values():
-        for row in rows:
-            query = _pseudolinear_interval_text(row, "query")
-            category = str(row.get("kind") or ".")
-            sample = get_event_haplotype(
-                str(row.get("pa_name") or ""),
-                str(row.get("pa_name") or ""),
-            )
-            if len(sample_names) == 1:
-                sample = sample_names[0]
-            elif sample not in sample_names:
-                sample = "."
-            references = [_pseudolinear_interval_text(row, "reference")]
-            alternative = _pseudolinear_interval_text(row, "alternative")
-            if alternative != ".":
-                # For locus duplications the insertion coordinate is emitted
-                # first, immediately followed by its mapped source interval.
-                references.append(alternative)
-            for reference in references:
-                handle.write(
-                    "##pseudoLinearMapping=<"
-                    f"Sample={_vcf_meta_quote(sample)},"
-                    f"Query={_vcf_meta_quote(query)},"
-                    f"Reference={_vcf_meta_quote(reference)},"
-                    f"Category={_vcf_meta_quote(category)}>\n"
-                )
+    for index, (row, reference, path) in enumerate(_mapping_entries(indexed_assignments)):
+        sample = get_event_haplotype(
+            str(row.get("pa_name") or ""),
+            str(row.get("pa_name") or ""),
+        )
+        if len(sample_names) == 1:
+            sample = sample_names[0]
+        elif sample not in sample_names:
+            sample = "."
+        handle.write(
+            "##pseudoLinearMapping=<"
+            f"ID={_vcf_meta_quote(str(index))},"
+            f"Sample={_vcf_meta_quote(sample)},"
+            f"Query={_vcf_meta_quote(_pseudolinear_interval_text(row, 'query'))},"
+            f"Reference={_vcf_meta_quote(reference)},"
+            f"Category={_vcf_meta_quote(str(row.get('kind') or '.'))},"
+            f"Path={_vcf_meta_quote(path)}>\n"
+        )
 
 
 def write_vcf_header(
@@ -5628,6 +5945,7 @@ def write_vcf_header(
     local_template_coordinates: bool = False,
     local_templates: Sequence[LocalTemplate] = (),
     pseudolinear_assignments=None,
+    filter_edge: int = 0,
 ):
     handle.write("##fileformat=VCFv4.2\n")
     handle.write("##source=refexalign_vcf_rewrite.py\n")
@@ -5645,6 +5963,8 @@ def write_vcf_header(
         "##perSampleV2ReferenceAlignmentEdgeBlackregion="
         f"{max(0, int(edge_blackregion))}\n"
     )
+    if filter_edge:
+        handle.write(f"##queryContigEdgeFilter={int(filter_edge)}\n")
     handle.write("##localBlockContributorSeparator=&\n")
     write_pseudolinear_mapping_header(
         handle, pseudolinear_assignments, sample_names,
@@ -5699,6 +6019,7 @@ def write_vcf_header(
     handle.write('##INFO=<ID=SVDELSEQ,Number=1,Type=String,Description="Representative deleted reference sequence for alleles with deleted component <=500 bp, otherwise .">\n')
     handle.write('##INFO=<ID=QUERYSEQ,Number=1,Type=String,Description="VCF-escaped representative query contig and 0-based query coordinate or range with strand, separated by |">\n')
     handle.write('##INFO=<ID=PACLASS,Number=1,Type=String,Description="Pseudo-linear assignment class of the representative observation: primary or fulllocusdup">\n')
+    handle.write('##INFO=<ID=PAMAP,Number=.,Type=Integer,Description="IDs of the ##pseudoLinearMapping entries the record was called from; their Path is pri (location layer: the haplotype\'s bases at this position) or alt (sequence-source layer: a copy\'s source or calls along it; adds no bases to the haplotype)">\n')
     handle.write('##INFO=<ID=ALTERNATIVECIGAR,Number=1,Type=String,Description="Query-to-source-locus alignment CIGAR for a full-locus duplication insertion; adjacent elected pieces are joined by &">\n')
     handle.write('##FORMAT=<ID=GT,Number=1,Type=String,Description="Haploid genotype: 1 variant, 0 callable reference, . no call">\n')
     handle.write('##FORMAT=<ID=TYPE,Number=.,Type=String,Description="Per-observation variant type">\n')
@@ -5847,6 +6168,9 @@ def sv_cluster_to_row(
         f"SVDELSEQ={vcf_escape(svdelseq)}",
         f"PACLASS={rep.pa_class or 'primary'}",
     ]
+    pa_map = sorted({index for member in members for index in member.pa_map})
+    if pa_map:
+        info_parts.append("PAMAP=" + ",".join(map(str, pa_map)))
     if rep.alternative_mapping_cigar:
         info_parts.append(
             "ALTERNATIVECIGAR="
@@ -5882,15 +6206,16 @@ def sv_cluster_to_row(
     return "\t".join(row)
 
 
-def snp_clusters(snps: Sequence[SNPUnit]) -> Dict[Tuple[str, int, str, str], List[SNPUnit]]:
-    out: Dict[Tuple[str, int, str, str], List[SNPUnit]] = defaultdict(list)
+def snp_clusters(snps: Sequence[SNPUnit]) -> Dict[tuple, List[SNPUnit]]:
+    out: Dict[tuple, List[SNPUnit]] = defaultdict(list)
     for s in snps:
-        out[(s.chrom, s.pos0, s.ref_base, s.alt_base)].append(s)
+        out[(s.chrom, s.pos0, s.ref_base, s.alt_base, s.pa_path)].append(s)
     return out
 
 
-def snp_cluster_to_row(key: Tuple[str, int, str, str], members: List[SNPUnit], sample_names: Sequence[str], coverage_map, filtered_map) -> Optional[str]:
-    chrom, pos0, ref, alt = key
+def snp_cluster_to_row(key: tuple, members: List[SNPUnit], sample_names: Sequence[str], coverage_map, filtered_map) -> Optional[str]:
+    chrom, pos0, ref, alt = key[:4]
+    path = key[4] if len(key) > 4 else "pri"
     event_by_sample: Dict[str, List[SNPUnit]] = defaultdict(list)
     for m in members:
         event_by_sample[m.sample].append(m)
@@ -5898,6 +6223,9 @@ def snp_cluster_to_row(key: Tuple[str, int, str, str], members: List[SNPUnit], s
     if nsup == 0:
         return None
     info = f"NSUP={nsup}"
+    pa_map = sorted({index for member in members for index in member.pa_map})
+    if pa_map:
+        info += ";PAMAP=" + ",".join(map(str, pa_map))
     sample_fields = []
     for sample in sample_names:
         evs = event_by_sample.get(sample, [])
@@ -5913,7 +6241,8 @@ def snp_cluster_to_row(key: Tuple[str, int, str, str], members: List[SNPUnit], s
                 sample, chrom, pos0, pos0 + 1, coverage_map, filtered_map,
             )
             sample_fields.append(format_missing_sample(symbol, SNP_FORMAT))
-    row = [chrom, str(pos0 + 1), f"SNP_{chrom}_{pos0 + 1}_{alt}", ref, alt, ".", "PASS", info, SNP_FORMAT] + sample_fields
+    row_id = f"SNP_{chrom}_{pos0 + 1}_{alt}" + ("_ALT" if path == "alt" else "")
+    row = [chrom, str(pos0 + 1), row_id, ref, alt, ".", "PASS", info, SNP_FORMAT] + sample_fields
     return "\t".join(row)
 
 
@@ -8015,7 +8344,7 @@ def read_pseudolinear_assignments(path: str) -> Dict[int, List[dict]]:
                     "alternative_start", "alternative_end",
                     "alternative_strand", "alternative_alignment_cigar",
                     "pa_name", "lift_stage", "secondary_lift", "lift_kind",
-                    "lift_role", "encoded",
+                    "lift_role", "encoded", "pa_path",
                     "dup_group", "insertion_group",
                     "insertion_anchor_path", "insertion_anchor_start",
                     "insertion_anchor_end",
@@ -8025,7 +8354,7 @@ def read_pseudolinear_assignments(path: str) -> Dict[int, List[dict]]:
                 "kind", "query_contig", "query_strand", "reference_path",
                 "reference_strand", "alternative_path",
                 "alternative_strand", "pa_name", "lift_stage",
-                "secondary_lift", "lift_kind", "lift_role", "encoded",
+                "secondary_lift", "lift_kind", "lift_role", "encoded", "pa_path",
                 "dup_group", "insertion_group", "insertion_anchor_path",
             ):
                 value = retained.get(key)
@@ -8524,24 +8853,67 @@ def parse_pseudolinear_row_events(row: dict, assignments: Sequence[dict], ctx: d
             '.',
         )
         dup_group = first.get('dup_group', '')
-        insertion_group_pieces = [
-            piece for piece in run if piece.get('insertion_group')
-        ]
-        insertion_group_ids = list(dict.fromkeys(
-            piece['insertion_group'] for piece in insertion_group_pieces
-        ))
-        insertion_group = (
-            insertion_group_ids[0] if len(insertion_group_ids) == 1 else ''
+        # A run can hold several insertion groups (each bracketed by its own
+        # flanks); every call is matched to the group whose query span it
+        # overlaps. Groups are disjoint on the query: keep them sorted by
+        # query start for a binary search per call.
+        group_spans = {}
+        for piece in run:
+            if piece.get('insertion_group'):
+                span = group_spans.setdefault(
+                    piece['insertion_group'], [piece['q0'], piece['q1'], piece],
+                )
+                span[0] = min(span[0], piece['q0'])
+                span[1] = max(span[1], piece['q1'])
+        group_list = sorted(
+            (span[0], span[1], group_id, span[2])
+            for group_id, span in group_spans.items()
         )
-        insertion_group_piece = (
-            insertion_group_pieces[0] if insertion_group else None
-        )
-        insertion_group_query_start = min(
-            (piece['q0'] for piece in insertion_group_pieces), default=0,
-        )
-        insertion_group_query_end = max(
-            (piece['q1'] for piece in insertion_group_pieces), default=0,
-        )
+        group_starts = [item[0] for item in group_list]
+
+        def overlapping_groups(q0, q1):
+            """[(group id, query start, query end, first piece)] of the
+            groups whose query span overlaps [q0, q1)."""
+            found = []
+            position = bisect.bisect_left(group_starts, q1) - 1
+            # Disjoint spans sorted by start also have increasing ends.
+            while position >= 0 and group_list[position][1] > q0:
+                start, end, group_id, piece = group_list[position]
+                found.append((group_id, start, end, piece))
+                position -= 1
+            return found[::-1]
+
+        def group_anchor_of(piece):
+            anchor_row = piece['assignment']
+            return (
+                anchor_row['insertion_anchor_start']
+                if isinstance(anchor_row.get('insertion_anchor_start'), int)
+                else anchor_row['reference_start'],
+                anchor_row['insertion_anchor_end']
+                if isinstance(anchor_row.get('insertion_anchor_end'), int)
+                else anchor_row['reference_end'],
+            )
+
+        def joins_group(sv, start, end, anchor):
+            """Whether call sv belongs to the group with query span
+            [start, end) and reference anchor (a0, a1)."""
+            return (
+                # The complete call is inside the elected INSERTION span,
+                (sv.qry_start >= start and sv.qry_end <= end)
+                # or the call reaches past it (neighbouring inserted bases
+                # joined by the parser). A pure insertion is then placed at
+                # the group's anchor (its own point is only its alignment's
+                # anchor); a call with a deletion joins only when its
+                # reference span touches the anchor without covering it (one
+                # covering it is already the whole replacement), and
+                # merge_pseudolinear_insertions replaces the union of both
+                # spans, so neither deletion is lost.
+                or (sv.del_size == 0
+                    or (sv.ref_start <= anchor[1]
+                        and anchor[0] <= sv.ref_end
+                        and not (sv.ref_start <= anchor[0]
+                                 and anchor[1] <= sv.ref_end)))
+            )
         full_locus_dup = bool(
             not first['source_relative']
             and (
@@ -8582,9 +8954,50 @@ def parse_pseudolinear_row_events(row: dict, assignments: Sequence[dict], ctx: d
             filter_non_acgt_sequences=ctx['filter_non_acgt_sequences'],
             separate_adjacent_indels=ctx.get('separate_adjacent_indels', False),
             call_insertion_snps=ctx.get('call_insertion_snps', True),
+            filter_edge=ctx.get('filter_edge', 0),
+            query_contig_lengths=ctx.get('query_contig_lengths'),
         )
+        # The run's layer: calls along a copy's source, or made from
+        # sequence-source (alternative) assignments, describe query bases the
+        # location layer already places.
+        alternative_pieces = [
+            piece for piece in run
+            if piece['source_relative']
+            or _alternative_assignment(piece['assignment'])
+        ]
+
+        def call_path(q0, q1):
+            if len(alternative_pieces) == len(run):
+                return 'alt'
+            if not alternative_pieces:
+                return 'pri'
+            # Mixed run: the layer of the piece holding the call.
+            inside = [piece for piece in run if piece['q0'] <= q0 and q1 <= piece['q1']]
+            return ('alt' if inside and all(piece in alternative_pieces for piece in inside)
+                    else 'pri')
+
+        def call_map(q0, q1, path):
+            """Header lines of the run's pieces holding query [q0, q1) (if
+            none holds it, the run's pieces of the call's path)."""
+            held = [piece for piece in run
+                    if ((piece['q0'] < q1 and q0 < piece['q1']) if q1 > q0
+                        else piece['q0'] <= q0 <= piece['q1'])]
+            if not held:
+                held = [piece for piece in run
+                        if (piece in alternative_pieces) == (path == 'alt')] or run[:1]
+            key = 'map_source_index' if first['source_relative'] else 'map_index'
+            return tuple(sorted({
+                piece['assignment'][key] for piece in held
+                if isinstance(piece['assignment'].get(key), int)
+            }))
+
         for sv in parsed.svs:
             sv.source_relative = sv.source_relative or first['source_relative']
+            # A call nested in an encoded insertion (made against its
+            # template; TYPE INS_*) belongs to its run's path; only a source
+            # run (a copy's source) is alt by itself.
+            sv.pa_path = call_path(sv.qry_start, sv.qry_end)
+            sv.pa_map = call_map(sv.qry_start, sv.qry_end, sv.pa_path)
             sv.pseudolinear_strand = '' if sv.source_relative else direction
             sv.pseudolinear = True
             sv.liftover_category = run_lift_category
@@ -8598,20 +9011,19 @@ def parse_pseudolinear_row_events(row: dict, assignments: Sequence[dict], ctx: d
                     not in {None, '', '.'}
                 ) else ''
             )
-            if (
-                not sv.source_relative
-                and insertion_group
-                and sv.ins_size > 0
-                # Group reconstruction is valid only when the complete call
-                # is inside the elected INSERTION span.  Merely touching a
-                # group edge, or containing the group as one component of a
-                # larger D/I replacement, must not tag the whole call: doing
-                # so would rebuild the replacement from the insertion flanks
-                # and discard its original deletion component.
-                and sv.qry_start >= insertion_group_query_start
-                and sv.qry_end <= insertion_group_query_end
-                and sv.qry_start < sv.qry_end
-            ):
+            # The call joins the one group (of those its query span overlaps)
+            # it belongs to; with none or several, it stays a call of its own.
+            joined = [
+                (group_id, piece)
+                for group_id, start, end, piece in (
+                    overlapping_groups(sv.qry_start, sv.qry_end)
+                    if group_list and not sv.source_relative
+                    and sv.ins_size > 0 and sv.qry_start < sv.qry_end else ()
+                )
+                if joins_group(sv, start, end, group_anchor_of(piece))
+            ]
+            if len(joined) == 1:
+                insertion_group, insertion_group_piece = joined[0]
                 sv.pseudolinear_group = insertion_group
                 group_assignment = insertion_group_piece['assignment']
                 sv.pseudolinear_group_ref_start = int(
@@ -8633,6 +9045,11 @@ def parse_pseudolinear_row_events(row: dict, assignments: Sequence[dict], ctx: d
                 )
             if not run_label:
                 sv.label_h = '.'
+        for snp in parsed.snps:
+            # On '-' the query point is one past the base (end - offset).
+            base = snp.qry_pos - 1 if snp.qry_strand == '-' else snp.qry_pos
+            snp.pa_path = call_path(base, base + 1)
+            snp.pa_map = call_map(base, base + 1, snp.pa_path)
         if not run_label:
             for snp in parsed.snps:
                 snp.label_h = '.'
@@ -8640,6 +9057,7 @@ def parse_pseudolinear_row_events(row: dict, assignments: Sequence[dict], ctx: d
         result.snps.extend(parsed.snps)
         result.coverage_spans.extend(parsed.coverage_spans)
         result.filtered_spans.extend(parsed.filtered_spans)
+        result.contig_edge_filtered_events += parsed.contig_edge_filtered_events
 
     # A duplicated PA may call SNP/SV differences on its own alternative
     # source path.  The elected PA-bounded query slice and its materialized
@@ -8698,12 +9116,20 @@ def merge_pseudolinear_insertions(svs: Sequence[SVUnit]) -> List[SVUnit]:
 
     for (_sample, group_id), members in sorted(insertion_groups.items()):
         members.sort(key=lambda sv: (sv.qry_start, sv.qry_end, sv.id))
-        if any(member.del_size > 0 for member in members):
-            # Defensive compatibility for reports produced before insertion
-            # groups required full query containment.  A call that already
-            # carries a deletion is a complete interval replacement; its
-            # original reference span and CIGAR are authoritative.  Rebuilding
-            # it from group anchors can turn e.g. 120D100I into a plain 100I.
+        anchor_start = members[0].pseudolinear_group_ref_start
+        anchor_end = members[0].pseudolinear_group_ref_end
+        deleting = [member for member in members if member.del_size > 0]
+        if deleting and (
+            any(not (member.ref_start <= anchor_end and anchor_start <= member.ref_end)
+                for member in deleting)
+            or (min(member.ref_start for member in deleting) <= anchor_start
+                and anchor_end <= max(member.ref_end for member in deleting))
+        ):
+            # A call carrying a deletion away from the group's anchor, or
+            # one already covering the anchor, is a complete interval
+            # replacement of its own; its reference span and CIGAR are
+            # authoritative (rebuilding it from the anchors could turn e.g.
+            # 120D100I into a plain 100I).
             output.extend(members)
             continue
         first = members[0]
@@ -8732,10 +9158,21 @@ def merge_pseudolinear_insertions(svs: Sequence[SVUnit]) -> List[SVUnit]:
         ordered = members if first.qry_strand == '+' else list(reversed(members))
         sequence = ''.join(member.raw_ins_seq for member in ordered)
         insertion_size = sum(member.ins_size for member in members)
-        reference_start = first.pseudolinear_group_ref_start
-        reference_end = first.pseudolinear_group_ref_end
+        # The group replaces its anchor span (the gap between its flanks; a
+        # point for a pure insertion) together with the reference spans its
+        # members delete themselves (which touch it): one replacement, so
+        # neither the bracketed span nor a member's own deletion is lost.
+        reference_start = min([anchor_start] + [member.ref_start for member in members
+                                                if member.del_size > 0])
+        reference_end = max([anchor_end] + [member.ref_end for member in members
+                                            if member.del_size > 0])
         deletion_size = reference_end - reference_start
-        cigar = f'>{insertion_size}I{sequence}'
+        # The members' direction: on a reversed reference ('<') the inserted
+        # bases are in that traversal's orientation, which the record writer
+        # turns to forward-reference orientation. A forced '>' would write
+        # them reverse-complemented (and the query strand unflipped).
+        direction = first.cigar[:1] if first.cigar[:1] in {'>', '<'} else '>'
+        cigar = f'{direction}{insertion_size}I{sequence}'
         if deletion_size:
             cigar += f'{deletion_size}D'
         labels = list(dict.fromkeys(
@@ -8752,6 +9189,7 @@ def merge_pseudolinear_insertions(svs: Sequence[SVUnit]) -> List[SVUnit]:
         group_pa_class = first.pseudolinear_group_pa_class or first.pa_class
         combined = replace(
             first,
+            pa_map=tuple(sorted({index for member in members for index in member.pa_map})),
             qry_start=members[0].qry_start,
             qry_end=members[-1].qry_end,
             ref_start=reference_start,
@@ -8782,40 +9220,41 @@ def merge_pseudolinear_insertions(svs: Sequence[SVUnit]) -> List[SVUnit]:
     if grouped_replacements:
         # The two flanks define the reference component of the replacement.
         # Suppress any independently recovered pure deletion wholly contained
-        # in that component; the grouped event already carries it.  Build one
-        # merged interval index per sample/path, then use binary search rather
-        # than comparing every deletion with every insertion group.
-        replacement_intervals = defaultdict(list)
+        # in that component and placed on the group's own query span (its
+        # ends included); the grouped event already carries it.  A deletion
+        # elsewhere on the query (another run whose reference lies inside
+        # the span) is its own event and is kept.  Groups are disjoint on the
+        # query: sort them once per sample/path/query contig and use binary
+        # search rather than comparing every deletion with every group.
+        replacement_index = defaultdict(list)
         for replacement in grouped_replacements:
-            replacement_intervals[(
+            replacement_index[(
                 replacement.sample, replacement.ref_contig,
-            )].append((replacement.ref_start, replacement.ref_end))
-        replacement_index = {}
-        for key, intervals in replacement_intervals.items():
-            merged = []
-            for start, end in sorted(intervals):
-                if merged and start <= merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-                else:
-                    merged.append((start, end))
-            replacement_index[key] = (
-                [start for start, _end in merged], merged,
-            )
+                replacement.qry_contig,
+            )].append((
+                replacement.qry_start, replacement.qry_end,
+                replacement.ref_start, replacement.ref_end,
+            ))
+        replacement_starts = {}
+        for key, groups in replacement_index.items():
+            groups.sort()
+            replacement_starts[key] = [group[0] for group in groups]
 
         retained_output = []
         for sv in output:
             if sv.ins_size == 0 and sv.del_size > 0:
-                indexed = replacement_index.get((sv.sample, sv.ref_contig))
-                if indexed is not None:
-                    starts, intervals = indexed
-                    interval_index = bisect.bisect_right(
-                        starts, sv.ref_start,
-                    ) - 1
-                    if (
-                        interval_index >= 0
-                        and intervals[interval_index][1] >= sv.ref_end
-                    ):
-                        continue
+                key = (sv.sample, sv.ref_contig, sv.qry_contig)
+                groups = replacement_index.get(key, ())
+                position = bisect.bisect_right(
+                    replacement_starts.get(key, ()), sv.qry_start,
+                )
+                if any(
+                    qry_start <= sv.qry_start <= qry_end
+                    and ref_start <= sv.ref_start and sv.ref_end <= ref_end
+                    for qry_start, qry_end, ref_start, ref_end
+                    in groups[max(0, position - 2):position]
+                ):
+                    continue
             retained_output.append(sv)
         output = retained_output
 
@@ -8829,7 +9268,10 @@ def merge_pseudolinear_insertions(svs: Sequence[SVUnit]) -> List[SVUnit]:
             first = run[0]
             ordered = run if first.qry_strand == '+' else list(reversed(run))
             labels = list(dict.fromkeys(sv.allelename for sv in ordered if sv.allelename))
-            combined = replace(first, qry_end=run[-1].qry_end,
+            combined = replace(first,
+                               pa_map=tuple(sorted({index for member in run
+                                                    for index in member.pa_map})),
+                               qry_end=run[-1].qry_end,
                 ins_size=sum(sv.ins_size for sv in run),
                 raw_ins_seq=''.join(sv.raw_ins_seq for sv in ordered),
                 cigar=''.join(sv.cigar for sv in ordered),
@@ -8851,7 +9293,7 @@ def merge_pseudolinear_insertions(svs: Sequence[SVUnit]) -> List[SVUnit]:
                     getattr(previous, key) != getattr(sv, key)
                     for key in ('sample', 'qry_contig', 'qry_strand', 'ref_contig',
                                 'ref_start', 'ref_end', 'pseudolinear_strand',
-                                'pa_class', 'alternative_mapping_source'))):
+                                'pa_class', 'alternative_mapping_source', 'pa_path'))):
                 flush()
                 run = []
         run.append(sv)
@@ -8880,10 +9322,13 @@ def _row_worker_parse(item):
     if ctx.get("use_pseudolinear", False):
         assignments = ctx["pseudolinear_assignments"].get(line_no, ())
         # A source with no elected query bases must not re-enter through the
-        # old PA parser. Explicit zero-query gapfill deletions predate the
-        # assignment table and retain their already validated calling path.
+        # old PA parser. A gapfill deletion row (query DEL...) is called only
+        # through the DELETION assignment _elect_gapfill_deletions gave it.
         if assignments or not str(row['query']).startswith('DEL'):
             return line_no, parse_pseudolinear_row_events(row, assignments, ctx)
+        # A gapfill deletion the election did not admit
+        # (_elect_gapfill_deletions) is not called.
+        return line_no, RowParseResult([], [], [], [], [row['query']])
     results = []
     for ownership_row in expand_graphcigartoref_ownership_rows(row):
         results.append(parse_row_events(
@@ -8906,6 +9351,8 @@ def _row_worker_parse(item):
                 "separate_adjacent_indels", False,
             ),
             call_insertion_snps=ctx.get("call_insertion_snps", True),
+            filter_edge=ctx.get("filter_edge", 0),
+            query_contig_lengths=ctx.get("query_contig_lengths"),
         ))
     if len(results) == 1:
         return line_no, apply_pseudolinear_vcf_policy(
@@ -8922,6 +9369,7 @@ def _row_worker_parse(item):
         combined.seen_queries.extend(result.seen_queries)
         combined.main_path_evidence.extend(result.main_path_evidence)
         combined.edge_filtered_events += result.edge_filtered_events
+        combined.contig_edge_filtered_events += result.contig_edge_filtered_events
         combined.alternative_filtered_events += result.alternative_filtered_events
         all_non_acgt = (
             all_non_acgt
@@ -8994,11 +9442,11 @@ def _iter_snp_batch_specs(
     index = 0
     while index < len(snps):
         snp = snps[index]
-        key = (snp.chrom, snp.pos0, snp.ref_base, snp.alt_base)
+        key = (snp.chrom, snp.pos0, snp.ref_base, snp.alt_base, snp.pa_path)
         end = index + 1
         while end < len(snps):
             other = snps[end]
-            other_key = (other.chrom, other.pos0, other.ref_base, other.alt_base)
+            other_key = (other.chrom, other.pos0, other.ref_base, other.alt_base, other.pa_path)
             if other_key != key:
                 break
             end += 1
@@ -9101,6 +9549,7 @@ def _write_header_and_bodies(
     local_template_coordinates: bool = False,
     local_templates: Sequence[LocalTemplate] = (),
     pseudolinear_assignments=None,
+    filter_edge: int = 0,
 ) -> None:
     started = time.monotonic()
     print(
@@ -9119,6 +9568,7 @@ def _write_header_and_bodies(
             local_template_coordinates=local_template_coordinates,
             local_templates=local_templates,
             pseudolinear_assignments=pseudolinear_assignments,
+            filter_edge=filter_edge,
         )
         for body_path in body_paths:
             with open(body_path) as body:
@@ -9251,6 +9701,19 @@ def main():
         ),
     )
     parser.add_argument(
+        "--filter-edge",
+        type=int,
+        default=0,
+        metavar="BP",
+        help=(
+            "drop variants whose distance to either end of the query "
+            "(assembly) contig is <= BP, and remove reference coverage "
+            "contributed by query bases within BP of a contig end; contig "
+            "lengths come from the -s/--seq (or --query) FASTA index "
+            "(default: 0, disabled)"
+        ),
+    )
+    parser.add_argument(
         "--allow-non-acgt-sequences",
         action="store_true",
         help=(
@@ -9333,6 +9796,8 @@ def main():
         parser.error("--format-processes must be at least 1")
     if args.edge_blackregion < 0:
         parser.error("--edge-blackregion must be at least 0")
+    if args.filter_edge < 0:
+        parser.error("--filter-edge must be at least 0")
     if args.var_in_insert < 0:
         parser.error("--var-in-insert must be at least 0")
     if args.var_in_insert > 0 and mappy is None:
@@ -9382,6 +9847,18 @@ def main():
     )
     if args.pseudo_linear_assignments:
         _set_pseudolinear_deletion_points(pseudolinear_assignments)
+        gapfill_kept, gapfill_dropped = _elect_gapfill_deletions(
+            args.input, pseudolinear_assignments,
+        )
+        print(
+            f"[graphreftovcf] gapfill deletion rows: {gapfill_kept} bracketed "
+            f"by the elected map (called), {gapfill_dropped} not (dropped)",
+            file=sys.stderr,
+        )
+        # Header entry IDs, set before calling so every record can cite the
+        # entry it is made from (INFO/PAMAP); the header writer recomputes
+        # the same IDs from the same rows.
+        _mapping_entries(pseudolinear_assignments)
         args.validate_cross_graph_svs = False
         args.resolve_conflicts_by_alignment_score = False
         args.inconsistency_report = None
@@ -9458,10 +9935,34 @@ def main():
     else:
         query_records, query_order, _query_reader = {}, [], None
     sequence_records: Dict[str, SeqRecord] = {}
+    _seq_reader = None
     if args.seq:
         sequence_records, _seq_order, _seq_reader = read_fasta_metadata(args.seq, require_coord=False, max_impute=args.max_impute, attach_reader=True)
     else:
         sequence_records = query_records
+    query_contig_lengths: Dict[str, int] = {}
+    if args.filter_edge:
+        for contig_reader in (_query_reader, _seq_reader):
+            if contig_reader is None:
+                continue
+            query_contig_lengths.update(
+                (name, int(entry[0]))
+                for name, entry in contig_reader.index.items()
+            )
+            # graphreftovcf_persample's in-memory reader also indexes query
+            # views by query name; whole-contig lengths come from its
+            # sequences so a view can never shadow a contig of the same name.
+            query_contig_lengths.update(
+                (name, len(sequence))
+                for name, sequence in (
+                    getattr(contig_reader, "sequences", None) or {}
+                ).items()
+            )
+        if not query_contig_lengths:
+            parser.error(
+                "--filter-edge needs query contig lengths from a -s/--seq "
+                "or --query FASTA"
+            )
     coord_records: Dict[str, SeqRecord] = {}
     coord_map_paths = split_coord_map_paths(args.coord_map)
     if coord_map_paths:
@@ -9515,6 +10016,7 @@ def main():
     non_acgt_filtered_rows = 0
     error_bed_filtered_rows = 0
     edge_filtered_events = 0
+    contig_edge_filtered_events = 0
 
     alternative_filtered_events = 0
     parse_started = time.monotonic()
@@ -9581,6 +10083,7 @@ def main():
 
     def consume_row_result(line_no: int, result: Optional[RowParseResult]):
         nonlocal next_id, non_acgt_filtered_rows, edge_filtered_events
+        nonlocal contig_edge_filtered_events
         nonlocal error_bed_filtered_rows
         nonlocal alternative_filtered_events
         nonlocal spilled_snp_count
@@ -9608,6 +10111,7 @@ def main():
         if result.row_filter_reason == "error_bed":
             error_bed_filtered_rows += 1
         edge_filtered_events += result.edge_filtered_events
+        contig_edge_filtered_events += result.contig_edge_filtered_events
         alternative_filtered_events += result.alternative_filtered_events
         for sv in result.svs:
             sv.id = next_id
@@ -9653,6 +10157,8 @@ def main():
         "var_in_insert_min_bp": 0,
         "call_insertion_snps": args.svcutoff is None,
         "edge_blackregion": args.edge_blackregion,
+        "filter_edge": args.filter_edge,
+        "query_contig_lengths": query_contig_lengths,
         "filter_non_acgt_sequences": not args.allow_non_acgt_sequences,
         "strict": not args.lenient,
         "interval_ownership": interval_ownership,
@@ -9856,6 +10362,14 @@ def main():
         f"{args.edge_blackregion} bp of a reference graph-alignment edge",
         file=sys.stderr,
     )
+    if args.filter_edge:
+        print(
+            "[graphreftovcf] query contig edge filter: "
+            f"{contig_edge_filtered_events} event(s) excluded within "
+            f"{args.filter_edge} bp of a query contig end; reference "
+            "coverage excludes those contig-end bases",
+            file=sys.stderr,
+        )
     coverage_map = build_sample_interval_map(coverage_spans_set, haplotype_mode=haplotype_mode, allowed_samples=allowed if sample_names else None)
     filtered_map = build_sample_interval_map(filtered_spans_set, haplotype_mode=haplotype_mode, allowed_samples=allowed if sample_names else None)
     # Header coverage must describe reference bases actually traversed by the
@@ -9997,7 +10511,7 @@ def main():
                     )
             print("[graphreftovcf] ordering SNP observations ...", file=sys.stderr)
             snps.sort(key=lambda value: (
-                value.chrom, value.pos0, value.ref_base, value.alt_base,
+                value.chrom, value.pos0, value.ref_base, value.alt_base, value.pa_path,
             ))
             snp_body = _temporary_body_path(args.output, "snp")
             snp_context = {
@@ -10066,6 +10580,7 @@ def main():
                 local_template_coordinates=bool(local_templates),
                 local_templates=local_templates,
                 pseudolinear_assignments=pseudolinear_assignments,
+                filter_edge=args.filter_edge,
             )
             finalize_vcf_temp(
                 indelsv_tmp, indelsv_out, realign=args.realignment,
@@ -10084,6 +10599,7 @@ def main():
                 local_template_coordinates=bool(local_templates),
                 local_templates=local_templates,
                 pseudolinear_assignments=pseudolinear_assignments,
+                filter_edge=args.filter_edge,
             )
             _write_header_and_bodies(
                 indelsv_tmp, sample_names, "indelsv", [sv_body],
@@ -10094,6 +10610,7 @@ def main():
                 local_template_coordinates=bool(local_templates),
                 local_templates=local_templates,
                 pseudolinear_assignments=pseudolinear_assignments,
+                filter_edge=args.filter_edge,
             )
             finalize_vcf_temp(snp_tmp, snp_out, realign=False)
             finalize_vcf_temp(
@@ -10110,6 +10627,7 @@ def main():
                 local_template_coordinates=bool(local_templates),
                 local_templates=local_templates,
                 pseudolinear_assignments=pseudolinear_assignments,
+                filter_edge=args.filter_edge,
             )
             finalize_vcf_temp(tmp, args.output, realign=args.realignment)
     finally:

@@ -44,15 +44,20 @@ from gfa_interval_pipeline import (
     _path_leaves, _prepare_intervals, _reachable_events, _report_unresolved,
     _valid_name, _write_links, _write_metadata, _write_parts, _write_segments,
     _write_source_sidecars, _write_variant_index)
+from gfa_interval_metadata import TEMPLATE_PATH
 from gfa_query_anchors import read_query_list
 
 
 class _Last(dict):
     """Records only the most recent assignment (rows() side channels)."""
-    last = None
+    key = last = None
 
     def __setitem__(self, key, value):
-        self.last = value
+        self.key, self.last = key, value
+
+    def get_for(self, key, default=None):
+        """The value last set for ``key``; ``default`` if it was set for another."""
+        return self.last if self.key == key else default
 
 
 def _digits(names):
@@ -81,21 +86,34 @@ def _scan(args, roots, log):
     parents = {}            # non-SNP variant ID -> data line (possible parents)
     targets = {}            # data line -> non-root names it references
     hashes = array('q')
+    # Breakpoint keys (parent name hash mixed with the start or end), so rows
+    # that abut on one parent (gfa_junctions) are put in one tree.
+    start_keys, end_keys = array('q'), array('q')
     loci = set(read_alternative_loci(list(vcf_paths(args.vcf))))
     collisions = set()
     started = time.monotonic()
     for record in rows(args.vcf, frozenset(), args.size_cutoff,
                        insertion_only=getattr(args, 'insertion_only', None) is not None,
                        event_kinds=kinds, record_indexes=lines,
-                       dup_alignments=dup_alignments, index=index):
-        identifier, chrom, _pos, _end, _length, values, _query, _reason, keep = record
-        kind, kinds.last = kinds.last or 'insertion', None
-        line = lines.last
+                       dup_alignments=dup_alignments, index=index, template_sites=True):
+        identifier, chrom, pos, ref_end, _length, values, _query, _reason, keep = record
+        # Only SNP/DEL/SUB rows record a kind; an insertion never matches.
+        kind = kinds.get_for(identifier, 'insertion')
+        line = lines.get_for(identifier)
         if getattr(args, 'variant_mode', 'all') == 'svonly' and kind == 'snp':
             keep = False
         yielded.append(line)
         retained.append(bool(keep))
         hashes.append(hash(identifier))
+        # Top-level breakpoints as StableResolver.breakpoints; nested rows
+        # only ever join rows of their own parent, already their tree.
+        start = pos - 1 if kind == 'snp' else pos
+        deleted = sum(value[5] - value[4] for value in values if value[2] == 'D')
+        end = (pos if kind == 'snp' else start + deleted if deleted else
+               start if ref_end == pos else ref_end)
+        parent = hash(chrom)
+        start_keys.append(_mix(parent, start))
+        end_keys.append(_mix(parent, end))
         if kind != 'snp':
             parents[identifier] = line
         names = {chrom, *(value[3] for value in values if value[3])}
@@ -118,7 +136,35 @@ def _scan(args, roots, log):
     return dict(index=index, yielded=np.frombuffer(yielded, np.int64),
                 retained=np.frombuffer(retained, np.int8).astype(bool),
                 parents=parents, targets=targets, dup_alignments=dup_alignments,
-                collisions=collisions)
+                collisions=collisions, abutting=_abutting(
+                    np.frombuffer(yielded, np.int64), np.frombuffer(start_keys, np.int64),
+                    np.frombuffer(end_keys, np.int64)))
+
+
+def _mix(parent, point):
+    """One int64 key for (parent name hash, point); collisions only join trees."""
+    return ((parent * 1_000_003 + point) & 0xFFFFFFFFFFFFFFFF) - (1 << 63)
+
+
+def _abutting(lines, start_keys, end_keys):
+    """Line pairs whose union puts rows ending where others start in one
+    tree: each such row with the first row starting there, and the rows
+    starting there with each other (linear in the rows at one point)."""
+    order = np.argsort(start_keys, kind='stable')
+    ordered = start_keys[order]
+    low = np.searchsorted(ordered, end_keys, side='left')
+    high = np.searchsorted(ordered, end_keys, side='right')
+    pairs, groups = [], set()
+    for row in np.flatnonzero(high > low).tolist():
+        first = int(order[low[row]])
+        if first != row or high[row] - low[row] > 1:
+            pairs.append((int(lines[row]), int(lines[first])))
+            groups.add(int(low[row]))
+    for start in sorted(groups):
+        stop = int(np.searchsorted(ordered, ordered[start], side='right'))
+        pairs.extend((int(lines[order[start]]), int(lines[other]))
+                     for other in order[start + 1:stop].tolist())
+    return pairs
 
 
 def _trees_and_needed(scan):
@@ -134,13 +180,23 @@ def _trees_and_needed(scan):
             parent_of[line], line = root, parent_of[line]
         return root
 
+    def union(line, other):
+        a, b = find(line), find(other)
+        if a != b:
+            parent_of[max(a, b)] = min(a, b)
+
+    templates = {}
     for line, names in targets.items():
         for name in names:
             other = parents.get(name)
             if other is not None:
-                a, b = find(line), find(other)
-                if a != b:
-                    parent_of[max(a, b)] = min(a, b)
+                union(line, other)
+            elif TEMPLATE_PATH.fullmatch(name):
+                # A --exact duplication site and the rows on its template.
+                union(line, templates.setdefault(name, line))
+    # Rows that follow each other in a carrier's walk (gfa_junctions).
+    for line, other in scan['abutting']:
+        union(line, other)
     # Reachable = retained variants and everything they are built on.
     yielded, retained = scan['yielded'], scan['retained']
     needed, seen = set(), set()
@@ -233,11 +289,12 @@ def _partition_pass(args, number, select, context, work, log):
         candidates = QueryCandidates(spool)
         events = OrderedDict()
         kinds, record_indexes, sequence_checks = {}, {}, {}
+        repeated = set()
         for record in rows(args.vcf, sources, args.size_cutoff, sequence_checks=sequence_checks,
                            candidate_sink=candidates.add,
                            insertion_only=getattr(args, 'insertion_only', None) is not None,
                            event_kinds=kinds, record_indexes=record_indexes,
-                           select=select, index=context['index']):
+                           select=select, index=context['index'], repeated=repeated):
             identifier, chrom, pos, ref_end, length, values, query, reason, keep = record
             if identifier in events:
                 raise ValueError(f'duplicate insertion ID or variant ID {identifier!r}')
@@ -302,6 +359,10 @@ def _partition_pass(args, number, select, context, work, log):
                     specs.append(PathSpec(f'{alias}#unique{run.unique}', 'unique',
                                           name, run.qstart, run.qend))
                     spec_event.append(position[name])
+        # Link-only walks write no P line, so they have no spec_event.
+        from gfa_junctions import junction_specs
+        specs.extend(junction_specs(args.vcf, events, resolver, aliases, PathSpec, log,
+                                    select=select, index=context['index'], repeated=repeated))
         names = set()
         for spec in specs:
             _valid_name(spec.name)
@@ -452,12 +513,17 @@ def run_partitioned(args, bed, log):
         {}, roots, (), sources, list(_flatten(args.local_path_fasta)), log,
         template_catalogs=args.local_reference_templates,
         backbone=getattr(args, 'reference_haplotype', None), needed=needed)
+    from gfa_duplications import add_template_roots
+    add_template_roots(needed, roots, source_aliases, Root, strict=False)
     catalog = getattr(args, 'alternative_catalog', None)
     if catalog:
+        # DUP_ templates are not catalog records; their loci may be.
         source_aliases.update(resolve_catalog_paths(
             scan['collisions'], roots, (), catalog, list(vcf_paths(args.vcf)),
             getattr(args, 'reference_haplotype', None), args.reference_fasta, args.output or bed,
-            Root, log, threads=args.processes, needed=needed))
+            Root, log, threads=args.processes,
+            needed={name for name in needed if not TEMPLATE_PATH.fullmatch(name)}))
+    add_template_roots(needed, roots, source_aliases, Root)
     plan = plan_duplication_paths(scan['dup_alignments'], roots, source_aliases, Root,
                                   None, scan['collisions'])
     dup_count = len(scan['dup_alignments'])

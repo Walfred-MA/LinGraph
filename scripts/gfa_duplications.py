@@ -277,3 +277,58 @@ def _not_found_reason(sequence, literal, cursor):
             return 'seq_inside_piece_reverse_complement'
         return 'piece_longer_than_seq'
     return 'no_exact_match'
+
+
+def _safe_token(text):
+    """graphvcfmerge._safe_variant_token: the locus as written in DUP_ names."""
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', text or 'locus')
+
+
+def add_template_roots(names, roots, source_aliases, root_type, strict=True):
+    """Add --exact full-locus duplication templates as shared paths.
+
+    ``DUP_<locus>_<start>_<end>`` (graphvcfmerge --exact) is the reference
+    interval [start, end) of <locus>: every duplication site walks this one
+    path, and each copy's differences are rows nested on it. Like the
+    ALTERNATIVECIGAR paths above it is a copy with its own segments
+    (TP:Z:duplication). The merge writes the locus with unsafe characters
+    replaced, so it is matched against the -r/-a and local path names that
+    way. With ``strict`` False, templates whose locus is not known yet are
+    left for a later call (e.g. after the alternative catalog). Returns the
+    names added.
+    """
+    from gfa_interval_metadata import TEMPLATE_PATH
+    added = []
+    next_order = max((root.order for root in roots.values()), default=-1) + 1
+    for name in sorted(names):
+        match = TEMPLATE_PATH.fullmatch(name)
+        if match is None or name in roots:
+            continue
+        locus, start, end = match[1], int(match[2]), int(match[3])
+        if locus not in roots and locus not in source_aliases:
+            known = sorted({other for other in (*roots, *source_aliases)
+                            if _safe_token(other) == locus})
+            if len(known) > 1:
+                raise ValueError(f'{name}: locus {locus!r} matches several paths: '
+                                 + ', '.join(known[:5]))
+            if not known:
+                if strict:
+                    raise ValueError(f'{name}: template locus {locus!r} is not in -r/-a, '
+                                     'the local reference templates or the alternative catalog')
+                continue
+            locus = known[0]
+        target, low, high, strand = locus, start, end, '+'
+        if locus in source_aliases:
+            target, low, high, strand = source_aliases[locus].interval(start, end)
+        base = roots.get(target)
+        if base is None or not 0 <= low < high <= base.length:
+            raise ValueError(f'{name}: template interval {locus}:{start}-{end} is not in -r/-a '
+                             'or the local reference templates')
+        if strand != '+':
+            raise ValueError(f'{name}: template maps in reverse onto {target}; not supported')
+        roots[name] = root_type(name, base.path, base.fai, high - low, True, 'duplication',
+                                next_order, record=base.record or target,
+                                base=base.base + low)
+        next_order += 1
+        added.append(name)
+    return added

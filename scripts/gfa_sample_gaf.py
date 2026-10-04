@@ -17,12 +17,19 @@ Steps (RAM is bounded by the graph arrays and one sample's variant shard):
    ``--shard-records`` records, append each sample's buffer to its shard file
    and close it again, so the number of open files never grows.
 4. In parallel per sample: load its shard, sort by contig and query start,
-   walk its pseudo-linear intervals in query order, and splice each variant's
-   allele walk into the reference path at its breakpoints (nested variants
-   are spliced into their parent insertion the same way). Consecutive
-   intervals of a contig are chained into one GAF record; a record breaks
-   only where the walk cannot continue (unmapped query, an interval without
-   graph support, a missing link, or a mid-node discontinuity).
+   chain its pseudo-linear intervals into runs (query and reference both
+   contiguous, as in tools/check_vcf_lossless.py), and splice each variant's
+   allele walk into the run's reference path at its merged breakpoints
+   (nested variants are spliced into their parent allele the same way; a
+   deletion's allele is the rows nested in it). Consecutive runs of a contig
+   are chained into one GAF record when they are contiguous on the query; a
+   record breaks only where the walk cannot continue (a query gap, unmapped
+   query, a run without graph support or whose walk does not have the
+   query's length, a missing link, or a mid-node discontinuity).
+
+With ``--add-links FILE``, a join between two steps that the GFA does not
+link is kept (the two are adjacent in this sample's haplotype) and the link
+is written to FILE as an L line; the final graph is the GFA plus FILE.
 
 GAF columns 10/11 (matches/block) assume the walked graph sequence equals the
 query; no base-level CIGAR is computed.
@@ -43,6 +50,10 @@ import tempfile
 import numpy as np
 
 KINDS = {'insertion': 0, 'snp': 1, 'substitution': 2, 'deletion': 3}
+KIND_NAMES = {value: key for key, value in KINDS.items()}
+# CHROM of rows nested in a merged row (graphvcfmerge row IDs) or on a shared
+# full-locus-dup template (gfa_interval_metadata.TEMPLATE_PATH).
+NESTED_CHROM = re.compile(r'(?:INS|DEL|SUB|DUP)_')
 SHARD_DTYPE = np.dtype([('contig', '<u4'), ('qs', '<i8'), ('qe', '<i8'),
                         ('var', '<u8'), ('strand', 'u1')])
 _META = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
@@ -138,7 +149,9 @@ def load_variant_index(path):
         if parent_name not in index or (variant_kind != 'deletion' and name not in index):
             missing += 1
             continue
-        path_of[i] = index[name] if variant_kind != 'deletion' else -1
+        # A deletion's P path (its flanks) names it as the parent of rows
+        # nested in it; its allele is those rows (Sample.allele).
+        path_of[i] = index.get(name, -1)
         parent[i] = index[parent_name]
         start[i], end[i] = int(low), int(high)
         kind[i] = KINDS.get(variant_kind, 0)
@@ -220,6 +233,16 @@ def build_shards(vcfs, samples, shard_dir, shard_records):
                 except ValueError:
                     continue
                 snp = G['var_kind'][current] == KINDS['snp']
+                kind_key = keys.index('TYPE') if 'TYPE' in keys else None
+                # A SNP row placed directly on its backbone path is top level:
+                # its INS_SNP observations restate an insertion's bases against
+                # that insertion's template and are skipped
+                # (tools/check_vcf_lossless.py, check_merge_lossless.py). A row
+                # on a merged row's path (an insertion or deletion row, or a
+                # shared DUP_ template) is nested: its INS_SNPs are the copy's
+                # own differences and are kept.
+                top_level = (snp and G['path_names'][int(exported[current])] == fields[0]
+                             and not NESTED_CHROM.match(fields[0]))
                 for column, sample in columns.items():
                     text = fields[column]
                     if not text.startswith('1'):
@@ -228,7 +251,10 @@ def build_shards(vcfs, samples, shard_dir, shard_records):
                     if len(values) != len(keys) or values[gt] != '1':
                         continue
                     names, coords = values[ctg].split(','), values[qc].split(',')
+                    kinds = values[kind_key].split(',') if kind_key is not None else []
                     for index, coord in enumerate(coords):
+                        if top_level and len(kinds) == len(coords) and kinds[index] != 'SNP':
+                            continue
                         match = re.fullmatch(r'(\d+)(?:-(\d+))?([+-]?)', coord)
                         if match is None:
                             continue
@@ -266,6 +292,7 @@ class Walk:
         self.end_trim = 0
         self.variants = 0
         self.matches = 0
+        self.pending = []      # links added by the extend() in progress
 
     def append(self, piece, stats):
         """Add (steps, start_offset, end_trim); False if it cannot continue."""
@@ -287,8 +314,14 @@ class Walk:
             stats['break_mid_node'] += 1
             return False
         if not _has_edge(last, first):
-            stats['break_missing_link'] += 1
-            return False
+            added = G.get('added_links')
+            if added is None:
+                stats['break_missing_link'] += 1
+                return False
+            if _edge_key(last, first) not in added:
+                added.add(_edge_key(last, first))
+                self.pending.append(_edge_key(last, first))
+                stats['link_added'] += 1
         self.steps.extend(steps)
         self.end_trim = trim
         return True
@@ -296,10 +329,16 @@ class Walk:
     def extend(self, pieces, stats):
         """Append all pieces or none (rolls back on a failed join)."""
         state = len(self.steps), self.start_offset, self.end_trim
+        self.pending = []
         for piece in pieces:
             if not self.append(piece, stats):
                 del self.steps[state[0]:]
                 _count, self.start_offset, self.end_trim = state
+                # Links added for this failed join are not used by any walk.
+                for key in self.pending:
+                    G['added_links'].discard(key)
+                stats['link_added'] -= len(self.pending)
+                self.pending = []
                 return False
         return True
 
@@ -328,6 +367,30 @@ def span(path, low, high, cache):
     return steps, int(low - cumulative[first]), int(cumulative[last + 1] - high)
 
 
+def _edge_owned(sample, nested, low, high, descending, length, path):
+    """Nested candidates of one allele, without the edge points it does not
+    own (allele_edges.py)."""
+    if length is None or low == high:
+        return nested
+    from allele_edges import edge_owned
+    first = high if descending else low
+    kept, starts, ends, spans = [], [], [], []
+    current = length
+    for candidate in nested:
+        point = int(sample.qs[candidate])
+        variant = int(sample.var[candidate])
+        child = G['var_parent'][variant] == path
+        a, b = int(G['var_start'][variant]), int(G['var_end'][variant])
+        if child and point == int(sample.qe[candidate]) and point in (low, high):
+            (starts if point == first else ends).append((a, b, candidate))
+            continue
+        kept.append(candidate)
+        if child:
+            spans.append((a, b))
+            current += int(sample.qe[candidate]) - point - (b - a)
+    return kept + edge_owned(starts, ends, spans, current, high - low, length)
+
+
 def reverse_pieces(pieces):
     return [([step ^ 1 for step in reversed(steps)], trim, offset)
             for steps, offset, trim in reversed(pieces)]
@@ -345,7 +408,23 @@ class Sample:
         for name in ('contig', 'qs', 'qe', 'var', 'strand'):
             setattr(self, name, np.ascontiguousarray(self.records[name], dtype=np.int64))
         self.used = np.zeros(len(self.records), dtype=bool)
+        self.skipped = set()     # positions skipped for overlapping another variant
         self.cache = {}
+
+    def snapshot(self, contig, low, high):
+        """The used flags of records starting in [low, high] (restore())."""
+        if contig is None:
+            return None
+        left = int(np.searchsorted(self.contig, contig, side='left'))
+        right = int(np.searchsorted(self.contig, contig, side='right'))
+        first = left + int(np.searchsorted(self.qs[left:right], low, side='left'))
+        last = left + int(np.searchsorted(self.qs[left:right], high, side='right'))
+        return first, self.used[first:last].copy()
+
+    def restore(self, saved):
+        if saved is not None:
+            first, values = saved
+            self.used[first:first + len(values)] = values
 
     def between(self, contig, low, high):
         """Record positions with query span inside [low, high] on contig."""
@@ -361,8 +440,11 @@ class Sample:
                 output.append(position)
         return output
 
-    def splice(self, path, low, high, candidates, stats):
-        """Pieces for [low, high) of path with candidate variants spliced."""
+    def splice(self, path, low, high, candidates, stats, descending=False):
+        """Pieces for [low, high) of path with candidate variants spliced.
+
+        Variants at one breakpoint follow the query; ``descending`` when the
+        path runs against the query."""
         chosen = []
         for position in candidates:
             variant = int(self.var[position])
@@ -370,13 +452,30 @@ class Sample:
                 continue
             a, b = int(G['var_start'][variant]), int(G['var_end'][variant])
             if low <= a <= b <= high:
-                chosen.append((a, b, position, variant))
+                chosen.append((a, b, -position if descending else position, variant))
         chosen.sort()
+        # A SNP inside one of this sample's SVs here (a deletion or
+        # substitution covering it) is redundant: the SV replaces that base.
+        # Placing it first would make the SV look overlapping and drop it
+        # (tools/check_vcf_lossless.py skips such SNPs the same way).
+        sv_starts, sv_reach = [], []
+        for a, b, _position, variant in chosen:
+            if b > a and G['var_kind'][variant] != KINDS['snp']:
+                sv_starts.append(a)
+                sv_reach.append(max(b, sv_reach[-1] if sv_reach else b))
         pieces = []
         cursor = low
         for a, b, position, variant in chosen:
+            position = abs(position)
+            if G['var_kind'][variant] == KINDS['snp'] and sv_starts:
+                covering = bisect_left(sv_starts, a + 1) - 1
+                if covering >= 0 and sv_reach[covering] >= b:
+                    self.used[position] = True
+                    stats['snp_inside_sv'] += 1
+                    continue
             if a < cursor:
                 stats['variant_overlap_skipped'] += 1
+                self.skipped.add(position)
                 continue
             pieces.append(span(path, cursor, a, self.cache))
             pieces.extend(self.allele(position, variant, stats))
@@ -388,19 +487,41 @@ class Sample:
 
     def allele(self, position, variant, stats):
         """Allele walk in its parent's orientation, with nested variants."""
-        if G['var_kind'][variant] == KINDS['deletion']:
-            return []
         path = int(G['var_path'][variant])
-        cumulative = _path_cumulative(path, self.cache)
-        nested = [candidate for candidate in self.between(
-            int(self.contig[position]), int(self.qs[position]),
-            int(self.qe[position])) if candidate != position]
+        low, high = int(self.qs[position]), int(self.qe[position])
+        # Nested rows follow the query along the parent path: backwards when
+        # this allele is carried on the query's reverse strand.
+        descending = bool(self.strand[position])
+        length = (int(_path_cumulative(path, self.cache)[-1])
+                  if path >= 0 and G['var_kind'][variant] != KINDS['deletion'] else None)
+        nested = _edge_owned(self, [candidate for candidate in self.between(
+            int(self.contig[position]), low, high) if candidate != position],
+            low, high, descending, length, path)
         self.used[position] = True
-        pieces = self.splice(path, 0, int(cumulative[-1]), nested, stats)
+        if G['var_kind'][variant] == KINDS['deletion']:
+            # A deletion has no bases; rows nested in it (--exact: a member's
+            # kept bases) are its allele, by offset and then query order.
+            if path < 0:
+                return []
+            chosen = sorted(
+                (int(G['var_start'][int(self.var[candidate])]),
+                 -candidate if descending else candidate)
+                for candidate in nested if G['var_parent'][int(self.var[candidate])] == path)
+            pieces = []
+            for _offset, candidate in chosen:
+                candidate = abs(candidate)
+                if self.used[candidate]:
+                    continue
+                pieces.extend(self.allele(candidate, int(self.var[candidate]), stats))
+                stats['variants_spliced'] += 1
+            return reverse_pieces(pieces) if G['var_reverse'][variant] else pieces
+        cumulative = _path_cumulative(path, self.cache)
+        pieces = self.splice(path, 0, int(cumulative[-1]), nested, stats, descending)
         return reverse_pieces(pieces) if G['var_reverse'][variant] else pieces
 
 
-def read_pseudolinear(vcf):
+def read_pseudolinear(vcf, only=None):
+    """``only``: keep that Sample's lines (a combined mapping header file)."""
     intervals = []
     seen = set()
     sample = None
@@ -414,10 +535,19 @@ def read_pseudolinear(vcf):
                 continue
             values = {key: bytes(value, 'utf-8').decode('unicode_escape')
                       for key, value in _META.findall(line)}
+            if only is not None and values.get('Sample') != only:
+                continue
+            if values.get('Path') == 'alt':
+                continue          # sequence source: places no bases
             query = _INTERVAL.fullmatch(values.get('Query', ''))
             if query is None:
                 continue
             key = (values['Query'], values.get('Category', '.'))
+            if query[2] == query[3]:
+                # A deletion (a query point) claims no query bases: several
+                # at one point are distinct reference spans, all kept (as in
+                # tools/check_vcf_lossless.py).
+                key += (values.get('Reference'),)
             if key in seen:
                 # Locus duplications repeat the query with their source
                 # interval; keep the first (insertion-point) line.
@@ -428,7 +558,10 @@ def read_pseudolinear(vcf):
                               values.get('Category', '.'),
                               (reference[1], int(reference[2]), int(reference[3]), reference[4])
                               if reference else None))
-    intervals.sort(key=lambda value: (value[0], value[1], value[2]))
+    # Ties at one query point (deletions) in walking order along the
+    # reference, so the one adjacent to the run extends it first.
+    intervals.sort(key=lambda value: (value[0], value[1], value[2], 0 if value[5] is None else (
+        value[5][1] if value[3] == value[5][3] else -value[5][2])))
     return sample, intervals
 
 
@@ -449,14 +582,84 @@ def _canonical_reference(reference):
     return index[target], low, high, strand if alias_strand == '+' else ('-' if strand == '+' else '+')
 
 
+def _runs(intervals, stats):
+    """Chain contiguous pseudo-linear intervals on one graph path into runs.
+
+    Yields (contig, qs, qe, qstrand, (path, low, high, rstrand) or None,
+    category, member intervals as (qs, qe, canonical, category)). As in tools/check_vcf_lossless.py, a run continues while the
+    query and the reference are both contiguous on the same strands, so a
+    variant is placed wherever its merged breakpoints fall inside the run.
+    Intervals without a graph anchor come out on their own (run None).
+    """
+    current = None
+    for contig, qs, qe, qstrand, category, reference in intervals:
+        stats['intervals'] += 1
+        canonical = None
+        if category == 'UNMAPPED':
+            stats['break_unmapped'] += 1
+        elif reference is not None:
+            canonical = _canonical_reference(reference)
+            if canonical is None:
+                stats['break_reference_not_in_gfa'] += 1
+        elif category not in ('INSERTION', 'DELETION'):
+            stats['break_reference_not_in_gfa'] += 1
+        member = (qs, qe, canonical, category)
+        if canonical is not None and current is not None:
+            path, low, high, rstrand = current[4]
+            other, start, end, strand = canonical
+            if (contig, qstrand, other, strand) == (current[0], current[3], path, rstrand) \
+                    and qs == current[2]:
+                if qstrand == strand and start == high:
+                    current = (contig, current[1], qe, qstrand, (path, low, end, strand), 'RUN',
+                               current[6])
+                    current[6].append(member)
+                    continue
+                if qstrand != strand and end == low:
+                    current = (contig, current[1], qe, qstrand, (path, start, high, strand), 'RUN',
+                               current[6])
+                    current[6].append(member)
+                    continue
+        if current is not None:
+            stats['runs'] += 1
+            yield current
+            current = None
+        if canonical is None:
+            yield contig, qs, qe, qstrand, None, category, [member]
+        else:
+            current = (contig, qs, qe, qstrand, canonical, category, [member])
+    if current is not None:
+        stats['runs'] += 1
+        yield current
+
+
+def _walked_length(pieces):
+    return sum(int(G['segment_length'][np.asarray(steps) >> 1].sum()) - offset - trim
+               for steps, offset, trim in pieces)
+
+
 def write_sample_gaf(task):
-    sample_name, vcf, shard, contig_names, lengths, output = task
+    sample_name, vcf, shard, contig_names, lengths, output, add_links, only = task
+    # Links this sample's walks need that the GFA lacks (--add-links).
+    G['added_links'] = set() if add_links else None
     records = np.fromfile(shard, dtype=SHARD_DTYPE)
     sample = Sample(records)
     contig_ids = {name: index for index, name in enumerate(contig_names)}
-    _vcf_sample, intervals = read_pseudolinear(vcf)
+    _vcf_sample, intervals = read_pseudolinear(vcf, only)
     stats = Counter()
     written = 0
+    breaks = open(output + '.breaks.tsv.tmp', 'w')
+    debug = open(output + '.lengthdebug.tsv.tmp', 'w')
+    debug.write('contig\tquery_start\tquery_end\tcategory\trun_path\twalk_minus_query\t'
+                'candidates\tvcf_index:kind:start-end:query:state\n')
+    breaks.write('contig\tquery_start\tquery_end\tbases\tcategory\toutcome\treason\n')
+
+    def report(contig, qs, qe, category, outcome, before):
+        """One line per split run or dropped interval: the break counters it
+        raised (the reason)."""
+        reason = ','.join(sorted(key for key in stats
+                                 if key.startswith('break_') and stats[key] > before.get(key, 0)))
+        breaks.write(f'{contig}\t{qs}\t{qe}\t{qe - qs}\t{category}\t{outcome}\t{reason or "."}\n')
+
     with open(output + '.tmp', 'w') as out:
         walk = None
         current_contig = None
@@ -479,38 +682,18 @@ def write_sample_gaf(task):
                 written += 1
             walk = None
 
-        for contig, qs, qe, qstrand, category, reference in intervals:
-            if contig != current_contig:
-                close()
-                current_contig = contig
-            stats['intervals'] += 1
-            spliced_start = stats['variants_spliced']
-            contig_id = contig_ids.get(contig)
+        def place(qs, qe, qstrand, run, category, contig_id):
+            """The walk pieces of one run (or anchorless interval), or None."""
             candidates = sample.between(contig_id, qs, qe) if contig_id is not None else []
             pieces = None
-            if category == 'UNMAPPED':
-                stats['break_unmapped'] += 1
-            elif category == 'DELETION' and reference is not None and (
-                    canonical := _canonical_reference(reference)):
-                # Deleted reference bases are skipped, never walked. The next
-                # piece must then be reachable by the deletion's graph link.
-                path, low, high, _strand = canonical
-                pieces = []
-                for position in candidates:
-                    variant = int(sample.var[position])
-                    if (G['var_kind'][variant] == KINDS['deletion'] and G['var_parent'][variant] == path
-                            and low <= G['var_start'][variant] <= G['var_end'][variant] <= high):
-                        sample.used[position] = True
-                        stats['variants_spliced'] += 1
-            elif reference is not None and (canonical := _canonical_reference(reference)):
-                path, low, high, rstrand = canonical
-                spliced_before = stats['variants_spliced']
-                pieces = sample.splice(path, low, high, candidates, stats)
+            if run is not None:
+                # Contiguous mappings: the reference walk with the sample's
+                # variants spliced at their merged breakpoints, which may lie
+                # anywhere in the run (--exact moves shifted breakpoints).
+                path, low, high, rstrand = run
+                pieces = sample.splice(path, low, high, candidates, stats, rstrand != qstrand)
                 if rstrand != qstrand:
                     pieces = reverse_pieces(pieces)
-                if category == 'INSERTION' and qe > qs and stats['variants_spliced'] == spliced_before:
-                    stats['break_insertion_without_variant'] += 1
-                    pieces = None
             elif category in ('INSERTION', 'DELETION'):
                 # No usable anchor (e.g. a locus duplication): use the
                 # variants carried inside this query interval directly.
@@ -521,6 +704,10 @@ def write_sample_gaf(task):
                     # Nested variants are spliced inside their parent allele.
                     if sample.used[position] or int(G['var_parent'][variant]) in inner:
                         continue
+                    # A deletion adds no bases here; it belongs to the
+                    # anchored run next to this interval.
+                    if G['var_kind'][variant] == KINDS['deletion']:
+                        continue
                     allele = sample.allele(position, variant, stats)
                     if sample.strand[position]:
                         allele = reverse_pieces(allele)
@@ -529,30 +716,118 @@ def write_sample_gaf(task):
                 if qe > qs and not pieces:
                     stats['break_insertion_without_variant'] += 1
                     pieces = None
-            else:
-                stats['break_reference_not_in_gfa'] += 1
-            if pieces is None:
+            if pieces is not None and _walked_length(pieces) != qe - qs:
+                # A variant was not placed here: never write a walk that does
+                # not spell the query.
+                stats['break_length_mismatch'] += 1
+                length_report(qs, qe, category, run, candidates, _walked_length(pieces) - (qe - qs))
+                pieces = None
+            return pieces
+
+        def length_report(qs, qe, category, run, candidates, delta):
+            """Every candidate variant of a walk whose length is off: placed
+            or not, and why not (another path, outside the interval, overlap)."""
+            path = run[0] if run is not None else -1
+            low, high = (run[1], run[2]) if run is not None else (0, 0)
+            items = []
+            for position in candidates:
+                variant = int(sample.var[position])
+                parent = int(G['var_parent'][variant])
+                a, b = int(G['var_start'][variant]), int(G['var_end'][variant])
+                if sample.used[position]:
+                    state = 'placed'
+                elif position in sample.skipped:
+                    state = 'overlap_skipped'
+                elif parent != path:
+                    state = 'other_path:' + (G['path_names'][parent] if parent >= 0 else '.')
+                elif not low <= a <= b <= high:
+                    state = 'outside'
+                else:
+                    state = 'unused'
+                items.append(f'{variant}:{KIND_NAMES.get(int(G["var_kind"][variant]), "?")}:'
+                             f'{a}-{b}:q{int(sample.qs[position])}-{int(sample.qe[position])}:{state}')
+            debug.write(f'{current_contig}\t{qs}\t{qe}\t{category}\t'
+                        f'{G["path_names"][path] if path >= 0 else "."}:{low}-{high}\t{delta}\t'
+                        f'{len(items)}\t{";".join(items)}\n')
+
+        def walk_on(qs, qe, pieces, spliced):
+            """Add pieces to the record, or start a new one; False (nothing
+            changed) when the pieces are not a walk of the graph by themselves."""
+            nonlocal walk
+            # A record continues only where the query is contiguous.
+            if walk is None or qs != walk.qend or not walk.extend(pieces, stats):
+                fresh = Walk(qs)
+                if not fresh.extend(pieces, stats):
+                    return False
                 close()
-                continue
-            spliced = stats['variants_spliced'] - spliced_start
-            if walk is None:
-                walk = Walk(qs)
-            if not walk.extend(pieces, stats):
-                # Cannot chain onto the previous interval: start a new record.
-                close()
-                walk = Walk(qs)
-                if not walk.extend(pieces, stats):
-                    stats['interval_dropped'] += 1
-                    walk = None
-                    continue
+                walk = fresh
             walk.qend = qe
             walk.variants += spliced
-            stats['intervals_walked'] += 1
+            stats['runs_walked'] += 1
+            return True
+
+        for contig, qs, qe, qstrand, run, category, members in _runs(intervals, stats):
+            if contig != current_contig:
+                close()
+                current_contig = contig
+            contig_id = contig_ids.get(contig)
+            saved = Counter(stats), sample.snapshot(contig_id, qs, qe)
+            spliced_start = stats['variants_spliced']
+            pieces = place(qs, qe, qstrand, run, category, contig_id)
+            if pieces is not None and walk_on(qs, qe, pieces,
+                                              stats['variants_spliced'] - spliced_start):
+                continue
+            report(contig, qs, qe, category, 'run_failed', saved[0])
+            # Variants consumed by the failed attempt stay available to the
+            # neighbouring runs.
+            sample.restore(saved[1])
+            if len(members) > 1:
+                # Retry this run interval by interval (the pre-run granularity),
+                # so only intervals that cannot be walked are lost.
+                stats.clear()
+                stats.update(saved[0])
+                sample.restore(saved[1])
+                stats['run_split'] += 1
+                for low, high, canonical, member_category in members:
+                    spliced_start = stats['variants_spliced']
+                    before = Counter(stats)
+                    snapshot = sample.snapshot(contig_id, low, high)
+                    pieces = place(low, high, qstrand, canonical, member_category, contig_id)
+                    if pieces is None or not walk_on(
+                            low, high, pieces, stats['variants_spliced'] - spliced_start):
+                        sample.restore(snapshot)
+                        stats['run_dropped'] += pieces is not None
+                        report(contig, low, high, member_category,
+                               'interval_dropped' if pieces is not None else 'interval_unwalked',
+                               before)
+                        close()
+                continue
+            stats['run_dropped'] += pieces is not None
+            close()
         close()
+    breaks.close()
+    debug.close()
+    os.replace(output + '.breaks.tsv.tmp', output + '.breaks.tsv')
+    os.replace(output + '.lengthdebug.tsv.tmp', output + '.lengthdebug.tsv')
     os.replace(output + '.tmp', output)
     stats['variants_unplaced'] = int((~sample.used).sum())
     stats['gaf_records'] = written
-    return sample_name, dict(stats)
+    # The sample's variants no walk placed: VCF index (variants.tsv column 1),
+    # query interval, graph placement, and whether one was skipped for
+    # overlapping another of the sample's variants.
+    with open(output + '.unplaced.tsv.tmp', 'w') as out:
+        out.write('contig\tquery_start\tquery_end\tstrand\tvcf_index\tparent\t'
+                  'parent_start\tparent_end\treason\n')
+        for position in np.flatnonzero(~sample.used).tolist():
+            variant = int(sample.var[position])
+            parent = int(G['var_parent'][variant]) if variant < len(G['var_parent']) else -1
+            out.write(f'{contig_names[int(sample.contig[position])]}\t{int(sample.qs[position])}\t'
+                      f'{int(sample.qe[position])}\t{"-" if sample.strand[position] else "+"}\t'
+                      f'{variant}\t{G["path_names"][parent] if parent >= 0 else "."}\t'
+                      f'{int(G["var_start"][variant])}\t{int(G["var_end"][variant])}\t'
+                      f'{"overlap_skipped" if position in sample.skipped else "unused"}\n')
+    os.replace(output + '.unplaced.tsv.tmp', output + '.unplaced.tsv')
+    return sample_name, dict(stats), sorted(G['added_links'] or ())
 
 
 # ----------------------------------------------------------------- main ----
@@ -589,7 +864,9 @@ def build_parser():
     parser.add_argument('-v', '--vcf', required=True, action='append', nargs='+',
                         help='merged VCFs, in the same order given to merged_vcf_to_gfa.py')
     parser.add_argument('-s', '--sample-vcf', required=True, action='append', nargs='+',
-                        help='per-sample VCFs carrying ##pseudoLinearMapping headers')
+                        help='per-sample VCFs carrying ##pseudoLinearMapping headers, or one '
+                             'file of all samples\' mapping lines (tools/rebuild_assemblies.py '
+                             'headers): its samples are the lines\' Sample values')
     parser.add_argument('-q', '--query-fasta-list',
                         help='NAME FASTA [FAI] per line, for GAF query lengths')
     parser.add_argument('-o', '--output-folder', required=True, help='writes SAMPLE.gaf here')
@@ -597,6 +874,9 @@ def build_parser():
     parser.add_argument('--shard-records', type=int, default=100_000,
                         help='buffered records before flushing shards (default: 100000)')
     parser.add_argument('--tmpdir', help='shard folder parent (default: output folder)')
+    parser.add_argument('--add-links', metavar='FILE',
+                        help='keep joins the GFA does not link (adjacent in a sample) and write '
+                             'those links to FILE as L lines; the final graph is the GFA plus FILE')
     return parser
 
 
@@ -613,20 +893,28 @@ def main(argv=None):
     load_variant_index(args.variant_index or args.gfa + '.variants.tsv')
     load_local_paths(args.local_paths or args.gfa + '.anchors.bed.local-paths.tsv')
 
-    samples = {}
+    samples = {}        # name -> (file, Sample filter or None)
     for vcf in sample_vcfs:
-        name, _intervals = None, None
+        name, listed = None, []
         with _open(vcf) as handle:
             for line in handle:
                 if line.startswith('#CHROM'):
                     columns = line.rstrip('\n').split('\t')
                     name = columns[9] if len(columns) > 9 else None
                     break
-        if not name:
-            raise SystemExit(f'{vcf}: no sample column')
-        if name in samples:
-            raise SystemExit(f'sample {name!r} is given twice')
-        samples[name] = vcf
+                if line.startswith('##pseudoLinearMapping=<'):
+                    value = dict(_META.findall(line)).get('Sample')
+                    if value and value not in listed:
+                        listed.append(value)
+        # A per-sample VCF names its sample column; a combined mapping
+        # header file has no #CHROM line and holds every sample's lines.
+        entries = [(name, None)] if name else [(value, value) for value in listed]
+        if not entries:
+            raise SystemExit(f'{vcf}: no sample column or ##pseudoLinearMapping samples')
+        for value, only in entries:
+            if value in samples:
+                raise SystemExit(f'sample {value!r} is given twice')
+            samples[value] = (vcf, only)
     lengths = _fai_lengths(args.query_fasta_list, samples)
 
     with tempfile.TemporaryDirectory(prefix='gaf-shards-', dir=args.tmpdir or output) as directory:
@@ -636,13 +924,24 @@ def main(argv=None):
         np.save(output / 'variant_offsets.npy', offsets)
         _log(f'{len(offsets)} VCF records indexed; shards in {directory}')
         tasks = [(name, vcf, str(shards[name]), contig_names, lengths.get(name, {}),
-                  str(output / f'{name}.gaf')) for name, vcf in samples.items()]
+                  str(output / f'{name}.gaf'), bool(args.add_links), only)
+                 for name, (vcf, only) in samples.items()]
         if args.processes > 1 and len(tasks) > 1:
             context = mp.get_context('fork')
             with context.Pool(min(args.processes, len(tasks))) as pool:
                 results = list(pool.imap_unordered(write_sample_gaf, tasks))
         else:
             results = [write_sample_gaf(task) for task in tasks]
+    if args.add_links:
+        links = sorted({key for _name, _stats, added in results for key in added})
+        with open(args.add_links + '.tmp', 'w') as out:
+            for key in links:
+                a, b = key >> 32, key & 0xFFFFFFFF
+                out.write(f'L\t{a >> 1}\t{"-" if a & 1 else "+"}\t'
+                          f'{b >> 1}\t{"-" if b & 1 else "+"}\t0M\n')
+        os.replace(args.add_links + '.tmp', args.add_links)
+        _log(f'{len(links)} link(s) added by sample walks -> {args.add_links}')
+    results = [(name, stats) for name, stats, _added in results]
     with open(output / 'gaf_stats.tsv', 'w') as out:
         keys = sorted({key for _name, stats in results for key in stats})
         out.write('sample\t' + '\t'.join(keys) + '\n')
