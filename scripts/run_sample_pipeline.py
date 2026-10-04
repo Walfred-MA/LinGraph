@@ -649,6 +649,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
                 paths.graphcigartoreffix, fasta_reference, fasta_query,
                 script_dir / "graphreftovcf.py",
                 script_dir / "graphreftovcf_persample.py",
+                script_dir / "query_error_bed.py",
                 fasta_reference_index, fasta_query_index, paths.genomelift,
                 paths.genomeliftfix,
                 paths.pseudolinear,

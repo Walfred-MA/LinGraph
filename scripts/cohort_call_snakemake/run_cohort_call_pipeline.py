@@ -684,6 +684,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "pseudolinear_assignments.py",
         "alternative_intervals.py",
         "graphreftovcf_persample.py", "local_reference_templates.py", "lift_local_templates.py",
+        "query_error_bed.py",
         "assembly_contigs.py", "fixed_alternatives.py", "minsetref_localize.py", "minsetref_align.py",
         "gfixbreaks.py", "graphvcfmerge.py", "graphvcfmerge_snp.py", "graphvcfmerge_snp_compact.py", "graphvcfmerge_snp_runs.py", "cohort_vcf_merge.py", "graphvcfmerge_kmer.py",
         "graphvcfmerge_nested.py", "graphvcfmerge_scheduler.py", "graphvcfmerge_checkpoints.py",
