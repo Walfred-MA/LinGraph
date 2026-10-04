@@ -261,6 +261,9 @@ def build_fasta_preparation_stages(
         naming_input = mask_output
 
     if prefix is not None and not headers_ready:
+        namefixed_output = final_local
+        if namefixed_output.resolve() == source.resolve():
+            namefixed_output = sample_dir / f"{stem}.namefixed.fa"
         stages.append(Stage(
             name="query_contig_names",
             command=script_command(
@@ -268,12 +271,12 @@ def build_fasta_preparation_stages(
                 "namecontigsfix.py",
                 "-i", naming_input,
                 "-n", prefix,
-                "-o", final_local,
+                "-o", namefixed_output,
             ),
             inputs=(naming_input,),
-            outputs=(final_local,),
+            outputs=(namefixed_output,),
         ))
-        prepared = final_local
+        prepared = namefixed_output
     else:
         prepared = naming_input
 

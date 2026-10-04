@@ -124,13 +124,19 @@ python tools/prepare_assemblies.py \
   -O prepared_assemblies --contignamefix
 ```
 
-For name fixing alone, use `namecontigsfix.py` with a separate output:
+For name fixing alone, the `-n` value can use either assembly-list notation
+(`HG002_h1`) or FASTA-prefix notation (`HG002#1`). The output defaults to a
+new sibling FASTA, so the source is preserved:
 
 ```bash
 python tools/namecontigsfix.py \
-  -i assembly.fa -n 'HG002#1' -o assembly.namefixed.fa
+  -i assembly.fa -n HG002_h1
 samtools faidx assembly.namefixed.fa
 ```
+
+Use `assembly.namefixed.fa` in the assembly list. Pass `-o output.fa` to
+choose another output path. The resulting contig IDs begin with
+`HG002#1#` (for example, `HG002#1#chr1`).
 
 Keep native contig names for `CHM13_h1` and `HG38_h1`; omit name fixing for
 those references. LinGraph and the standalone sample caller check inputs

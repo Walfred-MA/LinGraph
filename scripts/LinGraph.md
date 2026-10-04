@@ -109,8 +109,9 @@ fixing alone, use `tools/namecontigsfix.py`. See
 [assembly preparation](../tools/assembly_preparation.md) for examples.
 
 Before starting either mode, LinGraph checks each assembly's **first sequence
-only**: its identifier must be `SAMPLE#HAPLOTYPE` or start with
-`SAMPLE#HAPLOTYPE#`, it must contain lowercase `a/c/g/t`, and the first entry
+only**: for assembly-list name `HG002_h1`, its identifier must be `HG002#1` or
+start with `HG002#1#` (for example, `HG002#1#chr1`); it must contain lowercase
+`a/c/g/t`, and the first entry
 of `FASTA.fai` must match the header and sequence offset. This includes the
 reference assembly, except that **`CHM13_h1` and `HG38_h1` skip the contig-prefix
 and masking checks**. These two references can retain native names such as
@@ -119,9 +120,11 @@ required. Later sequences are not scanned by this preparation check.
 Preparation checks apply to the selected samples and chosen reference;
 unselected assemblies in the saved graph cohort are not checked for masking or
 sample-prefixed contig names. The main pipeline never masks, renames, or creates an assembly index.
-A failed check stops before computation and prints a command using
-`tools/prepare_assemblies.py`. The standalone `run_sample_pipeline.py` uses
-the same read-only checks and also requires inputs to be prepared separately.
+A contig-prefix failure stops before computation and prints an example command
+using `tools/namecontigsfix.py`, followed by `samtools faidx`. Other preparation
+failures print a `tools/prepare_assemblies.py` command. The standalone
+`run_sample_pipeline.py` prepares query names and masks in its output directory,
+but does not alter the source assembly.
 
 ## Graph mode
 

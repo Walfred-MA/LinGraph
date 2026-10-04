@@ -100,8 +100,18 @@ filenames. In `graph` mode, add `--mc-graph` to export a pangenome graph as
 ### Prepare assembly FASTAs
 
 Use one assembly per haplotype. A diploid sample normally has two entries,
-such as `HG002_h1` and `HG002_h2`. An input list has exactly two
-whitespace-separated columns, with no header:
+such as `HG002_h1` and `HG002_h2`. The assembly-list label and the FASTA
+contig prefix use different formats: the list uses an underscore before `h`,
+while FASTA headers use `#` separators. For example, `HG002_h1` in the list
+must have contig IDs beginning with `HG002#1#` (such as `HG002#1#chr1`). This
+format change is required before graph construction or calling.
+
+For example, preparation changes a raw contig header like `>chr1` to
+`>HG002#1#chr1` for the `HG002_h1` assembly. The sample and haplotype prefix
+identifies which assembly owns each contig; keep each contig under exactly one
+haplotype prefix.
+
+An input list has exactly two whitespace-separated columns, with no header:
 
 ```text
 HG002_h1 /data/raw/HG002.h1.fa
@@ -123,8 +133,21 @@ Add `--remask` when you want to regenerate an existing mask.
 
 Input rules:
 
-- Names use `SAMPLE_h1`, `SAMPLE_h2`, etc. Contig identifiers use
-  `SAMPLE#HAPLOTYPE#CONTIG`, for example `HG002#1#chr1`.
+- The first column uses `SAMPLE_hN`, for example `HG002_h1`; each FASTA
+  identifier must be `SAMPLE#N#CONTIG`, for example `HG002#1#chr1`. If the
+  source FASTA has plain names such as `>chr1`, run the preparation command
+  above with `--contignamefix`; it writes a prepared copy with the required
+  prefix and does not change the source FASTA.
+- For name fixing alone, this short command accepts either `HG002_h1` or
+  `HG002#1` and writes `assembly.namefixed.fa` by default:
+
+  ```bash
+  python3 tools/namecontigsfix.py -i assembly.fa -n HG002_h1
+  samtools faidx assembly.namefixed.fa
+  ```
+
+  Use `assembly.namefixed.fa` in the assembly list. Add `-o output.fa` to
+  choose a different output path.
 - Calling requires uncompressed, soft-masked FASTAs and matching `FASTA.fai`
   indexes. Preparation accepts compressed inputs.
 - Relative FASTA paths are resolved from the input list's directory. Paths
@@ -134,6 +157,10 @@ Input rules:
   separate `HG002_h1` rows. Name collisions make inputs and per-haplotype
   outputs ambiguous and can cause one assembly's results to be mistaken for
   another's.
+- Do not put one haplotype's prefix inside another's contig name, such as
+  `HG002#1#HG002#2#chr1`. The name fixer rejects this collision instead of
+  adding another prefix; correct the source FASTA header or assembly-list
+  label so the contig belongs to exactly one haplotype.
 - **`CHM13_h1` and `HG38_h1` can keep their native contig names and masking.**
   They still need matching indexes, created with `samtools faidx reference.fa`.
 - Calling checks the first sequence and index entry. Run preparation explicitly

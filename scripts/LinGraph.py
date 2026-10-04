@@ -211,8 +211,9 @@ def check_fasta(path):
 def check_prepared(name, fasta):
     """Inspect the first FASTA record and the FAI names; never modify inputs."""
     native_reference = name in {"CHM13_h1", "HG38_h1"}
+    prefix = name.rsplit("_h", 1)[0] + "#" + name.rsplit("_h", 1)[1]
 
-    def fail(reason):
+    def fail(reason, *, fix_names=False, name_collision=False):
         if native_reference:
             raise ValueError(
                 f"Assembly {name} is not ready: {reason}.\n"
@@ -220,13 +221,45 @@ def check_prepared(name, fasta):
                 "Regenerate the adjacent index with: "
                 + shlex.join(["samtools", "faidx", str(fasta)])
             )
-        command = [sys.executable, str(ROOT / "tools" / "prepare_assemblies.py"),
-                   "-i", str(fasta), "--name", name, "-O", "prepared_assemblies",
-                   "--remask", "--contignamefix"]
-        raise ValueError(f"Assembly {name} is not ready: {reason}.\n"
-                         "Please mask/format/index it separately with tools/prepare_assemblies.py, for example:\n"
-                         + shlex.join(command) + "\nThen use prepared_assemblies/query_paths.prepared.txt with -I. "
-                         "LinGraph has not modified this assembly.")
+        message = f"Assembly {name} is not ready: {reason}.\n"
+        if name_collision:
+            raise ValueError(
+                message
+                + "The FASTA header and assembly-list name refer to different "
+                "sample/haplotypes. Correct the source header or assembly-list "
+                "label so each haplotype has one unique prefix, then rebuild its "
+                "FASTA index with samtools faidx. Do not add another prefix to "
+                "this contig. LinGraph has not modified the assembly."
+            )
+        if fix_names:
+            output = Path("prepared_assemblies") / f"{name}.namefixed.fa"
+            fix_command = [
+                sys.executable, str(ROOT / "tools" / "namecontigsfix.py"),
+                "-i", str(fasta), "-n", prefix, "-o", str(output),
+            ]
+            index_command = ["samtools", "faidx", str(output)]
+            raise ValueError(
+                message + f"Expected {prefix!r} or contig names beginning with "
+                f"{prefix + '#'!r}. "
+                "For example, fix names and build the index with:\n  "
+                + shlex.join(fix_command) + "\n  "
+                + shlex.join(index_command) + "\nThen replace this FASTA path "
+                f"in your assembly list with {output}. LinGraph has not modified "
+                "the input assembly."
+            )
+
+        output_folder = "prepared_assemblies"
+        command = [
+            sys.executable, str(ROOT / "tools" / "prepare_assemblies.py"),
+            "-i", str(fasta), "--name", name, "-O", output_folder,
+            "--contignamefix",
+        ]
+        raise ValueError(
+            message + "Prepare the FASTA and index separately with:\n  "
+            + shlex.join(command)
+            + f"\nThen use {output_folder}/query_paths.prepared.txt with -I. "
+            "LinGraph has not modified the input assembly."
+        )
 
     index = Path(str(fasta) + ".fai")
     if not index.is_file():
@@ -239,9 +272,19 @@ def check_prepared(name, fasta):
         if not fields:
             fail("the first FASTA header is empty")
         contig = fields[0].decode("ascii", errors="replace")
-        prefix = name.rsplit("_h", 1)[0] + "#" + name.rsplit("_h", 1)[1]
         if not native_reference and contig != prefix and not contig.startswith(prefix + "#"):
-            fail(f"first sequence {contig!r} must be {prefix!r} or start with {prefix + '#'!r}")
+            embedded = re.match(r"^([A-Za-z0-9.-]+#[1-9][0-9]*)#", contig)
+            if embedded and embedded.group(1) != prefix:
+                fail(
+                    f"first sequence {contig!r} has conflicting sample/haplotype "
+                    f"prefix {embedded.group(1)!r}; expected {prefix!r}",
+                    name_collision=True,
+                )
+            fail(
+                f"first sequence {contig!r} must be {prefix!r} or start with "
+                f"{prefix + '#'!r}",
+                fix_names=True,
+            )
         offset = handle.tell()
         with index.open() as fai:
             record = fai.readline().split()
@@ -265,9 +308,12 @@ def check_prepared(name, fasta):
                     rest = rest[len(prefix) + 1:]
                 collision = re.match(r"([A-Za-z0-9.-]+#[1-9][0-9]*)#", rest)
                 if collision:
-                    fail(f"sequence {indexed!r} carries sample prefix "
-                         f"{collision.group(1)!r}, which collides with {prefix!r}; "
-                         "sample names may not collide")
+                    fail(
+                        f"sequence {indexed!r} carries sample prefix "
+                        f"{collision.group(1)!r}, which collides with {prefix!r}; "
+                        "sample names may not collide",
+                        name_collision=True,
+                    )
         masked = False
         for line in handle:
             if line.startswith(b">"):

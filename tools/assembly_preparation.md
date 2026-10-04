@@ -49,18 +49,24 @@ Prepare native `CHM13_h1` and `HG38_h1` references separately without
 For name fixing alone, without masking, use a separate output file:
 
 ```bash
-python3 tools/namecontigsfix.py -i assembly.fa -n 'HG002#1' -o assembly.namefixed.fa
+python3 tools/namecontigsfix.py -i assembly.fa -n HG002_h1
 samtools faidx assembly.namefixed.fa
 ```
+
+The name fixer accepts either `SAMPLE_hN` or `SAMPLE#N`, defaults to a new
+sibling FASTA, and never overwrites its input. Use the output path in the
+assembly list; pass `-o output.fa` to select a different destination.
 
 ## Behavior
 
 - A FASTA is considered soft-masked when at least one lowercase `a`, `c`, `g`,
   or `t` occurs in its sequence. An already masked FASTA skips WindowMasker.
 - `--remask` runs WindowMasker regardless of the detected input state.
-- `--contignamefix` checks every identifier against the list name. For
-  `HG002_h1`, valid identifiers are `HG002#1` or start with `HG002#1#`. A
-  prefix is added only when necessary, and duplicate prefixes are collapsed.
+- Assembly-list names and FASTA prefixes use different formats:
+  `HG002_h1` in the list corresponds to contig IDs such as `HG002#1#chr1`.
+- `--contignamefix` checks every identifier against the list name, adds the
+  required prefix when absent, and collapses repeated copies of that same
+  prefix. Different embedded haplotype prefixes are rejected as collisions.
 - Name repair aborts if it would create duplicate FASTA identifiers.
 - `samtools faidx` is always run on every resulting FASTA.
 - Inputs ending in gzip data are accepted and written as ordinary,
