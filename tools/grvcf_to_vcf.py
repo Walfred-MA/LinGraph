@@ -24,6 +24,9 @@ from graph_cigar_payloads import query_only_graph_cigar
 DNA = re.compile(r'[ACGTNacgtn]+')
 OP = re.compile(r'(\d+)([=MXIDHS])([A-Za-z]*)')
 GT = re.compile(r'(?:\.|\d+)(?:[|/](?:\.|\d+))*')
+# CHROM of a nested row: its parent row's ID (graphvcfmerge INS_/DEL_/SUB_
+# rows) or a shared full-locus-dup template path (DUP_).
+NESTED_CHROM = re.compile(r'(?:INS|DEL|SUB|DUP)_')
 
 
 def unescape(text):
@@ -358,7 +361,7 @@ def load_input(path, database):
 def write_header(handle, metadata, header, catalog, reference, filters):
     handle.write('##fileformat=VCFv4.3\n##source=LinGraph_grvcf_to_vcf\n')
     handle.write('##reference=' + Path(reference).resolve().as_uri() + '\n')
-    handle.write('##LinGraphConversion="Representative alleles; graph-only records are in the unplaced grVCF"\n')
+    handle.write('##LinGraphConversion="Representative alleles; nested rows removed; other graph-only records are in the unplaced grVCF"\n')
     for name, length in catalog.contigs.items():
         handle.write(f'##contig=<ID={name},length={length}>\n')
     declared = set()
@@ -421,6 +424,11 @@ def run(args):
             for number, raw in database.execute('SELECT ordinal,text FROM records ORDER BY ordinal'):
                 stats['read'] += 1
                 fields = raw.split('\t')
+                if fields[0] not in catalog.contigs and NESTED_CHROM.match(fields[0]):
+                    # Variation inside another row's allele: the output keeps
+                    # each row's representative allele only.
+                    stats['nested_removed'] += 1
+                    continue
                 if fields[0] not in catalog.contigs:
                     rejected.write(raw + '\n')
                     stats['unplaced'] += 1
@@ -467,16 +475,19 @@ def run(args):
         if str(output).endswith('.gz'):
             os.replace(str(staged)+'.csi', str(output)+'.csi')
     print(f'[grvcf_to_vcf] read={stats["read"]} converted={stats["converted"]} '
-          f'unplaced={stats["unplaced"]}\nVCF: {output}\nUnplaced grVCF: {unplaced}', file=sys.stderr)
+          f'nested_removed={stats["nested_removed"]} unplaced={stats["unplaced"]}\n'
+          f'VCF: {output}\nUnplaced grVCF: {unplaced}', file=sys.stderr)
     return 0
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='Example:\n  python tools/grvcf_to_vcf.py -i calls/cohort.sv.vcf \\\n    -r reference.fa -o calls/cohort.sv.standard.vcf\n\n'
+        epilog='Example:\n  python minsetref/tools/grvcf_to_vcf.py -i calls/cohort.sv.vcf \\\n    -r reference.fa -o calls/cohort.sv.standard.vcf\n\n'
         'Keeps the merged representative alleles and original genotype ploidy.\n'
         'Graph-specific INFO/FORMAT fields are replaced by GT and allele counts.\n'
-        'Rows outside the reference FASTA are preserved in a separate grVCF.\n'
+        'Nested rows (CHROM = a parent row ID or DUP_ template) are removed:\n'
+        'carriers are given the representative allele, not base-for-base.\n'
+        'Other rows outside the reference FASTA are preserved in a separate grVCF.\n'
         'Use --normalize for bcftools left alignment; .vcf.gz also writes a CSI index.')
     parser.add_argument('-i', '--input', required=True, help='individual or merged grVCF (.vcf or .vcf.gz)')
     parser.add_argument('-r', '--reference', required=True, help='calling reference FASTA, with adjacent .fai')
