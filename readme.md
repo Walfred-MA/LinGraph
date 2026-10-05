@@ -20,7 +20,7 @@ coordinates in grVCF and can export cohort calls as a pangenome graph.
 
 ## Workflow overview
 
-![LinGraph workflow: prepare and align local graphs, pair query and reference sequences, call and merge grVCF variants, and export a pangenome GFA.](scripts/docs/figures/lingraph_workflow.png)
+![LinGraph workflow: prepare and align local graphs, pair query and reference sequences, call and merge grVCF variants, and export a pangenome GFA.](docs/figures/lingraph_workflow.png)
 
 LinGraph partitions assemblies into loci, builds and aligns local graphs, and
 uses those alignments to call variants. Cohort calls retain sequence and graph
