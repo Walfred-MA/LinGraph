@@ -114,8 +114,8 @@ haplotype prefix.
 An input list has exactly two whitespace-separated columns, with no header:
 
 ```text
-HG002_h1 /data/raw/HG002.h1.fa
-HG002_h2 /data/raw/HG002.h2.fa
+HG002_h1 /data/raw/HG002.h1.raw.fasta
+HG002_h2 /data/raw/HG002.h2.raw.fasta
 ```
 
 Save this as `raw_assemblies.list`, then prepare the assemblies:
@@ -296,10 +296,10 @@ List the prepared haplotype assemblies in `samples.list`. For example, two
 diploid samples have four entries:
 
 ```text
-HG002_h1 /data/prepared/HG002.h1.fa
-HG002_h2 /data/prepared/HG002.h2.fa
-HG003_h1 /data/prepared/HG003.h1.fa
-HG003_h2 /data/prepared/HG003.h2.fa
+HG002_h1 /data/prepared/HG002.h1.prepared.fasta
+HG002_h2 /data/prepared/HG002.h2.prepared.fasta
+HG003_h1 /data/prepared/HG003.h1.prepared.fasta
+HG003_h2 /data/prepared/HG003.h2.prepared.fasta
 ```
 
 ```bash
@@ -352,7 +352,7 @@ run. For `HG38_h1`, the pipeline uses chr1–22, chrX, and chrY; chrM and
 non-primary scaffolds are excluded.
 
 To supply one FASTA directly, replace `-I ...` with
-`-i /data/prepared/HG002.h1.fa --sample HG002_h1`.
+`-i /data/prepared/HG002.h1.prepared.fasta --sample HG002_h1`.
 
 ### Reuse reference alignments
 
@@ -438,10 +438,10 @@ Create `cohort.list` with the reference and prepared haplotypes:
 
 ```text
 CHM13_h1 /data/references/chm13.fa
-HG002_h1 /data/prepared/HG002.h1.fa
-HG002_h2 /data/prepared/HG002.h2.fa
-HG003_h1 /data/prepared/HG003.h1.fa
-HG003_h2 /data/prepared/HG003.h2.fa
+HG002_h1 /data/prepared/HG002.h1.prepared.fasta
+HG002_h2 /data/prepared/HG002.h2.prepared.fasta
+HG003_h1 /data/prepared/HG003.h1.prepared.fasta
+HG003_h2 /data/prepared/HG003.h2.prepared.fasta
 ```
 
 Build with **gene blocks**, the recommended windows for pangenome graph
