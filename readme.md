@@ -423,6 +423,10 @@ HG003_h1 /data/prepared/HG003.h1.prepared.fasta
 HG003_h2 /data/prepared/HG003.h2.prepared.fasta
 ```
 
+You can choose **any haplotype in the cohort as the reference/backbone** with
+`-r HAPLOTYPE_NAME` (for example, `-r HG002_h2`). If `-r` is omitted, the
+first haplotype in `cohort.list` is used.
+
 Build with **gene blocks**, the recommended windows for pangenome graph
 construction:
 
