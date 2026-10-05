@@ -41,7 +41,7 @@ CIGAR_RE = re.compile(r"(\d+)([MIDNSHP=X])")
 
 # Default winnowmap parameters (repetitive-aware, fast); overridable.
 WINNOWMAP_DEFAULTS = dict(k=19, w=10, m=300, p=0.001, N=100)
-MINIMAP2_DEFAULTS = dict(preset="asm5", p=0.001, N=20, f=0.001, K="100M")
+MINIMAP2_DEFAULTS = dict(preset=None, p=0.001, N=20, f=0.001, K="100M")
 PAF_INDEX_THRESHOLD_BYTES = 100_000_000
 
 
@@ -579,7 +579,7 @@ def run_minimap2(query_fasta: str, target_fasta: str, out_paf: str, threads: int
                  log: logging.Logger, params: Optional[dict] = None,
                  reuse_existing: bool = False,
                  emit_cigar: bool = True) -> None:
-    """Run the fast stage-1 assembly aligner using the older pipeline policy."""
+    """Run minimap2 without a preset unless the caller explicitly selects one."""
     if reuse_existing and os.path.exists(out_paf):
         log.info("REUSE: existing minimap2 PAF %s", out_paf)
         return
@@ -588,7 +588,9 @@ def run_minimap2(query_fasta: str, target_fasta: str, out_paf: str, threads: int
         p.update(params)
 
     def command(worker_threads: int, query_batch: Optional[str]) -> List[str]:
-        cmd = ["minimap2", "-x", str(p["preset"])]
+        cmd = ["minimap2"]
+        if p["preset"]:
+            cmd.extend(["-x", str(p["preset"])])
         if emit_cigar:
             cmd.extend(["-c", "--eqx"])
         cmd.extend([
@@ -636,7 +638,7 @@ def run_minimap2(query_fasta: str, target_fasta: str, out_paf: str, threads: int
 
 
 def build_minimap2_index(ref_fasta: str, out_index: str, log: logging.Logger,
-                         preset: str = "asm5") -> str:
+                         preset: Optional[str] = None) -> str:
     """Build one reusable minimap2 index for parallel assembly jobs."""
     Path(out_index).parent.mkdir(parents=True, exist_ok=True)
     if os.path.isfile(out_index) and os.path.getsize(out_index) > 0:
@@ -648,7 +650,10 @@ def build_minimap2_index(ref_fasta: str, out_index: str, log: logging.Logger,
         os.remove(temporary)
     except FileNotFoundError:
         pass
-    run_command(["minimap2", "-x", str(preset), "-d", temporary, ref_fasta], log)
+    cmd = ["minimap2"]
+    if preset:
+        cmd.extend(["-x", str(preset)])
+    run_command(cmd + ["-d", temporary, ref_fasta], log)
     if not os.path.isfile(temporary) or os.path.getsize(temporary) == 0:
         raise RuntimeError(f"minimap2 produced no index: {temporary}")
     os.replace(temporary, out_index)
