@@ -865,8 +865,9 @@ def build_parser():
                         help='merged VCFs, in the same order given to merged_vcf_to_gfa.py')
     parser.add_argument('-s', '--sample-vcf', required=True, action='append', nargs='+',
                         help='per-sample VCFs carrying ##pseudoLinearMapping headers, or one '
-                             'file of all samples\' mapping lines (tools/rebuild_assemblies.py '
-                             'headers): its samples are the lines\' Sample values')
+                             'merged header of all samples\' mapping lines (tools/rebuild_assemblies.py '
+                             'headers, or a VCF header whose #CHROM line lists several samples): '
+                             'its samples are the lines\' Sample values; no per-sample VCF is read')
     parser.add_argument('-q', '--query-fasta-list',
                         help='NAME FASTA [FAI] per line, for GAF query lengths')
     parser.add_argument('-o', '--output-folder', required=True, help='writes SAMPLE.gaf here')
@@ -900,14 +901,16 @@ def main(argv=None):
             for line in handle:
                 if line.startswith('#CHROM'):
                     columns = line.rstrip('\n').split('\t')
-                    name = columns[9] if len(columns) > 9 else None
+                    name = columns[9] if len(columns) == 10 else None
                     break
                 if line.startswith('##pseudoLinearMapping=<'):
                     value = dict(_META.findall(line)).get('Sample')
                     if value and value not in listed:
                         listed.append(value)
-        # A per-sample VCF names its sample column; a combined mapping
-        # header file has no #CHROM line and holds every sample's lines.
+        # A per-sample VCF names its one sample column.  A merged header
+        # (no #CHROM line, or a #CHROM line with several samples) holds every
+        # sample's lines, each named by its Sample value, so the original
+        # per-sample VCFs are not needed.
         entries = [(name, None)] if name else [(value, value) for value in listed]
         if not entries:
             raise SystemExit(f'{vcf}: no sample column or ##pseudoLinearMapping samples')

@@ -32,6 +32,8 @@ AlleleView = Tuple[str, int, int, str]
 _FASTA_CACHE: Dict[str, Dict[str, str]] = {}
 _VIEWS_BY_FASTA: Dict[str, Dict[str, AlleleView]] = {}
 _ORIGINAL_READ_FASTA_METADATA = core.read_fasta_metadata
+_ORIGINAL_INDEXED_FASTA_READER = core.IndexedFastaReader
+_ASSEMBLY_FASTA_PATH: Optional[str] = None
 
 
 def _load_fasta(path: str) -> Dict[str, str]:
@@ -81,11 +83,23 @@ def _load_fasta(path: str) -> Dict[str, str]:
 
 
 class InMemoryFastaReader:
-    """IndexedFastaReader-compatible full-memory FASTA plus virtual views."""
+    """RAM-backed assembly reader with indexed access for other FASTAs."""
 
     def __init__(self, fasta_path: str, index_path: Optional[str] = None):
-        del index_path
-        self.fasta_path = os.path.abspath(os.path.expanduser(fasta_path))
+        self.fasta_path = os.path.realpath(os.path.expanduser(fasta_path))
+        self.delegate = None
+        if (
+            _ASSEMBLY_FASTA_PATH is not None
+            and self.fasta_path != _ASSEMBLY_FASTA_PATH
+        ):
+            self.delegate = _ORIGINAL_INDEXED_FASTA_READER(
+                self.fasta_path, index_path,
+            )
+            self.index_path = self.delegate.index_path
+            self.index = self.delegate.index
+            self.sequences = {}
+            self.views = {}
+            return
         self.index_path = "<in-memory>"
         self.sequences = _load_fasta(self.fasta_path)
         self.views = _VIEWS_BY_FASTA.get(self.fasta_path, {})
@@ -104,6 +118,8 @@ class InMemoryFastaReader:
         return self.index[name][0]
 
     def fetch(self, name: str, start: int, end: int, strand: str = "+") -> str:
+        if self.delegate is not None:
+            return self.delegate.fetch(name, start, end, strand)
         if name in self.views:
             contig, view_start, view_end, view_strand = self.views[name]
             source = self.sequences.get(contig)
@@ -186,12 +202,18 @@ def _option_value(arguments: List[str], names: Tuple[str, ...]) -> Optional[str]
     return None
 
 
-def _build_allele_views(input_path: str) -> Dict[str, AlleleView]:
+def _build_allele_views(input_path: str, error_regions=None, query_names=None) -> Dict[str, AlleleView]:
     views: Dict[str, AlleleView] = {}
+    found_rows = False
     with core.open_text(input_path) as handle:
         for line_number, raw in enumerate(handle, 1):
-            row = core.parse_graphcigartoref_row(raw, line_number)
+            row = core.parse_graphcigartoref_row(raw, line_number, error_regions)
             if row is None:
+                continue
+            found_rows = True
+            if query_names is not None:
+                query_names.add(row['query'])
+            if row.get('error_bed_filtered'):
                 continue
             coordinate = core.parse_coord_token(row.get("query_coord", ""))
             if coordinate is None:
@@ -211,7 +233,7 @@ def _build_allele_views(input_path: str) -> Dict[str, AlleleView]:
                 # assembly view; parse_row_events selects each row's offset.
                 coordinate = (old[0], min(old[1], coordinate[1]), max(old[2], coordinate[2]), old[3])
             views[name] = coordinate
-    if not views:
+    if not found_rows:
         raise ValueError(f"no graph-reference CIGAR rows found: {input_path}")
     return views
 
@@ -227,6 +249,7 @@ def _fork_context():
 
 
 def main() -> int:
+    global _ASSEMBLY_FASTA_PATH
     arguments = sys.argv[1:]
     if "-h" in arguments or "--help" in arguments:
         # graphreftovcf.py owns the complete option set.  It also exposes
@@ -256,13 +279,18 @@ def main() -> int:
     query_fasta = core.normalize_cli_path(query_fasta, "--fasta-query")
     reference_fasta = core.normalize_cli_path(reference_fasta, "--ref")
     input_path = os.path.abspath(os.path.expanduser(input_path))
-    query_fasta = os.path.abspath(os.path.expanduser(query_fasta))
-    reference_fasta = os.path.abspath(os.path.expanduser(reference_fasta))
+    query_fasta = os.path.realpath(os.path.expanduser(query_fasta))
+    reference_fasta = os.path.realpath(os.path.expanduser(reference_fasta))
     for path in (input_path, query_fasta, reference_fasta):
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
+    _ASSEMBLY_FASTA_PATH = query_fasta
 
-    views = _build_allele_views(input_path)
+    error_bed_path = core.normalize_cli_path(
+        _option_value(arguments, ('--error-bed',)), '--error-bed')
+    error_regions = core.QueryErrorBed.read(error_bed_path) if error_bed_path else None
+    query_names = set()
+    views = _build_allele_views(input_path, error_regions, query_names)
     _VIEWS_BY_FASTA[query_fasta] = views
     print(
         f"[graphreftovcf_persample] indexed {len(views)} input allele view(s) "
@@ -276,7 +304,7 @@ def main() -> int:
     requested_columns = _option_value(arguments, ("--columns", "-c"))
     inferred_samples = sorted({
         haplotype
-        for name in views
+        for name in query_names
         for haplotype in (core.get_haplotype(name),)
         if haplotype.endswith(("_h1", "_h2"))
     })
@@ -310,6 +338,11 @@ def main() -> int:
     core.IndexedFastaReader = InMemoryFastaReader
     core.read_fasta_metadata = _read_fasta_metadata_with_views
     core.mp_context = _fork_context
+    print(
+        "[graphreftovcf_persample] assembly uses shared RAM; reference and "
+        "local templates use indexed access",
+        file=sys.stderr,
+    )
     core.main()
     return 0
 

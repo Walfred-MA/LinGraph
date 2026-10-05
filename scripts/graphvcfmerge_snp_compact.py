@@ -23,6 +23,7 @@ import time
 
 import numpy as np
 import graphvcfmerge as vcf
+import graphvcfmerge_insertion_store as insertion_store
 
 DTYPE = np.dtype([('pos', '<u4'), ('bases', 'u1'), ('query_pos', '<u4'),
                   ('query', '<u4'), ('allele', '<u4'), ('label_h', '<u4')], align=False)
@@ -112,13 +113,18 @@ def snp_observations(field, fmt):
 
 class Writer:
     """One binary file per scan worker; chromosome spans live in metadata."""
-    def __init__(self, directory):
+    def __init__(self, directory, durable=True, *, memory=False):
+        # Insertion records stay in RAM up to 1 MiB, then spill to scratch.
+        # They are published with their metadata in a shared bundle at finish.
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.durable = durable
+        if durable and not memory:
+            self.directory.mkdir(parents=True, exist_ok=True)
         self.queries, self.alleles, self.label_groups = {}, {}, {}
         self.metadata = {}
         self.chroms, self.coverage, self.lengths = {}, defaultdict(list), {}
-        self.handle = (self.directory / "records.bin").open("wb")
+        self.handle = (tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode='w+b')
+                       if memory else (self.directory / "records.bin").open("wb"))
         self.sections = defaultdict(list)
         self.counts = defaultdict(int)
         self.last_key = None
@@ -173,14 +179,19 @@ class Writer:
     def close(self):
         self.handle.close()
 
-    def finish(self):
-        self.close()
-        data = dict(protocol=PROTOCOL, directory=str(self.directory.resolve()),
+    def data(self):
+        return dict(protocol=PROTOCOL,
+                    directory=str(self.directory.resolve() if self.durable
+                                  else os.path.abspath(self.directory)),
                     queries=list(self.queries), alleles=list(self.alleles),
                     label_groups=list(self.label_groups), chroms=self.chroms,
                     coverage=dict(self.coverage), lengths=self.lengths,
                     counts=dict(self.counts), sections=dict(self.sections), metadata=list(self.metadata))
-        vcf.checkpoints.write_json(self.directory / 'source.json', data)
+
+    def finish(self):
+        self.close()
+        data = self.data()
+        vcf.checkpoints.write_json(self.directory / 'source.json', data, self.durable)
         return data
 
 
@@ -190,7 +201,7 @@ def _scan_one(task):
     all_samples, metadata = [], []
     try:
         for path in paths:
-            samples = []
+            samples, alternative_entries = [], set()
             with vcf.open_text(str(path)) as source:
                 for number, raw in enumerate(source, 1):
                     try:
@@ -201,6 +212,10 @@ def _scan_one(task):
                                 writer.chroms[chrom_key(chrom)] = chrom
                                 writer.coverage[chrom].append([data['Sample'], int(data['Start']), int(data['End'])])
                         elif raw.startswith('##'):
+                            if raw.startswith('##pseudoLinearMapping=<'):
+                                entry = vcf.alternative_path_entry(raw.strip())
+                                if entry is not None:
+                                    alternative_entries.add(entry)
                             metadata.append(raw.strip())
                         elif raw.startswith('#CHROM\t'):
                             samples = raw.rstrip('\r\n').split('\t')[9:]
@@ -210,6 +225,11 @@ def _scan_one(task):
                             if not samples:
                                 raise ValueError('missing #CHROM sample header')
                             row = vcf.parse_vcf_record(raw, number)
+                            # A copy's differences against its source (Path=alt
+                            # entries only) are annotations, never merged.
+                            if (('PAMAP=' in raw or 'PAPATH=alt' in raw)
+                                    and vcf.alternative_path_record(row.info, alternative_entries)):
+                                continue
                             writer.consume(row, samples)
                     except (ValueError, KeyError) as error:
                         raise ValueError(f'{path}:{number}: {error}') from error
@@ -326,9 +346,24 @@ def source_sections(data, key):
     return binary, spans
 
 
-def _load_source(task):
+def _load_source(task, loaded=None):
     # Insertion loci fit in memory. Original chromosome sorting uses bounded spans.
+    # ``loaded``: this bundled source's (metadata, records), read in a batch.
     path, key, locus = task
+    if isinstance(path, dict):
+        data, records = loaded if loaded is not None else insertion_store.read(path)
+        if len(records) != sum(data['counts'].values()) * DTYPE.itemsize:
+            raise ValueError(f'invalid bundled SNP record count: {path}')
+        spans = data['sections'].get(key, [])
+        if sum(count for _, count in spans) != data['counts'].get(key, 0):
+            raise ValueError(f'invalid bundled SNP section counts: {path}')
+        chunks = []
+        for offset, count in spans:
+            if offset < 0 or count < 0 or offset % DTYPE.itemsize or offset + count * DTYPE.itemsize > len(records):
+                raise ValueError(f'invalid bundled SNP section bounds: {path}')
+            chunks.append(np.frombuffer(records, dtype=DTYPE, offset=offset, count=count))
+        array = np.concatenate(chunks) if chunks else np.empty(0, dtype=DTYPE)
+        return array, data, key, locus
     data = json.loads(Path(path).read_text())
     binary, spans = source_sections(data, key)
     chunks = [np.fromfile(binary, dtype=DTYPE, offset=offset, count=count) for offset, count in spans]
@@ -366,11 +401,19 @@ def concat_insertions(manifest, insertion_snps=None):
             data = vcf._parse_structured_meta(line, 'contig')
             definitions[data['ID']] = data.get('length')
     by_locus, names, lengths = defaultdict(list), {}, {}
-    paths = dict.fromkeys(str(Path(path).resolve()) for path in index['sources'])
-    for path in paths:
-        if path in embedded:
+    paths = {}
+    for source in index['sources']:
+        identity = (source['bundle'], source['key'], source['offset'], source['digest']) if isinstance(source, dict) else str(Path(source).resolve())
+        paths[identity] = source if isinstance(source, dict) else identity
+    bundled = [path for identity, path in paths.items()
+               if isinstance(path, dict) and identity not in embedded]
+    metadata_of = {id(path): entry[0] for path, entry in zip(
+        bundled, insertion_store.read_many(bundled, with_records=False))}
+    for identity, path in paths.items():
+        if identity in embedded:
             continue
-        data = json.loads(Path(path).read_text())
+        data = (metadata_of[id(path)] if isinstance(path, dict)
+                else json.loads(Path(path).read_text()))
         if any(query[0] not in samples for query in data['queries']):
             raise ValueError(f'insertion SNP source contains an unknown sample: {path}')
         for key, name in data['chroms'].items():
@@ -391,14 +434,42 @@ def concat_insertions(manifest, insertion_snps=None):
     return metadata, plan
 
 
-def append_insertions(handle, manifest, plan):
-    """Load, sort and emit one insertion locus at a time; never create sort runs."""
+APPEND_BATCH_LOCI = 512
+
+
+def append_insertions(handle, manifest, plan, root=None):
+    """Load, sort and emit one insertion locus at a time; never create sort runs.
+
+    Bundled sources and realignment records are read APPEND_BATCH_LOCI loci
+    at a time with one open per bundle, not one per locus."""
     total = 0
-    for key, name, paths in plan:
+    realign_root = Path(root) / 'realign' if root else None
+    # Older runs wrote realignment records as one JSON file per path.
+    legacy = ({path.stem for path in realign_root.glob('*.json')}
+              if realign_root is not None and realign_root.is_dir() else set())
+    for start in range(0, len(plan), APPEND_BATCH_LOCI):
+        chunk = plan[start:start + APPEND_BATCH_LOCI]
+        bundled = [path for _key, _name, paths in chunk for path in paths if isinstance(path, dict)]
+        loaded = {id(path): entry for path, entry in zip(bundled, insertion_store.read_many(bundled))}
+        realignments = {}
+        if realign_root is not None:
+            found = insertion_store.find_many(realign_root, [key for key, _name, _paths in chunk])
+            keys = list(found)
+            realignments = dict(zip(keys, (entry[0] for entry in insertion_store.read_many(
+                [found[key] for key in keys], with_records=False))))
+        total += _append_chunk(handle, manifest, chunk, loaded, realignments, realign_root, legacy)
+    if plan:
+        print(f'[merge:snp] concat appended {total} sites from {len(plan)} insertion loci', file=sys.stderr)
+    return total
+
+
+def _append_chunk(handle, manifest, chunk, loaded, realignments, realign_root, legacy):
+    total = 0
+    for key, name, paths in chunk:
         queries, alleles, groups = {}, {}, {}
         coverage, arrays = defaultdict(list), []
         for path in paths:
-            array, data, _, _ = _load_source((path, key, 0))
+            array, data, _, _ = _load_source((path, key, 0), loaded.get(id(path)))
             query_map = np.array([queries.setdefault(tuple(q), len(queries)) for q in data['queries']], dtype='<u4')
             allele_map = np.array([alleles.setdefault(a, len(alleles)) for a in data['alleles']], dtype='<u4')
             group_map = np.array([groups.setdefault(g, len(groups)) for g in data.get('label_groups', [])], dtype='<u4')
@@ -410,11 +481,17 @@ def append_insertions(handle, manifest, plan):
         ordered = np.concatenate(arrays)
         del arrays, array
         ordered.sort(kind='mergesort', order=DTYPE.names)
-        total += write_locus(handle, name, ordered, list(queries), list(alleles), list(groups),
+        query_list, allele_list = list(queries), list(alleles)
+        if key in realignments:
+            # --exact nested realignment records for this insertion path.
+            ordered = apply_realignment(realign_root / (key + '.json'), ordered, query_list,
+                                        allele_list, kind='INS_SNP', data=realignments[key])
+        elif key in legacy:
+            ordered = apply_realignment(realign_root / (key + '.json'), ordered, query_list,
+                                        allele_list, kind='INS_SNP')
+        total += write_locus(handle, name, ordered, query_list, allele_list, list(groups),
                              coverage, manifest['samples'])
         del ordered
-    if plan:
-        print(f'[merge:snp] concat appended {total} sites from {len(plan)} insertion loci', file=sys.stderr)
     return total
 
 
@@ -424,10 +501,67 @@ def merge_chrom(root, chrom, processes=1):
     if key not in manifest['chroms']:
         raise ValueError(f'unknown SNP chromosome: {chrom}')
     with vcf.checkpoints.chrom_lock(manifest['directory'], key):
-        return _emit_chrom(manifest, key, processes)
+        return _emit_chrom(manifest, key, processes, root=root)
 
 
-def _emit_chrom(manifest, key, processes):
+def apply_realignment(path, ordered, queries, alleles, kind='SNP', data=None):
+    """Apply graphvcfmerge --exact realignment records to one sorted locus.
+
+    Drops remove the named SNP observations (superseded by a moved SV's
+    flank representation); adds are that representation's new SNPs. A drop
+    that matches nothing is an error: the SV merge replaced it. kind is SNP
+    for reference loci and INS_SNP for insertion paths. ``data``: the
+    records, already read (batched callers).
+    """
+    path = Path(path)
+    source = (insertion_store.find(path.parent, path.stem)
+              if data is None and re.fullmatch(r'[0-9a-f]{64}', path.stem) else None)
+    if data is not None:
+        pass
+    elif source is not None:
+        data, _ = insertion_store.read(source)
+    elif path.is_file():
+        data = json.loads(path.read_text())
+    else:
+        return ordered
+    if not data['drops'] and not data['adds']:
+        return ordered
+    by_query = defaultdict(set)
+    for number, query in enumerate(queries):
+        if query[3] == kind and query[4] == '1':
+            by_query[(query[0], query[1], query[2])].add(number)
+    keep = np.ones(len(ordered), dtype=bool)
+    for sample, pos, alt, contig, qpos, strand in data['drops']:
+        ids = by_query.get((sample, contig, strand), set())
+        first = np.searchsorted(ordered['pos'], pos, side='left')
+        last = np.searchsorted(ordered['pos'], pos, side='right')
+        rows = [row for row in range(first, last)
+                if keep[row] and int(ordered['query'][row]) in ids
+                and int(ordered['query_pos'][row]) == qpos
+                and int(ordered['bases'][row]) & 15 == BASE_INDEX[alt.upper()]]
+        if not rows:
+            raise ValueError(f'realignment drop not found: {sample} {data["chrom"]}:{pos} {alt} {contig}:{qpos}{strand}')
+        keep[rows] = False
+    added = np.empty(len(data['adds']), dtype=DTYPE)
+    query_index = {tuple(query): number for number, query in enumerate(queries)}
+    allele = alleles.index('.') if '.' in alleles else None
+    if allele is None:
+        alleles.append('.')
+        allele = len(alleles) - 1
+    for row, (sample, pos, ref, alt, contig, qpos, strand) in enumerate(data['adds']):
+        query = (sample, contig, strand, kind, '1', False, 'PASS')
+        if query not in query_index:
+            queries.append(query)
+            query_index[query] = len(queries) - 1
+        added[row] = (u32(pos), pack_bases(ref, alt), u32(qpos), query_index[query], allele, 0)
+    result = np.concatenate([ordered[keep], added])
+    result.sort(kind='mergesort', order=DTYPE.names)
+    print(f'[merge:snp] {data["chrom"]}: realignment dropped {int((~keep).sum())} and added '
+          f'{len(added)} SNP observation(s)', file=sys.stderr, flush=True)
+    return result
+
+
+def _emit_chrom(manifest, key, processes, root=None):
     from graphvcfmerge_snp import atomic_output, part_path
     from graphvcfmerge_snp_memory import sorted_locus
     chrom = manifest['chroms'][key]
@@ -438,6 +572,9 @@ def _emit_chrom(manifest, key, processes):
     with atomic_output(part_path(manifest, key, 'snp')) as handle:
         for locus in loci:
             ordered, queries, alleles, groups, coverage = sorted_locus(manifest, locus, max(1, processes))
+            if root is not None:
+                ordered = apply_realignment(Path(root) / 'realign' / (locus + '.json'),
+                                            ordered, queries, alleles)
             print(f'[merge:snp] {manifest["loci"][locus]}: writing VCF from {len(ordered):,} observations',
                   file=sys.stderr, flush=True)
             count += write_locus(handle, manifest['loci'][locus], ordered,
@@ -506,18 +643,37 @@ def write_locus(handle, chrom, ordered, query_list, allele_list, label_groups, c
     return count
 
 
+_OWNERS = {}    # (root, insertion key) -> owner, from this process's puts or a prefetch
+
+
+def prefetch_owners(root, path_ids):
+    """Owners of many insertion paths with one lookup per bundle (nested rounds)."""
+    keys = {chrom_key(path_id) for path_id in path_ids} - {
+        key for (cached_root, key) in _OWNERS if cached_root == str(root)}
+    found = insertion_store.find_many(root, keys)
+    for key, (data, _) in zip(found, insertion_store.read_many(list(found.values()),
+                                                               with_records=False)):
+        _OWNERS[str(root), key] = data.get('owner')
+    for key in keys - set(found):
+        _OWNERS[str(root), key] = None      # no spool (e.g. a deletion parent)
+
+
 def insertion_owner(root, path_id):
+    cached = _OWNERS.get((str(root), chrom_key(path_id)), False)
+    if cached is not False:
+        return cached or path_id
+    source = insertion_store.find(root, chrom_key(path_id))
+    if source is not None:
+        return insertion_store.read(source, with_records=False)[0].get('owner', path_id)
     pointer = Path(root) / (chrom_key(path_id) + '.json')
     return json.loads(pointer.read_text()).get('owner', path_id) if pointer.exists() else path_id
 
 
 def save_insertion(root, path_id, sequences, bodies, sources, rep_slot, sample_names, owner=None):
     """Call SNPs on the final insertion representative using existing CIGARs."""
-    target = Path(root) / chrom_key(path_id)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # Each final insertion has one owner. A retry atomically replaces its data.
-    directory = Path(tempfile.mkdtemp(prefix=target.name + '-', dir=target.parent))
-    writer = Writer(directory)
+    # Dictionary IDs and record offsets remain local to this insertion. Bundle
+    # append publishes its complete metadata and records together, even when empty.
+    writer = Writer(root, durable=False, memory=True)
     template = sequences[rep_slot].upper()
     writer.lengths[path_id] = len(template)
     writer.chroms[chrom_key(path_id)] = path_id
@@ -555,11 +711,10 @@ def save_insertion(root, path_id, sequences, bodies, sources, rep_slot, sample_n
                     tpos += count
                 elif op in 'IS':
                     qpos += count
-        data = writer.finish()
+        data = writer.data()
         data['owner'] = owner or path_id
-        # A stable pointer is published last; incomplete/replaced generations
-        # are never discovered by SNP jobs.
-        vcf.checkpoints.write_json(Path(str(target) + '.json'), data)
+        insertion_store.put(root, chrom_key(path_id), data, writer.handle)
+        _OWNERS[str(root), chrom_key(path_id)] = data['owner']
     finally:
         writer.close()
 
@@ -571,11 +726,12 @@ def finalize_insertions(root, vcf_paths=None, *, insertion_ids=None):
     if insertion_ids is not None:
         if vcf_paths is not None:
             raise ValueError('provide VCF paths or insertion IDs, not both')
-        pointers = {root / (chrom_key(name) + '.json') for name in insertion_ids}
+        keys = {chrom_key(name) for name in insertion_ids}
     elif vcf_paths is None:
-        pointers = {path for path in root.glob('*.json') if path.name != 'manifest.json'}
+        keys = {path.stem for path in root.glob('*.json') if path.name != 'manifest.json'}
+        keys.update(source['key'] for source in insertion_store.sources(root))
     else:
-        pointers = set()
+        keys = set()
         for path in vcf_paths:
             with vcf.open_text(str(path)) as handle:
                 for raw in handle:
@@ -589,8 +745,28 @@ def finalize_insertions(root, vcf_paths=None, *, insertion_ids=None):
                             raise ValueError('invalid VCF row while finalizing insertion SNPs')
                     fields = raw[:end].split('\t')
                     if vcf.parse_info_field(fields[7]).get('SVTYPE') == 'INS':
-                        pointers.add(root / (chrom_key(fields[2]) + '.json'))
-    if any(not path.is_file() for path in pointers):
-        raise ValueError('SV output is missing an insertion SNP spool')
-    sources = [str(path.resolve()) for path in sorted(pointers)]
+                        keys.add(chrom_key(vcf.checkpoints.insertion_snp_owner(fields[2], fields[7])))
+    bundled = insertion_store.find_many(root, keys)
+    sources = [bundled[key] if key in bundled else legacy_insertion_source(root, key)
+               for key in sorted(keys)]
     vcf.checkpoints.write_json(root / 'manifest.json', dict(protocol=PROTOCOL, sources=sources))
+
+
+def insertion_source(root, key):
+    """Prefer the bundled generation; existing per-insertion spools stay readable."""
+    source = insertion_store.find(root, key)
+    if source is not None:
+        return source
+    return legacy_insertion_source(root, key)
+
+
+def legacy_insertion_source(root, key):
+    """A per-insertion spool of an older run (key known not to be bundled)."""
+    pointer = Path(root) / (key + '.json')
+    if not pointer.is_file():
+        raise ValueError(f'SV output is missing an insertion SNP spool: {pointer}')
+    return str(pointer.resolve())
+
+
+def save_insertion_realignment(root, path_id, records):
+    insertion_store.put(Path(root) / 'realign', chrom_key(path_id), records)

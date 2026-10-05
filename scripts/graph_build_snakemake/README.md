@@ -21,7 +21,7 @@ is not marked complete while a background process is still running.
 Create the pinned workflow environment:
 
 ```bash
-conda env create -f scripts/graph_build_snakemake/envs/snakemake-6.15.1.yaml
+conda env create -f graph_build_snakemake/envs/snakemake-6.15.1.yaml
 conda activate minsetref-snakemake-6.15.1
 ```
 
@@ -88,7 +88,7 @@ legacy or unprefixed contig names are accepted.
 Validation failure stops before k-mer construction and tells the user to run
 the assembly-preparation workflow in the configured `preparation_folder`.
 The standalone preparation command is documented in
-[assembly preparation](../../tools/assembly_preparation.md).
+[`../preparation/README.md`](../preparation/README.md).
 
 If `-r` is a list name, that entry is moved to the first row of the normalized
 list. If it is a FASTA already present in the list, its entry is moved first.
@@ -174,14 +174,14 @@ With no value it reuses `-q`; an optional value selects another indexed
 assembly list:
 
 ```bash
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 -q query_paths.txt \
   --bed-grouped groupblocks.bed \
   --alternative alternative.fa \
   --find-novel-loci \
   -G graph_work -j 64
 
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 -q query_paths.txt \
   --find-novel-loci discovery_query_paths.txt \
   -G graph_work -j 64
@@ -219,7 +219,7 @@ provided, or when no BED was supplied. `--find-novel-loci` and
 Reference by assembly-list name, automatic blocking:
 
 ```bash
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 \
   -q query_paths.txt \
   -G cohort_graph_work \
@@ -229,7 +229,7 @@ python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
 Reference by FASTA and user-supplied blocks:
 
 ```bash
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r /assemblies/reference.fa \
   -q query_paths.txt \
   -b blocks.bed \
@@ -241,7 +241,7 @@ python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
 Template-defined grouped blocks, with no cohort-wide reference:
 
 ```bash
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -q query_paths.txt \
   --bed-grouped groupblocks.bed \
   -G cohort_graph_work \
@@ -256,7 +256,7 @@ partition template.
 Inspect the DAG without running commands:
 
 ```bash
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 -q query_paths.txt \
   -G cohort_graph_work -j 64 --dry-run
 ```
@@ -265,7 +265,7 @@ To continue directly into cohort variant calling after graph construction,
 give a separate calling output directory with `--continue-cohort-call`:
 
 ```bash
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 -q query_paths.txt \
   -G cohort_graph_work -j 64 \
   --continue-cohort-call cohort_calls \
@@ -357,22 +357,22 @@ k-mer redundancy prefilter, starts cleaning directly with Minimap2, and then
 uses the same alignment policy as `--slow-rigorous`:
 
 ```bash
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 -q query_paths.txt --bed-grouped groupblocks.bed \
   -G graph_work -j 64
 
 # Also generate _linear.txt:
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 -q query_paths.txt --bed-grouped groupblocks.bed \
   -G graph_work -j 64 --fast-mode --linear
 
 # Run both graph aligners for every sequence:
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 -q query_paths.txt --bed-grouped groupblocks.bed \
   -G graph_work -j 64 --slow-rigorous
 
 # Also omit the k-mer redundancy prefilter:
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 -q query_paths.txt --bed-grouped groupblocks.bed \
   -G graph_work -j 64 --max-rigorous
 ```
@@ -423,7 +423,7 @@ in 16-MiB chunks, so the full cohort of partition sample sequences is never
 held in RAM or retained on disk.
 
 ```bash
-python3 scripts/graph_build_snakemake/run_graph_pipeline.py \
+python3 graph_build_snakemake/run_graph_pipeline.py \
   -r CHM13_h1 -q query_paths.txt \
   --bed-grouped grouped_blocks.bed \
   -G graph_work -j 64 \
@@ -573,7 +573,11 @@ summary.complete
 
 `partition_caches.jsonl` is always present and may be empty. Each nonempty
 JSON-line record names its partition and stores the exact text of that
-partition's validated `PARTITIONcache.json`. `--compressgraph` remains accepted
+partition's validated `PARTITIONcache.json`. Packaging warns when fewer caches
+than partitions are stored. `reconstruct_local_graph_folders.py` writes each
+record back as `Graphs/PARTITION/PARTITIONcache.json` and, by default, stops if
+the file is missing or empty, since block partitioning needs the caches; pass
+`--no-partition-caches` to build folders without them. `--compressgraph` remains accepted
 as a deprecated compatibility flag but is no longer needed.
 
 When a packaged graph path is byte-for-byte identical to a contiguous slice of

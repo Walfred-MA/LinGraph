@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import shutil
 import argparse
+import bisect
 import collections as cl
 import gzip
 import math
@@ -63,6 +64,23 @@ _ALIGNMENT_OPERATION_RE = re.compile(r"(\d+)([=MXIDHS])([A-Za-z]*)")
 _ALIGNMENT_HEADER = (
     "hotspot_index", "contig", "start", "end", "strand", "queryname",
     "graph_path", "graphcigar", "refpositions", "qpositions",
+)
+_ALIGNMENT_COMPONENT_RE = re.compile(r"([<>])([^<>]+)")
+_ALIGNMENT_SEGMENT_RE = re.compile(r"([<>])([^:<>]+):([^<>]*)")
+# Final lift stages (see _elect_final_stages).
+FINAL_STAGE_HIGH_COVERAGE = 0.9
+FINAL_STAGE_HIGH_KMER_SIMILARITY = 0.9
+FINAL_STAGE_MIN_COVERAGE = 0.5
+FINAL_STAGE_MIN_KMER_SIMILARITY = 0.5
+FINAL_STAGE_ANCHOR_BONUS = 0.2
+FINAL_STAGE_PROMOTION_MARGIN = 1.5
+FINAL_STAGE_MULTI_MIN_SHARE = 0.1
+FINAL_STAGE_MULTI_MIN_REFERENCE_COVERAGE = 0.5
+FINAL_STAGE_MULTI_MAX_SHARED = 0.5
+FINAL_STAGE_MIN_PATH_COVERAGE = 2_000
+FINAL_STAGE_COLUMNS = (
+    "assignment_stage", "assignment_tier", "location_mapping",
+    "sequence_mapping",
 )
 
 
@@ -130,11 +148,113 @@ def canonical_alignment_allele_name(name: str) -> str:
     )
 
 
-def read_alignment_scores(path: str) -> Dict[str, int]:
-    """Read best complete-graph alignment score for every PA name."""
-    if not path:
+def graph_alignment_affine_score_in_query(
+    graph_cigar: str, query_positions, query_start: int, query_end: int,
+) -> int:
+    """Score only the part of an ``_align.txt`` row inside a query window.
+
+    ``query_positions`` is the row's column 10: the oriented query interval
+    of every graph segment, in segment order.  Query-consuming operations are
+    clipped to ``[query_start, query_end)``; a deletion counts when it lies
+    strictly inside the window.  For the complete query this equals
+    ``graph_alignment_affine_score``.
+    """
+    matches = mismatches = gap_openings = gap_extensions = 0
+    active_gap = ""
+    bodies = [
+        match.group(1)
+        for match in re.finditer(r"[<>][^:<>]+:([^<>]*)", graph_cigar or "")
+    ]
+    if not bodies:
+        return 0
+    if len(bodies) != len(query_positions):
+        raise ValueError(
+            "graph CIGAR segment and query-position counts differ: "
+            f"{len(bodies)}/{len(query_positions)}"
+        )
+    for body, (segment_query_start, _segment_query_end) in zip(
+        bodies, query_positions,
+    ):
+        cursor = segment_query_start
+        for operation_match in _ALIGNMENT_OPERATION_RE.finditer(body):
+            length = int(operation_match.group(1))
+            operation = operation_match.group(2)
+            if length <= 0 or operation == "H":
+                continue
+            if operation == "D":
+                if query_start < cursor < query_end:
+                    if active_gap == "D":
+                        gap_extensions += length
+                    else:
+                        gap_openings += 1
+                        gap_extensions += max(0, length - 1)
+                        active_gap = "D"
+                continue
+            if operation not in {"=", "M", "X", "I"}:
+                continue
+            inside = (
+                min(cursor + length, query_end) - max(cursor, query_start)
+            )
+            cursor += length
+            if inside <= 0:
+                continue
+            if operation == "I":
+                if active_gap == "I":
+                    gap_extensions += inside
+                else:
+                    gap_openings += 1
+                    gap_extensions += max(0, inside - 1)
+                    active_gap = "I"
+                continue
+            active_gap = ""
+            if operation == "X":
+                mismatches += inside
+            else:
+                matches += inside
+    return (
+        matches
+        - 4 * mismatches
+        - 4 * gap_openings
+        - gap_extensions
+    )
+
+
+def read_pa_loci(path: str) -> dict:
+    """Index RefMatch/GenomeLift-input PA loci by (graph, assembly contig)."""
+    loci = cl.defaultdict(list)
+    for parts in iter_rows(path):
+        if parts[0] == "allelename":
+            continue
+        try:
+            contig, start, end, strand = parse_loc(parts[2])
+        except ValueError:
+            continue
+        loci[(allele_matrix_name(parts[0]), contig)].append(
+            (start, end, strand or "+", parts[0])
+        )
+    return {
+        key: (tuple(value[0] for value in values), tuple(values))
+        for key, values in (
+            (key, sorted(values)) for key, values in loci.items()
+        )
+    }
+
+
+def read_alignment_scores(path: str, pa_loci) -> Dict[str, int]:
+    """Score every PA from the ``_align.txt`` row that contains its locus.
+
+    `_align.txt` query names use hotspot-local indices, not GenomeLift PA
+    names, so each PA is matched by locus exactly as graphcigartoref_persample
+    ``locate_alignment_row`` does: same graph and contig, an alignment
+    interval containing the PA, preferring the same strand, then the smallest
+    span.  The PA is scored on its own query sub-interval of that row, so PAs
+    sharing one hotspot alignment are ranked by their own alignment quality.
+    Unaligned (``*``) rows give no score.
+    """
+    if not path or not pa_loci:
         return {}
-    scores: Dict[str, int] = {}
+    best = {}
+    alignment_header = "\t".join(_ALIGNMENT_HEADER)
     with open(path, "rt") as handle:
         for line_number, raw in enumerate(handle, 1):
             if not raw.strip() or raw.startswith("#"):
@@ -147,14 +267,56 @@ def read_alignment_scores(path: str) -> Dict[str, int]:
                     f"{path}:{line_number}: expected ten alignment columns, "
                     f"found {len(fields)}"
                 )
-            allele = fields[5].strip()
-            graph_cigar = fields[7].strip()
-            if not allele or not graph_cigar or graph_cigar == "*":
+            indexed = pa_loci.get((allele_matrix_name(fields[5].strip()),
+                                   fields[1].strip()))
+            if indexed is None:
                 continue
-            score = graph_alignment_affine_score(graph_cigar)
-            for key in (allele, canonical_alignment_allele_name(allele)):
-                scores[key] = max(score, scores.get(key, score))
-    return scores
+            try:
+                row_start, row_end = int(fields[2]), int(fields[3])
+            except ValueError as error:
+                raise ValueError(
+                    f"{path}:{line_number}: invalid alignment interval"
+                ) from error
+            row_strand = fields[4].strip() or "+"
+            aligned = fields[6].strip() not in {"", "*"} and fields[7].strip() not in {"", "*"}
+            starts, loci = indexed
+            query_positions = None
+            index = bisect.bisect_left(starts, row_start)
+            while index < len(loci) and loci[index][0] < row_end:
+                start, end, strand, name = loci[index]
+                index += 1
+                if end > row_end:
+                    continue
+                key = (
+                    0 if row_strand == strand else 1,
+                    row_end - row_start,
+                    row_start,
+                    row_end,
+                    0 if aligned else 1,
+                    line_number,
+                )
+                previous = best.get(name)
+                if previous is not None and previous[0] <= key:
+                    continue
+                score = None
+                if aligned:
+                    if query_positions is None:
+                        query_positions = _parse_alignment_position_list(
+                            fields[9].strip(), f"{path}:{line_number}",
+                        )
+                    if row_strand == "-":
+                        local = (row_end - end, row_end - start)
+                    else:
+                        local = (start - row_start, end - row_start)
+                    score = graph_alignment_affine_score_in_query(
+                        fields[7].strip(), query_positions, *local,
+                    )
+                best[name] = (key, score)
+    return {
+        name: score
+        for name, (_key, score) in best.items()
+        if score is not None
+    }
 
 
 def alignment_score_for_allele(
@@ -783,6 +945,10 @@ class AlleleRecord:
     grouped_query_original_locs: tuple = ()
     grouped_query_left_extensions: tuple = ()
     grouped_query_right_extensions: tuple = ()
+    # Assignment pass used by the exclusive pseudo-linear owner election.
+    # 1: initial mutual sequence match; 2: coordinate-aware tag pass;
+    # 4: distance-normalized tag pass; 3: final positional fallback.
+    assignment_stage: int = 0
 
 
 @dataclass(**DATACLASS_OPTIONS)
@@ -799,6 +965,1444 @@ class FinalLiftRow:
     part_index: int
     left_extension: str
     right_extension: str
+    assignment_stage: int = 0
+    final_stage_present: bool = False
+    # Effective column-16 tier and every reference named by the column-17/18
+    # location and sequence mappings.
+    assignment_tier: str = ""
+    mapped_refs: tuple = ()
+
+
+def final_stage_and_tier(fields):
+    """Effective (stage, tier, present) of a GenomeLift row.
+
+    Columns 15/16 join the location and sequence mappings with ";" (e.g.
+    ``2;3`` / ``primary;secondary``); the primary one is effective, else the
+    first. ``present`` is False for rows without a numeric stage.
+    """
+    stages = (fields[14] if len(fields) > 14 else "").strip().split(";")
+    tiers = (fields[15] if len(fields) > 15 else "").strip().lower().split(";")
+    index = tiers.index("primary") if "primary" in tiers else 0
+    stage_text = stages[index] if index < len(stages) else stages[0]
+    if not stage_text.isdigit():
+        return 0, (tiers[0] if tiers else ""), False
+    return int(stage_text), (tiers[index] if index < len(tiers) else ""), True
+
+
+def final_mapping_refs(fields):
+    """References named by the column-17/18 mappings (tier|refs|interval|score)."""
+    references = []
+    for value in fields[16:18] if len(fields) > 17 else ():
+        parts = value.strip().split("|")
+        if len(parts) >= 2 and parts[1] not in {"", "."}:
+            references.extend(
+                name.strip() for name in parts[1].split(";") if name.strip()
+            )
+    return tuple(dict.fromkeys(references))
+
+
+def final_source_class(fields):
+    """Source RefMatch class: column 17 in 17-column files, else column 7."""
+    if len(fields) == 17 and fields[16].strip() and "|" not in fields[16]:
+        return fields[16].strip()
+    return fields[6].strip()
+
+
+@dataclass
+class FinalStageAssignmentRow:
+    """One materialized GenomeLift row during the final stage election."""
+
+    fields: list
+    allele: str
+    genome: str
+    matrix: str
+    asm_contig: str
+    query_tags: tuple
+    assigned_refs: tuple
+    coordinate_refs: tuple
+    kmer_differences: dict
+    stage2_refs: tuple = ()
+    final_stage: int = 0
+    # Parts of one grouped placement share a claim on their reference run.
+    group_key: str = ""
+    # ``-inf``/``-inf`` rows own no assembly sequence and never claim.
+    placeholder: bool = False
+    # Reference-haplotype rows describe the reference catalog itself.
+    reference_row: bool = False
+    # Assembly locus of this PA (or grouped part), used to find the
+    # containing ``_align.txt`` row: alignment rows are named by hotspot-local
+    # indices that differ from GenomeLift PA names.
+    asm_start: int = 0
+    asm_end: int = 0
+    asm_strand: str = "+"
+    # Source RefMatch class (diagnostic only).
+    source_class: str = ""
+    # part_N of a grouped placement (0 when ungrouped).
+    part_index: int = 0
+    # Columns 17/18: the location (stage 2) and sequence (stage 3/4)
+    # mappings, dict(stage, tier, refs, interval, score); stage 1 sets both.
+    location: dict = None
+    sequence: dict = None
+
+
+def _final_stage_part_value(value: str, part_index: int) -> str:
+    values = value.split(";")
+    if part_index and len(values) >= part_index:
+        return values[part_index - 1].strip()
+    return value.strip()
+
+
+def _final_stage_kmer_differences(fields, part_index: int) -> dict:
+    """Return the minimum RefMatch difference for every named reference."""
+    result = {}
+    if len(fields) > 7:
+        for token in re.split(r"[;,]", fields[7]):
+            token = token.strip()
+            if not token or ":" not in token:
+                continue
+            reference, raw_difference = token.rsplit(":", 1)
+            reference = reference.strip().split("[", 1)[0]
+            try:
+                difference = float(raw_difference)
+            except ValueError:
+                continue
+            if not reference or not math.isfinite(difference) or difference < 0:
+                continue
+            result[reference] = min(
+                difference, result.get(reference, math.inf),
+            )
+
+    best = _final_stage_part_value(fields[1], part_index)
+    if best.endswith("]") and "[" in best:
+        best = best.split("[", 1)[0]
+    try:
+        best_difference = float(fields[5])
+    except (ValueError, IndexError):
+        best_difference = math.inf
+    if (
+        best not in {"", ".", "NA", "na", "None", "none"}
+        and math.isfinite(best_difference)
+        and best_difference >= 0
+    ):
+        result[best] = min(
+            best_difference, result.get(best, math.inf),
+        )
+    return result
+
+
+def _final_stage_anchor_rank(query_tags, reference_options):
+    """Use GenomeLift's exact-then-distance-normalized flank comparison."""
+    for normalized_pass in (0, 1):
+        compared_query = (
+            tuple(normalize_tag(tag, ignore_distance=True) for tag in query_tags)
+            if normalized_pass else query_tags
+        )
+        best = None
+        for mode, raw_pair in reference_options:
+            compared_pair = (
+                tuple(normalize_tag(tag, ignore_distance=True) for tag in raw_pair)
+                if normalized_pass else raw_pair
+            )
+            matches = sum(
+                bool(query and reference and query == reference)
+                for query, reference in zip(compared_query, compared_pair)
+            )
+            if not matches:
+                continue
+            score = (
+                normalized_pass,
+                0 if matches == 2 else 1,
+                0 if str(mode) == "initiated" else 1,
+            )
+            if best is None or score < best:
+                best = score
+        if best is not None:
+            return best
+    return None
+
+
+def _reference_interval_index(ref_alleles):
+    """Build sorted per-graph/per-contig indexes for column-10 lookup."""
+    result = {}
+    for name, reference in ref_alleles.items():
+        key = (allele_matrix_name(name), reference.contig)
+        result.setdefault(key, []).append((
+            reference.start, reference.end, name,
+        ))
+    for key, values in result.items():
+        values.sort(key=lambda value: (value[0], value[1], value[2]))
+        prefix_max_end = []
+        maximum = -1
+        for _start, end, _name in values:
+            maximum = max(maximum, end)
+            prefix_max_end.append(maximum)
+        result[key] = (
+            tuple(value[0] for value in values), tuple(values),
+            tuple(prefix_max_end),
+        )
+    return result
+
+
+def _coordinate_reference_candidates(
+    coordinate: str, matrix: str, interval_index,
+) -> tuple:
+    """Resolve column 10 by overlap without scanning every reference PA."""
+    if not coordinate:
+        return ()
+    try:
+        contig, start, end, _strand = parse_loc(coordinate)
+    except ValueError:
+        return ()
+    starts, intervals, prefix_max_end = interval_index.get(
+        (matrix, contig), ((), (), ()),
+    )
+    stop = bisect.bisect_left(starts, end)
+    candidates = []
+    index = stop - 1
+    while index >= 0 and prefix_max_end[index] > start:
+        ref_start, ref_end, name = intervals[index]
+        overlap = min(end, ref_end) - max(start, ref_start)
+        if overlap > 0:
+            candidates.append((
+                -overlap, ref_end - ref_start, ref_start, ref_end, name,
+            ))
+        index -= 1
+    if not candidates:
+        return ()
+    return (min(candidates)[-1],)
+
+
+def _parse_final_stage_rows(path: str, ref_alleles, targets):
+    """Read the 14 public columns and retain comments for atomic rewriting."""
+    with open(path, "rt") as handle:
+        raw_lines = list(handle)
+    interval_index = _reference_interval_index(targets)
+    parsed = []
+    row_by_line = {}
+    for line_index, raw in enumerate(raw_lines):
+        if not raw.strip() or raw.startswith("#"):
+            continue
+        fields = raw.rstrip("\r\n").split("\t")
+        if fields[0] == "allelename" or fields[0] in {"DEL", "NA"}:
+            continue
+        if len(fields) < 14:
+            raise ValueError(
+                f"{path}:{line_index + 1}: expected at least 14 GenomeLift "
+                f"columns, found {len(fields)}"
+            )
+        # Source RefMatch class (grouped rows show part_N in column 7).
+        # Re-running over staged output replaces columns 15-17.
+        source_class = final_source_class(fields)
+        fields = fields[:14]
+        part_match = re.fullmatch(r"part_(\d+)", fields[6].strip())
+        part_index = int(part_match.group(1)) if part_match else 0
+        try:
+            asm_contig, asm_start, asm_end, asm_strand = parse_loc(
+                _final_stage_part_value(fields[2], part_index)
+            )
+            genome = parse_allele_name(fields[0])[4]
+        except ValueError:
+            continue
+        matrix = allele_matrix_name(fields[0])
+        assigned = tuple(dict.fromkeys(
+            reference.strip()
+            for reference in fields[8].split(";")
+            if reference.strip() in targets
+            and allele_matrix_name(reference.strip()) == matrix
+        ))
+        coordinate = _final_stage_part_value(fields[9], part_index)
+        coordinate_refs = _coordinate_overlapping_references(
+            coordinate, matrix, interval_index,
+        )
+        # Every part of a grouped placement repeats the complete query-locus
+        # list and merged reference interval, so together they identify the
+        # group (the same token graphcigartoref_persample uses).
+        group_key = (
+            "\x1f".join((
+                matrix, asm_contig, fields[9].strip(),
+                fields[2].strip() if ";" in fields[2] else "",
+            ))
+            if part_index else fields[0]
+        )
+        placeholder = (
+            _final_stage_part_value(fields[12], part_index) == "-inf"
+            and _final_stage_part_value(fields[13], part_index) == "-inf"
+        )
+        row = FinalStageAssignmentRow(
+            fields=fields,
+            allele=fields[0],
+            genome=genome,
+            matrix=matrix,
+            asm_contig=asm_contig,
+            query_tags=(fields[10].strip(), fields[11].strip()),
+            assigned_refs=assigned,
+            coordinate_refs=coordinate_refs,
+            kmer_differences=_final_stage_kmer_differences(
+                fields, part_index,
+            ),
+            group_key=group_key,
+            placeholder=placeholder,
+            reference_row=fields[0] in ref_alleles,
+            asm_start=asm_start,
+            asm_end=asm_end,
+            asm_strand=asm_strand or "+",
+            source_class=source_class,
+            part_index=part_index,
+        )
+        parsed.append(row)
+        row_by_line[line_index] = row
+    return raw_lines, parsed, row_by_line
+
+
+def _stage_assignment_coordinates(references, ref_alleles):
+    resolved = tuple(dict.fromkeys(
+        location_refname_for_output(reference, ref_alleles)
+        for reference in references
+        if location_refname_for_output(reference, ref_alleles)
+    ))
+    if not resolved:
+        return (), ""
+    if len(resolved) == 1:
+        return resolved, location_coords_for_output(resolved[0], ref_alleles)
+    coordinates = [ref_alleles[name] for name in resolved if name in ref_alleles]
+    if not coordinates or len({item.contig for item in coordinates}) != 1:
+        return resolved, ""
+    strands = {item.strand for item in coordinates}
+    strand = next(iter(strands)) if len(strands) == 1 else "+"
+    return resolved, format_ref_anchor_interval(
+        coordinates[0].contig,
+        min(item.start for item in coordinates),
+        max(item.end for item in coordinates),
+        strand,
+    )
+
+
+def _merge_intervals(intervals) -> tuple:
+    """Return the sorted union of half-open intervals."""
+    if not intervals:
+        return ()
+    ordered = sorted(intervals)
+    merged = []
+    current_start, current_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            merged.append((current_start, current_end))
+            current_start, current_end = start, end
+    merged.append((current_start, current_end))
+    return tuple(merged)
+
+
+def _parse_alignment_position_list(text: str, context: str) -> list:
+    intervals = []
+    for token in text.split(";"):
+        values = token.split("_")
+        if len(values) != 2:
+            raise ValueError(f"{context}: invalid path interval {token!r}")
+        try:
+            start, end = map(int, values)
+        except ValueError as error:
+            raise ValueError(
+                f"{context}: invalid path interval {token!r}"
+            ) from error
+        if start < 0 or end < start:
+            raise ValueError(f"{context}: invalid path interval {token!r}")
+        intervals.append((start, end))
+    return intervals
+
+
+def read_alignment_projection_rows(path: str, keep_keys=None) -> dict:
+    """Index `_align.txt` rows by (graph, contig) for locus-based lookup.
+
+    `_align.txt` query names use hotspot-local indices that differ from
+    GenomeLift PA names, so a PA is matched to the alignment row whose
+    interval contains its locus, exactly as graphcigartoref_persample does.
+    Only columns 2-7, 9 and 10 are sliced; the graph CIGAR in column 8 is
+    never materialized.  Each retained row is
+    ``(start, end, strand, components)`` where every component is
+    ``(path, orientation, path_start, path_end, query_start, query_end)``
+    in the row's oriented query coordinates.
+    """
+    if not path:
+        return {}
+    keep = set(keep_keys) if keep_keys is not None else None
+    result = {}
+    alignment_header = "\t".join(_ALIGNMENT_HEADER)
+    with open(path, "rt") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip() or raw.startswith("#"):
+                continue
+            line = raw.rstrip("\r\n")
+            if line == alignment_header:
+                continue
+            tabs = [index for index, value in enumerate(line) if value == "\t"]
+            if len(tabs) != len(_ALIGNMENT_HEADER) - 1:
+                raise ValueError(
+                    f"{path}:{line_number}: expected ten alignment columns, "
+                    f"found {len(tabs) + 1}"
+                )
+            query_name = line[tabs[4] + 1:tabs[5]].strip()
+            matrix = allele_matrix_name(query_name)
+            contig = line[tabs[0] + 1:tabs[1]].strip()
+            key = (matrix, contig)
+            if keep is not None and key not in keep:
+                continue
+            context = f"{path}:{line_number}"
+            try:
+                start = int(line[tabs[1] + 1:tabs[2]])
+                end = int(line[tabs[2] + 1:tabs[3]])
+            except ValueError as error:
+                raise ValueError(f"{context}: invalid alignment interval") from error
+            strand = line[tabs[3] + 1:tabs[4]].strip() or "+"
+            graph_path = line[tabs[5] + 1:tabs[6]].strip()
+            ref_positions = line[tabs[7] + 1:tabs[8]].strip()
+            query_positions = line[tabs[8] + 1:].strip()
+            components = ()
+            if (
+                graph_path not in {"", "*"}
+                and ref_positions not in {"", "."}
+                and query_positions not in {"", "."}
+            ):
+                paths = _ALIGNMENT_COMPONENT_RE.findall(graph_path)
+                path_intervals = _parse_alignment_position_list(
+                    ref_positions, context,
+                )
+                query_intervals = _parse_alignment_position_list(
+                    query_positions, context,
+                )
+                if not (len(paths) == len(path_intervals) == len(query_intervals)):
+                    raise ValueError(
+                        f"{context}: graph path, reference-position, and "
+                        "query-position column counts do not match"
+                    )
+                components = tuple(
+                    (name, orientation, path_start, path_end,
+                     query_start, query_end)
+                    for (orientation, name), (path_start, path_end),
+                    (query_start, query_end)
+                    in zip(paths, path_intervals, query_intervals)
+                )
+            result.setdefault(key, []).append((start, end, strand, components))
+    return result
+
+
+def _select_containing_alignment(rows, start: int, end: int, strand: str):
+    """Mirror graphcigartoref_persample.locate_alignment_row's interval rule."""
+    candidates = [
+        (
+            0 if row[2] == strand else 1,
+            row[1] - row[0],
+            row[0],
+            row[1],
+            0 if row[3] else 1,
+            order,
+            row,
+        )
+        for order, row in enumerate(rows)
+        if row[0] <= start and row[1] >= end
+    ]
+    return min(candidates)[-1] if candidates else None
+
+
+def project_locus_path_intervals(
+    alignment_rows, matrix: str, contig: str, start: int, end: int,
+    strand: str,
+) -> dict:
+    """Project one PA locus onto graph-path intervals of its alignment row.
+
+    The PA's oriented query sub-interval is clipped against every component's
+    query range (column 10) and mapped linearly onto that component's path
+    range (column 9), respecting ``<`` traversal.  A PA that is only part of a
+    longer hotspot alignment is therefore not credited with its neighbours'
+    path intervals.
+    """
+    if end <= start:
+        return {}
+    row = _select_containing_alignment(
+        alignment_rows.get((matrix, contig), ()), start, end, strand,
+    )
+    if row is None or not row[3]:
+        return {}
+    row_start, row_end, row_strand, components = row
+    if row_strand == "-":
+        local_start, local_end = row_end - end, row_end - start
+    else:
+        local_start, local_end = start - row_start, end - row_start
+    intervals_by_path = {}
+    for name, orientation, path_start, path_end, query_start, query_end in components:
+        clipped_start = max(query_start, local_start)
+        clipped_end = min(query_end, local_end)
+        if clipped_end <= clipped_start or query_end <= query_start:
+            continue
+        scale = (path_end - path_start) / (query_end - query_start)
+        offset_start = (clipped_start - query_start) * scale
+        offset_end = (clipped_end - query_start) * scale
+        if orientation == "<":
+            projected = (path_end - offset_end, path_end - offset_start)
+        else:
+            projected = (path_start + offset_start, path_start + offset_end)
+        projected_start = max(path_start, int(round(projected[0])))
+        projected_end = min(path_end, int(round(projected[1])))
+        if projected_end > projected_start:
+            intervals_by_path.setdefault(name, []).append(
+                (projected_start, projected_end)
+            )
+    return {
+        name: _merge_intervals(intervals)
+        for name, intervals in intervals_by_path.items()
+    }
+
+
+def _reference_path_interval_index(reference_intervals) -> dict:
+    """Index reference-PA graph-path intervals by path name.
+
+    ``reference_intervals`` maps each reference PA to the graph-path
+    intervals projected from the reference haplotype's ``_align.txt``.  Each
+    path maps to sorted ``(start, end, reference)`` tuples plus a prefix
+    maximum of ends, so a query interval finds every overlapping reference PA
+    by binary search.
+    """
+    by_path = cl.defaultdict(list)
+    for reference, intervals_by_path in reference_intervals.items():
+        for path_name, intervals in intervals_by_path.items():
+            for start, end in intervals:
+                by_path[path_name].append((start, end, reference))
+    result = {}
+    for path_name, values in by_path.items():
+        values.sort(key=lambda value: (value[0], value[1], value[2]))
+        prefix_max_end = []
+        maximum = -1
+        for _start, end, _reference in values:
+            maximum = max(maximum, end)
+            prefix_max_end.append(maximum)
+        result[path_name] = (
+            tuple(value[0] for value in values),
+            tuple(values),
+            tuple(prefix_max_end),
+        )
+    return result
+
+
+def reference_pa_path_intervals(reference_alignments: str, eligible) -> dict:
+    """Project every eligible reference PA onto the reference alignments."""
+    keys = {
+        (allele_matrix_name(name), reference.contig)
+        for name, reference in eligible.items()
+    }
+    alignment_rows = read_alignment_projection_rows(reference_alignments, keys)
+    result = {}
+    for name, reference in eligible.items():
+        intervals = project_locus_path_intervals(
+            alignment_rows, allele_matrix_name(name), reference.contig,
+            reference.start, reference.end, reference.strand or "+",
+        )
+        if intervals:
+            result[name] = intervals
+    return result
+
+
+def _stage4_reference_coverages(
+    row, path_intervals, reference_path_index,
+) -> dict:
+    """Sum query/reference-PA overlap on the graph paths both aligned to.
+
+    Query and reference intervals are in the same path-local coordinates, so
+    overlap is measured directly on each shared graph path, whichever
+    haplotype's path it is.  Only same-graph reference PAs are scored.
+    """
+    coverages = cl.defaultdict(int)
+    for path_name, query_intervals in path_intervals.items():
+        indexed = reference_path_index.get(path_name)
+        if indexed is None:
+            continue
+        reference_starts, references, reference_prefix_max_end = indexed
+        for query_start, query_end in query_intervals:
+            stop = bisect.bisect_left(reference_starts, query_end)
+            index = stop - 1
+            while (
+                index >= 0
+                and reference_prefix_max_end[index] > query_start
+            ):
+                ref_start, ref_end, reference = references[index]
+                overlap = min(query_end, ref_end) - max(
+                    query_start, ref_start,
+                )
+                if (
+                    overlap > 0
+                    and allele_matrix_name(reference) == row.matrix
+                ):
+                    coverages[reference] += overlap
+                index -= 1
+    return dict(coverages)
+
+
+def _target_references(ref_alleles) -> dict:
+    """Every reference PA with its own locus, including -inf placeholders."""
+    return {
+        name: reference
+        for name, reference in ref_alleles.items()
+        if allele_belongs_to_genome(name, reference.genome)
+        and not reference.delegate_only
+    }
+
+
+def _coordinate_overlapping_references(
+    coordinate: str, matrix: str, interval_index,
+) -> tuple:
+    """Return every same-graph reference PA overlapping a column-10 interval."""
+    if not coordinate:
+        return ()
+    try:
+        contig, start, end, _strand = parse_loc(coordinate)
+    except ValueError:
+        return ()
+    starts, intervals, prefix_max_end = interval_index.get(
+        (matrix, contig), ((), (), ()),
+    )
+    index = bisect.bisect_left(starts, end) - 1
+    names = []
+    while index >= 0 and prefix_max_end[index] > start:
+        ref_start, ref_end, name = intervals[index]
+        if min(end, ref_end) - max(start, ref_start) > 0:
+            names.append(name)
+        index -= 1
+    return tuple(sorted(names))
+
+
+def _slice_alignment_row(fields, window_start: int, window_end: int) -> dict:
+    """Exact path intervals of one query window of an ``_align.txt`` row.
+
+    The graph CIGAR (column 8) is walked component by component from each
+    component's query start (column 10) and path range (column 9; ``<``
+    components run backwards). Only =/X/M bases inside the window are kept;
+    I/S (including flanks) and D contribute no shared base.
+    """
+    segments = _ALIGNMENT_SEGMENT_RE.findall(fields[7])
+    try:
+        path_ranges = _parse_alignment_position_list(fields[8], "refpositions")
+        query_ranges = _parse_alignment_position_list(fields[9], "qpositions")
+    except ValueError:
+        return {}
+    if not (len(segments) == len(path_ranges) == len(query_ranges)):
+        return {}
+    intervals = cl.defaultdict(list)
+    for (orientation, path, body), (path_start, path_end), (query_start, _query_end) in zip(
+        segments, path_ranges, query_ranges,
+    ):
+        query_cursor = query_start
+        path_cursor = path_start if orientation == ">" else path_end
+        for length_text, operation, _payload in _ALIGNMENT_OPERATION_RE.findall(body):
+            length = int(length_text)
+            if operation in {"=", "X", "M"}:
+                clip_start = max(query_cursor, window_start)
+                clip_end = min(query_cursor + length, window_end)
+                if clip_end > clip_start:
+                    if orientation == ">":
+                        span = (path_cursor + clip_start - query_cursor,
+                                path_cursor + clip_end - query_cursor)
+                    else:
+                        span = (path_cursor - (clip_end - query_cursor),
+                                path_cursor - (clip_start - query_cursor))
+                    intervals[path].append(span)
+                query_cursor += length
+                path_cursor += length if orientation == ">" else -length
+            elif operation in {"I", "S"}:
+                query_cursor += length
+            elif operation == "D":
+                path_cursor += length if orientation == ">" else -length
+    return {path: _merge_intervals(values) for path, values in intervals.items()}
+
+
+def read_exact_pa_path_intervals(path: str, loci) -> dict:
+    """Slice every PA from the ``_align.txt`` row containing its locus.
+
+    ``loci`` maps a PA name to ``(graph, contig, start, end, strand)``.
+    Alignment rows are matched by locus, never by name (their query names use
+    hotspot-local indices): same graph and contig, the row interval contains
+    the PA, preferring the same strand, then the smallest span, as
+    graphcigartoref_persample.locate_alignment_row. The file is streamed; only
+    the selected PA slices are kept.
+    """
+    if not path or not loci:
+        return {}
+    by_key = cl.defaultdict(list)
+    for name, (matrix, contig, start, end, strand) in loci.items():
+        by_key[(matrix, contig)].append((start, end, strand or "+", name))
+    indexed = {}
+    for key, values in by_key.items():
+        values.sort()
+        indexed[key] = ([value[0] for value in values], values)
+    best = {}
+    with open(path, "rt") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            if not raw.strip() or raw.startswith("#"):
+                continue
+            fields = raw.rstrip("\r\n").split("\t")
+            if len(fields) != len(_ALIGNMENT_HEADER) or tuple(fields) == _ALIGNMENT_HEADER:
+                continue
+            entry = indexed.get((allele_matrix_name(fields[5].strip()), fields[1].strip()))
+            if entry is None:
+                continue
+            try:
+                row_start, row_end = int(fields[2]), int(fields[3])
+            except ValueError:
+                continue
+            row_strand = fields[4].strip() or "+"
+            aligned = (
+                fields[6].strip() not in {"", "*"}
+                and fields[7].strip() not in {"", "*"}
+            )
+            starts, values = entry
+            index = bisect.bisect_left(starts, row_start)
+            while index < len(values) and values[index][0] < row_end:
+                start, end, strand, name = values[index]
+                index += 1
+                if end > row_end:
+                    continue
+                rank = (
+                    0 if row_strand == strand else 1, row_end - row_start,
+                    row_start, row_end, 0 if aligned else 1, line_number,
+                )
+                if name in best and best[name][0] <= rank:
+                    continue
+                sliced = {}
+                if aligned:
+                    window = (
+                        (row_end - end, row_end - start) if row_strand == "-"
+                        else (start - row_start, end - row_start)
+                    )
+                    sliced = _slice_alignment_row(fields, *window)
+                best[name] = (rank, sliced)
+    return {name: sliced for name, (_rank, sliced) in best.items()}
+
+
+def _reference_overlap_intervals(query_intervals, reference_index, matrix) -> dict:
+    """Map each same-graph reference PA to its overlap with the query slice."""
+    overlaps = cl.defaultdict(list)
+    for path_name, intervals in query_intervals.items():
+        indexed = reference_index.get(path_name)
+        if indexed is None:
+            continue
+        starts, references, prefix_max_end = indexed
+        for query_start, query_end in intervals:
+            index = bisect.bisect_left(starts, query_end) - 1
+            while index >= 0 and prefix_max_end[index] > query_start:
+                ref_start, ref_end, reference = references[index]
+                start = max(query_start, ref_start)
+                end = min(query_end, ref_end)
+                if end > start and allele_matrix_name(reference) == matrix:
+                    overlaps[reference].append((path_name, start, end))
+                index -= 1
+    return overlaps
+
+
+def _union_overlap(overlaps, references) -> int:
+    """Query bases overlapping any reference PA of a (multi-matching) set."""
+    by_path = cl.defaultdict(list)
+    for reference in references:
+        for path_name, start, end in overlaps.get(reference, ()):
+            by_path[path_name].append((start, end))
+    return sum(
+        end - start
+        for intervals in by_path.values()
+        for start, end in _merge_intervals(intervals)
+    )
+
+
+def _fill_reference_run(members, targets, interval_index, available):
+    """Extend a reference set to its whole run, filling gaps.
+
+    Same-graph reference PAs lying mostly (>= half of their length) inside
+    the members' span on the same contig join the run, provided they have
+    graph-path intervals in the reference ``_align.txt`` (``available``).
+    Returns None when the members are not on one graph and contig.
+    """
+    if any(name not in targets for name in members):
+        return None
+    references = [targets[name] for name in members]
+    matrices = {allele_matrix_name(name) for name in members}
+    contigs = {reference.contig for reference in references}
+    if len(matrices) != 1 or len(contigs) != 1:
+        return None
+    matrix, contig = next(iter(matrices)), next(iter(contigs))
+    start = min(reference.start for reference in references)
+    end = max(reference.end for reference in references)
+    filled = set(members)
+    for name in _coordinate_overlapping_references(
+        f"{contig}:{start}-{end}", matrix, interval_index,
+    ):
+        if name in filled or name not in targets or name not in available:
+            continue
+        other = targets[name]
+        inside = min(end, other.end) - max(start, other.start)
+        if inside * 2 >= max(1, other.end - other.start):
+            filled.add(name)
+    return tuple(sorted(filled))
+
+
+def _elect_final_stages(
+    rows, ref_alleles, targets, overlaps_by_row, merged_spans=None,
+    available=None,
+):
+    """Four-stage lift election per genome, on query units.
+
+    A unit is either one query PA, or a merged query: all parts of one
+    GenomeLift grouped placement (part_N rows) or one query placed on several
+    references (a multi-reference column 9). A merged query is scored as one
+    unit against its merged reference. Gaps are part of both intervals: the
+    merged reference is the whole run of its references
+    (_fill_reference_run), and the merged query is the span from its first to
+    its last part, sliced from the alignment row containing it
+    (``merged_spans``; the parts' own slices when no row contains the span).
+    Coverage is the overlap of the merged query with the merged reference
+    divided by the merged query length; the unit is anchored by its column-9
+    placement and has no k-mer similarity. Every part receives the unit's
+    stage, tier and references.
+
+    A single query PA is scored against single reference PAs and one
+    coverage-based multi-matching set: the references each covering >=
+    FINAL_STAGE_MULTI_MIN_SHARE of the query and >=
+    FINAL_STAGE_MULTI_MIN_REFERENCE_COVERAGE of their own length (paralogs
+    covering the same query bases excluded), filled to their whole run
+    (_fill_reference_run). Similarity is 1 - the RefMatch k-mer difference
+    (best member of a set). A candidate is anchored when a member is named in
+    column 9, overlaps the column-10 interval, or matches the query's
+    propagated anchor tags.
+
+    Lifting has two sources that may disagree: location (anchors) and
+    sequence (k-mer similarity, coverage). Each row gets a location mapping
+    and/or a sequence mapping:
+
+      1  location and sequence agree: coverage >= 0.9 and similarity >= 0.9
+         after a +0.2 anchor bonus to both, the unit's highest-similarity
+         candidate. Fills both mappings.
+      2  location: the unit's anchors, with no coverage or k-mer condition.
+         GenomeLift's positional column 9 (a merged query's gap-filled run),
+         else its column-10 interval (the references inside it, possibly
+         none), else the best propagated-tag match. Units competing for a
+         location are ordered by coverage on it; the first is primary.
+      3  sequence. Beside a stage-2 location (each query PA, merged-query
+         members included): its best k-mer reference at similarity >= 0.9
+         when that disagrees with the location. It is a duplicate unless
+         the location is a duplicate, the best distance is 1.5x clear of the
+         second and the reference is unclaimed; then it is primary and the
+         location is dropped (translocation). Without a location: coverage
+         >= 0.5 or similarity > 0.5, promoted to primary when the reference
+         is unclaimed and the best overlap exceeds 1.5x the second (or 1.5x
+         the best distance is below the second); otherwise a duplicate.
+      4  sequence, without stages 1-3: >= 2,000 overlapping bases, duplicate.
+
+    Each reference PA is claimed by one primary mapping. A set claims only
+    the references it matched, not the gap references filled between them
+    (those count for coverage and column 9 only). Units owning no sequence
+    (all parts -inf/-inf) may hold a stage-2 location but never a primary
+    sequence mapping.
+    """
+    reference_tag_pairs = reference_tag_pair_options(
+        ref_alleles, ignore_distance=False,
+    )
+    interval_index = _reference_interval_index(targets)
+    merged_spans = merged_spans or {}
+    available = set(targets) if available is None else available
+    rows_by_genome = cl.defaultdict(list)
+    for row in rows:
+        rows_by_genome[row.genome].append(row)
+
+    def single_unit(row):
+        length = max(1, row.asm_end - row.asm_start)
+        overlaps = overlaps_by_row.get(row.allele, {})
+        overlap_bp = {
+            reference: _union_overlap(overlaps, (reference,))
+            for reference in overlaps
+        }
+        similarity = {
+            reference: 1.0 - difference
+            for reference, difference in row.kmer_differences.items()
+            if reference in targets
+            and allele_matrix_name(reference) == row.matrix
+        }
+        singles = set(overlap_bp) | set(similarity)
+        anchored = set(row.assigned_refs) | set(row.coordinate_refs)
+        for reference in singles:
+            if _final_stage_anchor_rank(
+                row.query_tags, reference_tag_pairs.get(reference, ()),
+            ) is not None:
+                anchored.add(reference)
+        candidate_sets = {(reference,) for reference in singles}
+        claims = {}
+        eligible = sorted((
+            reference for reference, value in overlap_bp.items()
+            if value >= FINAL_STAGE_MULTI_MIN_SHARE * length
+            and value >= FINAL_STAGE_MULTI_MIN_REFERENCE_COVERAGE * max(
+                1, targets[reference].end - targets[reference].start,
+            )
+        ), key=lambda reference: (-overlap_bp[reference], reference))
+        # A single-to-many neighbour covers other query bases; a paralog
+        # (sharing the graph path) covers the same ones. From the largest
+        # overlap down, a reference joins only when at most
+        # FINAL_STAGE_MULTI_MAX_SHARED of its overlap is already covered by
+        # the members chosen so far.
+        chosen = []
+        for reference in eligible:
+            added = (
+                _union_overlap(overlaps, chosen + [reference])
+                - _union_overlap(overlaps, chosen)
+            )
+            if (
+                not chosen
+                or overlap_bp[reference] - added
+                <= FINAL_STAGE_MULTI_MAX_SHARED * overlap_bp[reference]
+            ):
+                chosen.append(reference)
+        shared = tuple(sorted(chosen))
+        if len(shared) > 1:
+            filled = _fill_reference_run(
+                shared, targets, interval_index, available,
+            )
+            if filled:
+                candidate_sets.add(filled)
+                # Gap references count for coverage only; the unit claims
+                # just the references it matched.
+                claims[filled] = shared
+        candidates = []
+        for members in candidate_sets:
+            coverage = _union_overlap(overlaps, members) / length
+            best_similarity = max(
+                (similarity.get(reference, 0.0) for reference in members),
+                default=0.0,
+            )
+            bonus = (
+                FINAL_STAGE_ANCHOR_BONUS
+                if anchored.intersection(members) else 0.0
+            )
+            candidates.append(dict(
+                members=members, coverage=coverage,
+                similarity=best_similarity, anchored=bool(bonus),
+                effective_coverage=coverage + bonus,
+                effective_similarity=best_similarity + bonus,
+            ))
+        units = [
+            ((reference,), value) for reference, value in overlap_bp.items()
+        ] + [
+            (members, _union_overlap(overlaps, members)) for members in claims
+        ]
+        units.sort(key=lambda item: (-item[1], item[0]))
+        # Location: GenomeLift's positional placement (column 9, else its
+        # column-10 interval), else the best propagated-tag match.
+        coordinate = _final_stage_part_value(row.fields[9], row.part_index)
+        location = None
+        if row.assigned_refs:
+            location = dict(refs=tuple(row.assigned_refs),
+                            interval=coordinate, source="col9")
+        elif coordinate:
+            location = dict(refs=tuple(row.coordinate_refs),
+                            interval=coordinate, source="col10")
+        else:
+            ranks = {}
+            for reference in singles:
+                rank = _final_stage_anchor_rank(
+                    row.query_tags, reference_tag_pairs.get(reference, ()),
+                )
+                if rank is not None:
+                    ranks[reference] = rank
+            if ranks:
+                best_rank = min(ranks.values())
+                location = dict(refs=tuple(sorted(
+                    reference for reference, rank in ranks.items()
+                    if rank == best_rank
+                )), interval="", source="tags")
+        return dict(
+            rows=[row], key=row.group_key, name=row.allele,
+            placeholder=row.placeholder, length=length,
+            similarity=similarity, candidates=candidates, units=units,
+            claims=claims, merged=False, location=location,
+            overlap=lambda references: _union_overlap(overlaps, references),
+        )
+
+    def merged_unit(unit_rows):
+        named = tuple(sorted({
+            reference for row in unit_rows for reference in row.assigned_refs
+        }))
+        references = _fill_reference_run(
+            named, targets, interval_index, available,
+        ) or named
+        span = merged_spans.get(unit_rows[0].group_key)
+        outside = cl.Counter()
+        if span is not None:
+            span_key, length = span
+            overlaps = overlaps_by_row.get(span_key, {})
+
+            def overlap_of(members):
+                return _union_overlap(overlaps, members)
+
+            for reference in overlaps:
+                if reference not in references:
+                    outside[reference] = _union_overlap(overlaps, (reference,))
+        else:
+            length = sum(max(1, row.asm_end - row.asm_start) for row in unit_rows)
+
+            def overlap_of(members):
+                return sum(
+                    _union_overlap(overlaps_by_row.get(row.allele, {}), members)
+                    for row in unit_rows
+                )
+
+            for row in unit_rows:
+                overlaps = overlaps_by_row.get(row.allele, {})
+                for reference in overlaps:
+                    if reference not in references:
+                        outside[reference] += _union_overlap(
+                            overlaps, (reference,),
+                        )
+        overlap = overlap_of(references)
+        length = max(1, length)
+        # Location: the grouped placement's column 9 (gap-filled) and its
+        # merged column-10 interval; without a same-graph column 9, the
+        # references inside that interval.
+        coordinate = _final_stage_part_value(
+            unit_rows[0].fields[9], unit_rows[0].part_index,
+        )
+        location_refs = references or tuple(sorted({
+            reference for row in unit_rows for reference in row.coordinate_refs
+        }))
+        location = (
+            dict(refs=location_refs, interval=coordinate, source="col9")
+            if location_refs or coordinate else None
+        )
+        coverage = overlap / length
+        units = [(references, overlap)] + [
+            ((reference,), value) for reference, value in outside.items()
+        ]
+        units.sort(key=lambda item: (-item[1], item[0]))
+        return dict(
+            rows=list(unit_rows), key=unit_rows[0].group_key,
+            name=min(row.allele for row in unit_rows),
+            placeholder=all(row.placeholder for row in unit_rows),
+            length=length, similarity={},
+            candidates=[dict(
+                members=references, coverage=coverage, similarity=0.0,
+                anchored=True,
+                effective_coverage=coverage + FINAL_STAGE_ANCHOR_BONUS,
+                effective_similarity=FINAL_STAGE_ANCHOR_BONUS,
+            )] if references else [],
+            # Gap references count for coverage only; the unit claims just
+            # its column-9 references.
+            units=units, claims={references: named}, merged=True,
+            location=location, overlap=overlap_of,
+        )
+
+    for genome_rows in rows_by_genome.values():
+        units = []
+        grouped = cl.defaultdict(list)
+        for row in genome_rows:
+            if row.reference_row:
+                if row.allele in row.assigned_refs:
+                    mapping = dict(
+                        stage=1, tier="primary", refs=(row.allele,),
+                        interval=row.fields[9].strip(), score="reference",
+                    )
+                    row.location, row.sequence = mapping, dict(mapping)
+            elif row.part_index or len(row.assigned_refs) > 1:
+                grouped[row.group_key].append(row)
+            else:
+                units.append(single_unit(row))
+        units.extend(merged_unit(unit_rows) for unit_rows in grouped.values())
+
+        # Reference PA -> claiming key (a unit's key, or a PA name for a
+        # member's own stage-3 sequence mapping).
+        claimed = {}
+
+        def claim_set(unit, members):
+            return unit["claims"].get(tuple(members), tuple(members))
+
+        def free(key, references):
+            return all(
+                claimed.get(reference, key) == key for reference in references
+            )
+
+        def claim(key, references):
+            for reference in references:
+                claimed[reference] = key
+
+        def prefix(unit, rule):
+            return ("merged_" if unit["merged"] else "") + rule
+
+        def mapped(unit):
+            row = unit["rows"][0]
+            return row.location is not None or row.sequence is not None
+
+        def set_sequence(unit, members, stage, tier, score):
+            for row in unit["rows"]:
+                row.sequence = dict(
+                    stage=stage, tier=tier, refs=tuple(members), interval="",
+                    score=prefix(unit, score),
+                )
+            if tier == "primary":
+                claim(unit["key"], claim_set(unit, members))
+
+        def candidate_score(candidate):
+            return (
+                f"cov={candidate['coverage']:.3f},"
+                f"sim={candidate['similarity']:.3f},"
+                f"anchored={int(candidate['anchored'])}"
+            )
+
+        # Stage 1: sequence and location agree (anchor bonus); the unit's
+        # highest-similarity candidate. Fills both mappings.
+        stage1 = []
+        for unit in units:
+            if unit["placeholder"]:
+                continue
+            passing = [
+                candidate for candidate in unit["candidates"]
+                if candidate["effective_coverage"] >= FINAL_STAGE_HIGH_COVERAGE
+                and candidate["effective_similarity"]
+                >= FINAL_STAGE_HIGH_KMER_SIMILARITY
+            ]
+            if passing:
+                best = max(passing, key=lambda candidate: (
+                    candidate["effective_similarity"],
+                    candidate["effective_coverage"],
+                    -len(candidate["members"]),
+                ))
+                stage1.append((
+                    -best["effective_similarity"], -best["effective_coverage"],
+                    unit["name"], unit, best,
+                ))
+        for *_key, unit, best in sorted(stage1, key=lambda item: item[:3]):
+            if free(unit["key"], claim_set(unit, best["members"])):
+                score = prefix(unit, "high_confidence,") + candidate_score(best)
+                for row in unit["rows"]:
+                    row.location = dict(
+                        stage=1, tier="primary", refs=tuple(best["members"]),
+                        interval="", score=score,
+                    )
+                    row.sequence = dict(row.location)
+                claim(unit["key"], claim_set(unit, best["members"]))
+
+        # Stage 2: location by anchors, no coverage or k-mer condition.
+        # Units competing for a location are ordered by coverage on it.
+        stage2 = []
+        for unit in units:
+            if mapped(unit) or unit["location"] is None:
+                continue
+            location = unit["location"]
+            coverage = unit["overlap"](location["refs"]) / unit["length"]
+            stage2.append((-coverage, unit["name"], unit, location, coverage))
+        for _coverage, _name, unit, location, coverage in sorted(
+            stage2, key=lambda item: item[:2],
+        ):
+            references = claim_set(unit, location["refs"])
+            tier = "primary" if free(unit["key"], references) else "secondary"
+            if tier == "primary":
+                claim(unit["key"], references)
+            for row in unit["rows"]:
+                row.location = dict(
+                    stage=2, tier=tier, refs=tuple(location["refs"]),
+                    interval=location["interval"],
+                    score=prefix(unit, f"anchor,source={location['source']},"
+                                       f"cov={coverage:.3f}"),
+                )
+
+        # Stage 3 beside a location: each query PA's own k-mer best
+        # reference (>= 0.9) where it disagrees with the location. Primary
+        # only when the location is a duplicate, the best distance is 1.5x
+        # clear of the second and the reference is unclaimed; the location
+        # is then dropped (translocation).
+        hard = []
+        for unit in units:
+            for row in unit["rows"]:
+                if row.location is None or row.location["stage"] != 2:
+                    continue
+                by_distance = sorted(
+                    (difference, reference)
+                    for reference, difference in row.kmer_differences.items()
+                    if reference in targets
+                    and allele_matrix_name(reference) == row.matrix
+                )
+                if (
+                    not by_distance
+                    or 1.0 - by_distance[0][0] < FINAL_STAGE_HIGH_KMER_SIMILARITY
+                    or by_distance[0][1] in row.location["refs"]
+                ):
+                    continue
+                second = by_distance[1][0] if len(by_distance) > 1 else math.inf
+                hard.append((by_distance[0][0], row.allele, unit, row,
+                             by_distance[0][1], second))
+        for distance, _name, unit, row, reference, second in sorted(
+            hard, key=lambda item: item[:2],
+        ):
+            clear = FINAL_STAGE_PROMOTION_MARGIN * distance < second
+            tier = (
+                "primary"
+                if row.location["tier"] == "secondary" and clear
+                and not row.placeholder and free(row.allele, (reference,))
+                else "secondary"
+            )
+            row.sequence = dict(
+                stage=3, tier=tier, refs=(reference,), interval="",
+                score=f"kmer_high,sim={1.0 - distance:.3f},"
+                      f"dist={distance:.4f},second_dist={second:.4f}",
+            )
+            if tier == "primary":
+                claim(row.allele, (reference,))
+                row.location = None
+
+        # Stage 3 without a location: coverage >= 0.5 or similarity > 0.5;
+        # promote a clear unclaimed best reference, otherwise a duplicate.
+        stage3 = []
+        for unit in units:
+            if mapped(unit):
+                continue
+            unit_overlaps = unit["units"]
+            by_distance = sorted(
+                ((1.0 - value, reference)
+                 for reference, value in unit["similarity"].items()),
+            )
+            coverage_unit = (
+                unit_overlaps[0][0]
+                if unit_overlaps and unit_overlaps[0][1] / unit["length"]
+                >= FINAL_STAGE_MIN_COVERAGE else None
+            )
+            kmer_unit = (
+                (by_distance[0][1],)
+                if by_distance
+                and 1.0 - by_distance[0][0] > FINAL_STAGE_MIN_KMER_SIMILARITY
+                else None
+            )
+            if coverage_unit is None and kmer_unit is None:
+                continue
+            promotable = promoted_route = None
+            routes = {}
+            if coverage_unit is not None:
+                # A set's own members do not compete with it.
+                second = max((
+                    value for members, value in unit_overlaps[1:]
+                    if not set(members) <= set(coverage_unit)
+                ), default=0)
+                routes["coverage"] = (
+                    f"cov={unit_overlaps[0][1] / unit['length']:.3f},"
+                    f"second_cov={second / unit['length']:.3f}"
+                )
+                if unit_overlaps[0][1] > FINAL_STAGE_PROMOTION_MARGIN * second:
+                    promotable, promoted_route = coverage_unit, "coverage"
+            if kmer_unit is not None:
+                second = by_distance[1][0] if len(by_distance) > 1 else math.inf
+                routes["kmer"] = (
+                    f"dist={by_distance[0][0]:.4f},second_dist={second:.4f}"
+                )
+                if (
+                    promotable is None
+                    and FINAL_STAGE_PROMOTION_MARGIN * by_distance[0][0] < second
+                ):
+                    promotable, promoted_route = kmer_unit, "kmer"
+            selected = coverage_unit if coverage_unit is not None else kmer_unit
+            chosen = promotable or selected
+            stage3.append((
+                -dict(unit_overlaps).get(chosen, 0),
+                1.0 - max(
+                    (unit["similarity"].get(reference, 0.0)
+                     for reference in chosen), default=0.0,
+                ),
+                unit["name"], unit, promotable, selected, routes,
+                promoted_route, "coverage" if coverage_unit else "kmer",
+            ))
+        for *_key, unit, promotable, selected, routes, promoted_route, \
+                selected_route in sorted(
+            stage3, key=lambda item: item[:3],
+        ):
+            if (
+                promotable is not None and not unit["placeholder"]
+                and free(unit["key"], claim_set(unit, promotable))
+            ):
+                set_sequence(unit, promotable, 3, "primary",
+                             f"{promoted_route},{routes[promoted_route]}")
+            else:
+                reason = (
+                    "placeholder" if unit["placeholder"] and promotable
+                    else "claimed" if promotable else "unclear"
+                )
+                set_sequence(
+                    unit, selected, 3, "secondary",
+                    f"{selected_route},{routes[selected_route]},reason={reason}",
+                )
+
+        # Stage 4: >= 2,000 overlapping bases, always a duplicate (sequence).
+        for unit in units:
+            if mapped(unit):
+                continue
+            unit_overlaps = unit["units"]
+            if (
+                unit_overlaps
+                and unit_overlaps[0][1] >= FINAL_STAGE_MIN_PATH_COVERAGE
+            ):
+                set_sequence(
+                    unit, unit_overlaps[0][0], 4, "secondary",
+                    f"overlap,overlap_bp={unit_overlaps[0][1]},"
+                    f"cov={unit_overlaps[0][1] / unit['length']:.3f}",
+                )
+
+
+def finalize_lift_stages(
+    path: str,
+    ref_alleles,
+    alignments: str = "",
+    reference_alignments: str = "",
+):
+    """Elect final mappings, rewrite columns 9/10 and 15-18, return counts.
+
+    Coverage needs both ``alignments`` (the sample ``_align.txt``) and
+    ``reference_alignments`` (the reference haplotype ``_align.txt``); PAs are
+    matched to alignment rows by locus, never by name.
+
+      9/10   the primary mapping's references and interval (the location
+             when neither mapping is primary)
+      15/16  stage and tier of the location and sequence mappings, joined
+             with ";" in that order (``2;3`` / ``primary;secondary``);
+             stage 1 is ``1`` / ``primary``; ``0`` / "" when unmapped
+      17     location mapping (stage 1/2): ``tier|references|interval|score``
+      18     sequence mapping (stage 1/3/4), same format
+             (``.`` when absent; references ;-joined; score starts with the
+             rule: high_confidence, anchor, kmer_high, coverage, kmer,
+             overlap, reference; merged_ for merged queries)
+
+    Counts are by the stage shown in columns 9/10.
+    """
+    targets = _target_references(ref_alleles)
+    raw_lines, rows, row_by_line = _parse_final_stage_rows(
+        path, ref_alleles, targets,
+    )
+    query_loci = {
+        row.allele: (row.matrix, row.asm_contig, row.asm_start, row.asm_end,
+                     row.asm_strand)
+        for row in rows if not row.reference_row
+    }
+    # Merged queries (grouped parts, multi-reference column 9) are scored on
+    # their whole span, gaps between parts included.
+    merged_rows = cl.defaultdict(list)
+    for row in rows:
+        if not row.reference_row and (
+            row.part_index or len(row.assigned_refs) > 1
+        ):
+            merged_rows[row.group_key].append(row)
+    span_loci = {}
+    for key, group_rows in merged_rows.items():
+        if len({row.asm_contig for row in group_rows}) != 1:
+            continue
+        first = min(group_rows, key=lambda row: (row.asm_start, row.asm_end))
+        span_loci["\x00merged\x1f" + key] = (key, (
+            first.matrix, first.asm_contig,
+            min(row.asm_start for row in group_rows),
+            max(row.asm_end for row in group_rows),
+            first.asm_strand,
+        ))
+    query_loci.update({
+        span_key: locus for span_key, (_key, locus) in span_loci.items()
+    })
+    reference_loci = {
+        name: (allele_matrix_name(name), reference.contig, reference.start,
+               reference.end, reference.strand or "+")
+        for name, reference in targets.items()
+    }
+    query_slices = read_exact_pa_path_intervals(alignments, query_loci)
+    reference_slices = {
+        name: intervals
+        for name, intervals in read_exact_pa_path_intervals(
+            reference_alignments, reference_loci,
+        ).items()
+        if intervals
+    } if query_slices else {}
+    reference_index = _reference_path_interval_index(reference_slices)
+    overlaps_by_row = {
+        row.allele: _reference_overlap_intervals(
+            query_slices.get(row.allele, {}), reference_index, row.matrix,
+        )
+        for row in rows if not row.reference_row
+    }
+    merged_spans = {}
+    for span_key, (key, locus) in span_loci.items():
+        if not query_slices.get(span_key):
+            # No single alignment row contains the whole span: the parts'
+            # own slices are used instead.
+            continue
+        overlaps_by_row[span_key] = _reference_overlap_intervals(
+            query_slices[span_key], reference_index, locus[0],
+        )
+        merged_spans[key] = (span_key, locus[3] - locus[2])
+    _elect_final_stages(
+        rows, ref_alleles, targets, overlaps_by_row,
+        merged_spans=merged_spans, available=set(reference_slices),
+    )
+
+    counts = cl.defaultdict(int)
+    for row in rows:
+        fields = row.fields
+        mappings = []
+        for mapping in (row.location, row.sequence):
+            if mapping is None:
+                continue
+            references, coordinates = _stage_assignment_coordinates(
+                mapping["refs"], ref_alleles,
+            )
+            mapping["refs"] = references
+            # A location keeps GenomeLift's lifted interval when it has one.
+            mapping["interval"] = mapping["interval"] or coordinates
+            mappings.append(mapping)
+        if mappings:
+            # Columns 9/10: the primary mapping (location first).
+            shown = next(
+                (mapping for mapping in mappings
+                 if mapping["tier"] == "primary"),
+                mappings[0],
+            )
+            fields[8] = ";".join(shown["refs"])
+            fields[9] = shown["interval"]
+            row.final_stage = shown["stage"]
+        elif not row.reference_row:
+            fields[8] = ""
+        if row.location is not None and row.location["stage"] == 1:
+            stage_text, tier_text = "1", "primary"
+        else:
+            stage_text = ";".join(str(m["stage"]) for m in mappings) or "0"
+            tier_text = ";".join(m["tier"] for m in mappings)
+
+        def mapping_text(mapping):
+            if mapping is None:
+                return "."
+            return "|".join((
+                mapping["tier"], ";".join(mapping["refs"]) or ".",
+                mapping["interval"] or ".", mapping["score"],
+            ))
+
+        fields.extend((
+            stage_text, tier_text,
+            mapping_text(row.location), mapping_text(row.sequence),
+        ))
+        counts[row.final_stage] += 1
+
+    temporary = path + f".final-stages.tmp.{os.getpid()}"
+    try:
+        with open(temporary, "wt") as output:
+            for line_index, raw in enumerate(raw_lines):
+                row = row_by_line.get(line_index)
+                if row is None:
+                    if raw.rstrip("\r\n").split("\t", 1)[0] == "allelename":
+                        header = raw.rstrip("\r\n").split("\t")[:14]
+                        output.write("\t".join(
+                            header + list(FINAL_STAGE_COLUMNS)
+                        ) + "\n")
+                    else:
+                        output.write(raw)
+                else:
+                    output.write("\t".join(row.fields) + "\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+    return dict(counts)
 
 
 def _final_extension_value(token: str) -> str:
@@ -883,6 +2487,7 @@ def read_final_lift_rows(path: str) -> List[FinalLiftRow]:
                 value.strip() for value in fields[8].split(";")
                 if value.strip()
             )
+            stage, tier, stage_present = final_stage_and_tier(fields)
             rows.append(FinalLiftRow(
                 fields=tuple(fields),
                 allele=fields[0],
@@ -892,38 +2497,79 @@ def read_final_lift_rows(path: str) -> List[FinalLiftRow]:
                 end=end,
                 strand=strand,
                 assigned_refs=assigned_refs,
-                class_type=fields[6].strip(),
+                class_type=final_source_class(fields),
                 part_index=part_index,
                 left_extension=part_value(fields[12]),
                 right_extension=part_value(fields[13]),
+                assignment_stage=stage,
+                final_stage_present=stage_present,
+                assignment_tier=tier,
+                mapped_refs=final_mapping_refs(fields),
             ))
     return rows
 
 
-def _choose_final_deletion_anchors(left_rows, right_rows):
+def _positive_interval_overlap(left, right):
+    return min(left[1], right[1]) > max(left[0], right[0])
+
+
+def _choose_final_deletion_anchors(
+    left_rows, right_rows, max_extension=10000,
+):
+    """Choose flanking query anchors whose extended regions overlap.
+
+    The two sorted sweeps avoid the former all-pairs comparison.  A missing
+    reference block is a deletion only when both neighboring reference blocks
+    and both query anchors have overlapping effective extension intervals.
+    """
+    left_by_contig = cl.defaultdict(list)
+    right_by_contig = cl.defaultdict(list)
+    for row in left_rows:
+        effective = final_lift_effective_interval(row, max_extension)
+        if effective is not None:
+            left_by_contig[row.contig].append((effective, row))
+    for row in right_rows:
+        effective = final_lift_effective_interval(row, max_extension)
+        if effective is not None:
+            right_by_contig[row.contig].append((effective, row))
+
     candidates = []
-    for left in left_rows:
-        for right in right_rows:
-            if left.contig != right.contig:
-                continue
-            if left.start + left.end <= right.start + right.end:
-                strand = "+"
-                left_facing, right_facing = left.end, right.start
+    for contig in sorted(set(left_by_contig).intersection(right_by_contig)):
+        left_local = sorted(
+            left_by_contig[contig],
+            key=lambda item: (item[0][0], item[0][1], item[1].allele),
+        )
+        right_local = sorted(
+            right_by_contig[contig],
+            key=lambda item: (item[0][0], item[0][1], item[1].allele),
+        )
+        left_index = right_index = 0
+        while left_index < len(left_local) and right_index < len(right_local):
+            left_effective, left = left_local[left_index]
+            right_effective, right = right_local[right_index]
+            if _positive_interval_overlap(left_effective, right_effective):
+                if left.start + left.end <= right.start + right.end:
+                    strand = "+"
+                    left_facing, right_facing = left.end, right.start
+                else:
+                    strand = "-"
+                    left_facing, right_facing = left.start, right.end
+                candidates.append((
+                    abs(right_facing - left_facing),
+                    left.contig,
+                    min(left.start, right.start),
+                    max(left.end, right.end),
+                    left.allele,
+                    right.allele,
+                    left,
+                    right,
+                    max(0, (left_facing + right_facing) // 2),
+                    strand,
+                ))
+            if left_effective[1] <= right_effective[1]:
+                left_index += 1
             else:
-                strand = "-"
-                left_facing, right_facing = left.start, right.end
-            candidates.append((
-                abs(right_facing - left_facing),
-                left.contig,
-                min(left.start, right.start),
-                max(left.end, right.end),
-                left.allele,
-                right.allele,
-                left,
-                right,
-                max(0, (left_facing + right_facing) // 2),
-                strand,
-            ))
+                right_index += 1
     if not candidates:
         return None
     candidates.sort(key=lambda value: value[:6])
@@ -943,9 +2589,16 @@ def final_row_reference_presence(
     finite rows whose propagated tags infer only a boundary (possibly a
     zero-width column-10 interval). A column-2 fallback is never promoted into
     an anchor or graph-CIGAR assignment.
+
+    Final-stage tables follow the same rule: column 9 holds the elected
+    reference of every stage-1 to stage-4 row, and a stage-0 row (blank
+    column 9) falls back to column 2.  A stage-3/4 copy therefore suppresses a
+    DEL at its source; only primary rows (stages 1/2 and promoted 3) may act
+    as deletion anchors.
     """
-    if row.assigned_refs:
-        return row.assigned_refs
+    if row.assigned_refs or row.mapped_refs:
+        # Columns 17/18 may name a second (location or sequence) target.
+        return tuple(dict.fromkeys(row.assigned_refs + row.mapped_refs))
     if len(row.fields) < 2:
         return ()
 
@@ -990,7 +2643,19 @@ def build_final_unmatched_rows(
             matched_refs.update(presence_refs)
             if effective is None:
                 continue
-            if row.part_index == 0 and len(row.assigned_refs) == 1:
+            if (
+                row.part_index == 0
+                and len(row.assigned_refs) == 1
+                and (
+                    not row.final_stage_present
+                    # Only primary mappings anchor: stage 1, a primary
+                    # stage-2 location, or a primary stage-3 sequence.
+                    or (
+                        row.assignment_tier == "primary"
+                        and row.assignment_stage in {1, 2, 3}
+                    )
+                )
+            ):
                 anchors[row.assigned_refs[0]].append(row)
 
         for chrom, entries in sorted(references_by_chrom.items()):
@@ -1019,10 +2684,17 @@ def build_final_unmatched_rows(
                 if run_start > 0 and run_end < len(entries):
                     left_ref = entries[run_start - 1][0]
                     right_ref = entries[run_end][0]
-                    chosen = _choose_final_deletion_anchors(
-                        anchors.get(left_ref.allele, ()),
-                        anchors.get(right_ref.allele, ()),
-                    )
+                    left_reference_effective = entries[run_start - 1][1]
+                    right_reference_effective = entries[run_end][1]
+                    if _positive_interval_overlap(
+                        left_reference_effective,
+                        right_reference_effective,
+                    ):
+                        chosen = _choose_final_deletion_anchors(
+                            anchors.get(left_ref.allele, ()),
+                            anchors.get(right_ref.allele, ()),
+                            max_extension,
+                        )
                 status = "DEL" if chosen is not None else "NA"
                 missing_names = tuple(row.allele for row, _ in missing)
                 missing_original_loci = tuple(row.fields[2] for row, _ in missing)
@@ -1043,6 +2715,7 @@ def build_final_unmatched_rows(
                     reference_loc,
                     left_anchor,
                     right_anchor,
+                    "0",
                     "0",
                     "0",
                 )))
@@ -1077,7 +2750,7 @@ def normalize_tag(tag: str, ignore_distance=False):
     if not tag:
         return tag
     if ignore_distance:
-        return re.sub(r"_distance\d+$", "", tag)
+        return re.sub(r"(?:_distance\d+)+$", "", tag)
     return tag
 
 
@@ -2497,6 +4170,7 @@ def assign_grouped_anchor_fallback(
     matched_to_ref,
     allowed_shape_priorities=None,
     sim_cutoff=0.1,
+    assignment_stage=3,
 ):
     """Assign position-bracketed blocks between established fixed anchors.
 
@@ -2673,6 +4347,7 @@ def assign_grouped_anchor_fallback(
             row.grouped_query_original_locs = query_original_locations
             row.grouped_query_left_extensions = query_left_extensions
             row.grouped_query_right_extensions = query_right_extensions
+            row.assignment_stage = assignment_stage
         for reference_name in reference_names:
             matched_ref_keys.add((asm_contig, reference_name))
         assigned_groups += 1
@@ -2698,7 +4373,7 @@ def assign_matches(
     matched_asm = set()
     matched_to_ref = {}
 
-    def commit_match(r, refname, diffval):
+    def commit_match(r, refname, diffval, assignment_stage):
         refkey = (r.asm_contig, refname)
         matched_asm.add(r.allelename)
         matched_ref_keys.add(refkey)
@@ -2711,6 +4386,7 @@ def assign_matches(
         r.assigned_ref_alleles_bylocation = location_refname_for_output(refname, all_ref_alleles)
         r.assigned_ref_alleles_coordinates = location_coords_for_output(refname, all_ref_alleles)
         r.matched_ref_coords = original_ref_coords(ra)
+        r.assignment_stage = assignment_stage
 
     for r in rows:
         if r.allelename in anchors:
@@ -2724,7 +4400,7 @@ def assign_matches(
                     diffval = dv
                     break
 
-            commit_match(r, refname, diffval)
+            commit_match(r, refname, diffval, 1)
 
     rebuild_assembly_tags_from_matches(
         rows,
@@ -2764,6 +4440,7 @@ def assign_matches(
                 matched_to_ref,
                 allowed_shape_priorities={0},
                 sim_cutoff=sim_cutoff,
+                assignment_stage=2 if not ignore_distance else 4,
             ):
                 rebuild_assembly_tags_from_matches(
                     rows,
@@ -2809,7 +4486,10 @@ def assign_matches(
                     refkey = (row_map[allelename].asm_contig, refname)
                     if refkey in matched_ref_keys:
                         continue
-                    commit_match(row_map[allelename], refname, diffval)
+                    commit_match(
+                        row_map[allelename], refname, diffval,
+                        2 if not ignore_distance else 4,
+                    )
 
                 rebuild_assembly_tags_from_matches(
                     rows,
@@ -2834,6 +4514,7 @@ def assign_matches(
                 matched_to_ref,
                 allowed_shape_priorities={0, 1, 2},
                 sim_cutoff=sim_cutoff,
+                assignment_stage=2 if not ignore_distance else 4,
             ):
                 rebuild_assembly_tags_from_matches(
                     rows,
@@ -2888,7 +4569,10 @@ def assign_matches(
                 if allelename in matched_asm or refkey in matched_ref_keys:
                     continue
 
-                commit_match(row_map[allelename], refname, diffval)
+                commit_match(
+                    row_map[allelename], refname, diffval,
+                    2 if not ignore_distance else 4,
+                )
                 rebuild_assembly_tags_from_matches(
                     rows,
                     all_ref_alleles,
@@ -2912,6 +4596,7 @@ def assign_matches(
         matched_ref_keys,
         matched_to_ref,
         sim_cutoff=sim_cutoff,
+        assignment_stage=3,
     ):
         rebuild_assembly_tags_from_matches(
             rows,
@@ -2939,6 +4624,7 @@ def write_genome_output(rows, asm_ends, ref_alleles, outpath, write_header=False
         "asm_right_tag",
         "allele_left_offset",
         "allele_right_offset",
+        *FINAL_STAGE_COLUMNS,
     ]
 
     if ref_alleles is GLOBAL_REF_ALLELES and GLOBAL_REF_ANCHOR_INDEX is not None:
@@ -2967,6 +4653,11 @@ def write_genome_output(rows, asm_ends, ref_alleles, outpath, write_header=False
                     "",
                     NEG_INF_STR,
                     NEG_INF_STR,
+                    # Columns 15-18; finalize_lift_stages replaces them.
+                    "0",
+                    "",
+                    ".",
+                    ".",
                 ]
                 w.write("\t".join(row) + "\n")
                 continue
@@ -3025,6 +4716,12 @@ def write_genome_output(rows, asm_ends, ref_alleles, outpath, write_header=False
                 rtag,
                 left_extension_display,
                 right_extension_display,
+                # Columns 15-18; finalize_lift_stages replaces them
+                # (17/18: location and sequence mappings).
+                str(r.assignment_stage),
+                "",
+                ".",
+                ".",
             ]
             w.write("\t".join(row) + "\n")
 
@@ -3362,8 +5059,12 @@ def main():
         "--alignments",
         default="",
         help=(
-            "optional sample _align.txt used only to rank overlapping PAs "
-            "from the same graph; omitted preserves legacy ownership"
+            "QUERY_align.txt[,REFERENCE_align.txt]: the sample _align.txt "
+            "ranks overlapping PAs and, with the reference haplotype "
+            "_align.txt, gives the query/reference coverage used by the "
+            "final lift stages. Without the second path the reference file "
+            "is taken from REFHAPLO/REFHAPLO.align.txt beside the sample "
+            "folder"
         ),
     )
     parser.add_argument("--near-dist", type=int, default=1000)
@@ -3412,18 +5113,54 @@ def main():
         )
     except ValueError as exc:
         parser.error(str(exc))
-    if args.alignments and not os.path.isfile(args.alignments):
-        parser.error(f"alignment file not found: {args.alignments}")
+    alignment_paths = [
+        value.strip() for value in args.alignments.split(",")
+        if value.strip()
+    ]
+    if len(alignment_paths) > 2:
+        parser.error(
+            "--alignments takes QUERY_align.txt[,REFERENCE_align.txt]"
+        )
+    for alignment_path in alignment_paths:
+        if not os.path.isfile(alignment_path):
+            parser.error(f"alignment file not found: {alignment_path}")
+    args.alignments = alignment_paths[0] if alignment_paths else ""
+    args.reference_alignments = (
+        alignment_paths[1] if len(alignment_paths) > 1 else ""
+    )
+    if args.alignments and not args.no_reference:
+        if not args.reference_alignments:
+            # SAMPLES/SAMPLE/SAMPLE.align.txt -> SAMPLES/REFHAPLO/REFHAPLO.align.txt
+            args.reference_alignments = os.path.join(
+                os.path.dirname(os.path.dirname(
+                    os.path.abspath(args.alignments)
+                )),
+                args.refhaplo, f"{args.refhaplo}.align.txt",
+            )
+            if not os.path.isfile(args.reference_alignments):
+                parser.error(
+                    "final lift stages need the reference haplotype "
+                    "_align.txt for coverage; pass --alignments "
+                    "SAMPLE_align.txt,REFERENCE_align.txt (not found: "
+                    f"{args.reference_alignments})"
+                )
+        print(
+            "Final-stage coverage alignments: "
+            f"{args.alignments},{args.reference_alignments}",
+            flush=True,
+        )
 
     alignment_scores = None
     if args.alignments:
         try:
-            alignment_scores = read_alignment_scores(args.alignments)
+            alignment_scores = read_alignment_scores(
+                args.alignments, read_pa_loci(args.input),
+            )
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
         print(
-            f"Loaded alignment scores for {len(alignment_scores)} PA "
-            "name/alias entries",
+            f"Loaded locus-matched alignment scores for "
+            f"{len(alignment_scores)} PAs",
             flush=True,
         )
 
@@ -3617,6 +5354,18 @@ def main():
                         w.write(line)
 
         if not args.no_reference:
+            stage_counts = finalize_lift_stages(
+                args.output, ref_alleles, args.alignments,
+                args.reference_alignments,
+            )
+            print(
+                "Final lift stages: "
+                + ", ".join(
+                    f"stage {stage}={stage_counts.get(stage, 0)}"
+                    for stage in range(5)
+                ),
+                flush=True,
+            )
             deletion_count, unknown_count = append_final_unmatched_rows(
                 args.output,
                 args.refhaplo,

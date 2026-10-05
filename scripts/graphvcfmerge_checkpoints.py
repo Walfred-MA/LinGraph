@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import pickle
+import re
 import tempfile
 from contextlib import contextmanager
 
@@ -19,7 +20,31 @@ def settings(context):
     value = {key: context.get(key, default) for key, default in DEFAULT_SETTINGS.items()}
     if context.get("insertion_snps"):
         value["insertion_snps"] = os.path.abspath(context["insertion_snps"])
+    if context.get("kmermatch"):
+        # A rebuilt or replaced KmerMatch scores differently: its merged
+        # chromosomes are not reused.
+        value["kmermatch"] = kmermatch_stamp(context["kmermatch"])
     return value
+
+
+def kmermatch_stamp(executable):
+    path = Path(executable)
+    if not path.is_file():
+        return str(executable)
+    stat = path.stat()
+    return [str(path.resolve()), stat.st_size, stat.st_mtime_ns]
+
+
+def insertion_snp_owner(row_id, info_text):
+    """Path whose insertion SNPs an INS row uses: the row itself, or the
+    shared template path named by EXTENDGRAPHCIGAR=>PATH:N= (full-locus
+    duplications merged with --exact)."""
+    for item in info_text.split(";"):
+        if item.startswith("EXTENDGRAPHCIGAR="):
+            match = re.fullmatch(r"[<>]([^:<>@]+)(?::|@3A)\d+=", item[17:])
+            if match:
+                return match.group(1)
+    return row_id
 
 
 def locus_key(chrom):
@@ -66,23 +91,34 @@ def identity(root, chrom, context):
     return {"version": 1, "chrom": chrom, "settings": settings(context), "inputs": inputs}
 
 
-def atomic_write(path, writer):
+def atomic_write(path, writer, durable=True):
+    """Write through a temporary file and rename it into place: readers never
+    see a partial file. ``durable`` also fsyncs it and creates its folder;
+    per-insertion spool files skip both (hundreds of thousands per
+    chromosome on network storage) and are made durable once, when their
+    chromosome is marked done (mark_done)."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if durable:
+        path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as out:
             writer(out)
-            out.flush()
-            os.fsync(out.fileno())
+            if durable:
+                out.flush()
+                os.fsync(out.fileno())
         os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
+    except BaseException:
+        try:
             os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
-def write_json(path, value):
-    atomic_write(path, lambda out: out.write((json.dumps(value, sort_keys=True, indent=2) + "\n").encode()))
+def write_json(path, value, durable=True):
+    atomic_write(path, lambda out: out.write((json.dumps(value, sort_keys=True, indent=2) + "\n").encode()),
+                 durable)
 
 
 def write_pickle(path, value):
@@ -118,31 +154,48 @@ def outputs(root, chrom, emit_small=False, insertion_snps=None):
             if not name or int(length) < 0 or name in promoted:
                 raise ValueError(f"invalid promoted-path metadata: {result[1]}")
             promoted[name] = int(length)
-    if insertion_snps:
-        from graphvcfmerge_snp_compact import chrom_key, DTYPE
-        for part in list(result):
-            if not str(part).endswith('.part'):
-                continue
-            with part.open() as handle:
-                for raw in handle:
-                    fields = raw.rstrip('\n').split('\t')
-                    if len(fields) < 8 or 'SVTYPE=INS' not in fields[7].split(';'):
-                        continue
-                    pointer = Path(insertion_snps) / (chrom_key(fields[2]) + '.json')
-                    data = json.loads(pointer.read_text())
-                    result.append(pointer)
-                    from graphvcfmerge_snp_compact import source_sections
-                    for key in data['chroms']:
-                        binary, _ = source_sections(data, key)
-                        if binary.exists() and binary not in result:
-                            result.append(binary)
     return result
+
+
+def output_stamps(paths, insertion_snps=None):
+    stamps = {path.name: file_stamp(path) for path in paths}
+    if not insertion_snps:
+        return stamps
+    from graphvcfmerge_snp_compact import chrom_key, legacy_insertion_source
+    import graphvcfmerge_insertion_store as store
+    keys = set()
+    for part in paths:
+        if not str(part).endswith('.part'):
+            continue
+        with part.open() as handle:
+            for raw in handle:
+                fields = raw.rstrip('\n').split('\t', 8)
+                if len(fields) >= 8 and 'SVTYPE=INS' in fields[7].split(';'):
+                    keys.add(chrom_key(insertion_snp_owner(fields[2], fields[7])))
+    bundled = store.find_many(insertion_snps, keys)
+    realignments = store.find_many(Path(insertion_snps) / 'realign', keys)
+    for key in sorted(keys):
+        source = bundled[key] if key in bundled else legacy_insertion_source(insertion_snps, key)
+        if isinstance(source, dict):
+            # Locus contents, not a mutable bundle's size/mtime. Appending a
+            # different chromosome cannot invalidate this checkpoint.
+            stamps['insertion:' + key] = source['digest']
+            realignment = realignments.get(key)
+            if realignment is not None:
+                stamps['realign:' + key] = realignment['digest']
+        else:
+            stamps[Path(source).name] = file_stamp(Path(source))
+    return stamps
 
 
 def mark_done(root, chrom, context, manual=False):
     paths = outputs(root, chrom, settings(context)["emit_small"], context.get("insertion_snps"))
+    stamps = output_stamps(paths, context.get("insertion_snps"))
+    # Spool files are written without fsync (atomic_write durable=False):
+    # flush everything once before the marker declares them complete.
+    os.sync()
     value = identity(root, chrom, context)
-    value.update(manual=manual, outputs={(str(path.resolve()) if path.name == "records.bin" else path.name): file_stamp(path) for path in paths})
+    value.update(manual=manual, outputs=stamps)
     write_json(marker_path(root, chrom), value)
 
 
@@ -158,14 +211,20 @@ def is_done(root, chrom, context, adopt_manual=True):
         if adopt_manual:
             mark_done(root, chrom, context, manual=True)
         else:
-            outputs(root, chrom, settings(context)["emit_small"], context.get("insertion_snps"))
+            paths = outputs(root, chrom, settings(context)["emit_small"], context.get("insertion_snps"))
+            output_stamps(paths, context.get("insertion_snps"))
         return True
     value = json.loads(text)
     expected = identity(root, chrom, context)
     if any(value.get(key) != item for key, item in expected.items()):
         raise ValueError(f"stale completion marker (inputs/settings changed): {marker}")
     paths = outputs(root, chrom, expected["settings"]["emit_small"], context.get("insertion_snps"))
-    if value.get("outputs") != {(str(path.resolve()) if path.name == "records.bin" else path.name): file_stamp(path) for path in paths}:
+    # Markers written before pointers alone were stamped also list the
+    # insertions' records.bin files (by resolved path); their pointers are
+    # compared either way.
+    recorded = {key: stamp for key, stamp in (value.get("outputs") or {}).items()
+                if not key.endswith("records.bin")}
+    if recorded != output_stamps(paths, context.get("insertion_snps")):
         raise ValueError(f"completed outputs changed after marking: {marker}")
     return True
 

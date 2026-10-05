@@ -147,6 +147,9 @@ def run(output, mode='svonly', *, graph=None, reference=None, assembly_list=None
         '--realignment' if vcf.get('realignment', saved.get('realignment', True)) else '--no-realignment',
         '--resolve-conflicts-by-alignment-score' if vcf.get('resolve_conflicts_by_alignment_score', True) else '--no-resolve-conflicts-by-alignment-score',
         '--PAtag' if vcf.get('pa_tag', saved.get('pa_tag', True)) else '--noPAtag',
+        '--locus-dup-as-insert'
+        if vcf.get('locus_dup_as_insert', True)
+        else '--no-locus-dup-as-insert',
     ]
     if vcf.get('separate_adjacent_indels', False):
         options.append('--separate-adjacent-indels')
@@ -164,20 +167,31 @@ def run(output, mode='svonly', *, graph=None, reference=None, assembly_list=None
         graphcigar = sample_root / f'{name}.graphcigartoreffix.tsv'
         lift = sample_root / f'{name}.genomelift.tsv'
         liftfix = sample_root / f'{name}.genomeliftfix.tsv'
+        pseudolinear = sample_root / f'{name}.pseudolinear.tsv'
         assembly = assemblies[name]
         inputs = [*shared, *scripts, graphcigar, lift, liftfix,
                   Path(assembly['fasta']), Path(assembly['fai'])]
+        if pseudolinear.is_file():
+            inputs.append(pseudolinear)
         missing.update(str(path) for path in inputs if not path.is_file())
         destination = sample_root / f'{name}.vcf'
         command = [sys.executable, str(scripts[0]), '--input', str(graphcigar),
                    '--ref', saved['reference_fasta'], '--local-reference-templates', str(template),
                    '--fasta-query', assembly['fasta'], '--coord-map', f'{lift},{liftfix}',
                    '--output', str(destination), '--columns', name, *options]
+        if pseudolinear.is_file():
+            command.extend(['--pseudo-linear-assignments', str(pseudolinear)])
         jobs.append((name, inputs, command, destination))
     if missing:
         raise FileNotFoundError('--recall-only requires existing inputs; it will not rebuild them:\n' + '\n'.join(sorted(missing)))
     settings = {key: merge_config.get(key, default) for key, default in (
         ('merge_distance', 500), ('size_similarity', .7), ('sequence_similarity', .7), ('var_in_insert', 100))}
+    ignore_full_locus_dup_insertions = bool(
+        merge_config.get(
+            'ignore_full_locus_dup_insertions',
+            not merge_config.get('keep_full_locus_dup_insertions', False),
+        )
+    )
     kmermatch = kmermatch_override or saved.get('kmermatch', merge.sv.DEFAULT_KMERMATCH)
     if mode != 'snp' and not dry_run:
         from graphvcfmerge_kmer import resolve_kmermatch
@@ -204,4 +218,7 @@ def run(output, mode='svonly', *, graph=None, reference=None, assembly_list=None
     return merge.run(output, mode, paths=[job[3] for job in jobs], processes=merge_processes,
                      cutoff=cutoff, kmermatch=kmermatch, dry_run=dry_run,
                      keep_merge_tmpdir=merge_config.get('keep_merge_tmpdir', saved.get('keep_merge_tmpdir', False)),
+                     ignore_full_locus_dup_insertions=(
+                         ignore_full_locus_dup_insertions
+                     ),
                      **settings)

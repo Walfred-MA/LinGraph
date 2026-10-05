@@ -1,7 +1,6 @@
 # Merge modes and outputs
 
-The default is `--svonly`. With `LinGraph.py --mc-graph`, the default is `--all`.
-An explicit mode overrides that default:
+The default is `--all`. An explicit mode overrides that default:
 
 | Mode | Output |
 | --- | --- |
@@ -12,7 +11,9 @@ An explicit mode overrides that default:
 
 `--svcutoff` defaults to 20 bp (`--minsvsize` remains an alias in the cohort
 launcher). Indels in `--svindel` are the SV merger's below-cutoff results,
-including nested calls. They use the same merging algorithm as larger SVs.
+including nested calls. They are merged exactly: one row per identical POS,
+END, size and sequence, never clustered by distance or similarity (only SVs
+at or above the cutoff are).
 `--all` saves the three categories in separate VCFs; it does not produce a combined VCF.
 The historical `--SVonly [SIZE]` spelling is still accepted by the cohort launcher.
 
@@ -77,7 +78,7 @@ controller and its unfinished SNP jobs, make a copy with just the updated SNP
 chromosome rule:
 
 ```bash
-python tools/upgrade_snp_merge_workflow.py "$WORK"
+python minsetref/tools/upgrade_snp_merge_workflow.py "$WORK"
 snakemake graphvcfmerge_small_cohort \
   --snakefile "$WORK/Snakefile.snp-ram" \
   --config "run_config=$WORK/run.json" \
@@ -130,6 +131,14 @@ merger accepts the same option to consume the completed source manifest.
 Chromosome completion checks include the saved insertion SNP files, and the
 normal merge cleanup removes them after successful cohort publication.
 
+New insertion SNP sources use up to 32 indexed append-only bundle files instead
+of a directory and JSON files per insertion. Nested exact-mode SNP realignment
+records use another set of up to 32 bundles. Empty loci retain their coverage
+and template metadata. Entries have checksums; retries append a replacement
+generation, and chromosome checkpoints track the contents of each used locus.
+Older per-insertion sources and completed checkpoints remain readable. Keep
+`graphvcfmerge_insertion_store.py` alongside the other merger modules.
+
 Individual VCF calling also extracts SNPs from mismatches in encoded insertion
 alignments by default, including short insertions. These calls use the insertion
 template's coordinates and retain sample assembly coordinates and provenance.
@@ -145,7 +154,7 @@ is known, otherwise `.`; explicit missing calls remain missing.
 From the directory containing `graph/` and `cohort_calls/`:
 
 ```bash
-python /path/to/LinGraph/scripts/LinGraph.py graph -G graph -O cohort_calls --merge-only --all -t 16
+python /path/to/minsetref/LinGraph.py graph -G graph -O cohort_calls --merge-only --all -t 16
 ```
 
 This reads existing per-sample VCFs and writes separate `cohort.sv.vcf`, `cohort.indel.vcf`, and `cohort.snp.vcf` files in `cohort_calls/`.
@@ -160,7 +169,7 @@ alignments, use `--recall-only --all` as described below.
 The direct equivalent is:
 
 ```bash
-python scripts/cohort_vcf_merge.py run -O cohort_calls --all -t 16
+python cohort_vcf_merge.py run -O cohort_calls --all -t 16
 ```
 
 Merge scratch directories are deleted automatically after all final cohort VCFs
@@ -192,14 +201,14 @@ selected VCFs. `--insertion-only [SIZE]` is an additional export filter, with a
 ## Recall existing alignments and merge only
 
 ```bash
-python /path/to/LinGraph/scripts/LinGraph.py graph -G graph -O HG38SVs \
+python /path/to/minsetref/LinGraph.py graph -G graph -O HG38SVs \
   -r HG38_h1 --recall-only --all -t 16
 ```
 
 The cohort launcher also accepts this mode:
 
 ```bash
-python scripts/cohort_call_snakemake/run_cohort_call_pipeline.py \
+python cohort_call_snakemake/run_cohort_call_pipeline.py \
   -G graph -O HG38SVs -r HG38_h1 --recall-only --all -j 16
 ```
 
@@ -265,7 +274,7 @@ To remove a stale cohort-workflow lock after confirming no other cohort
 Snakemake controller is running, only the existing output directory is needed:
 
 ```bash
-python scripts/cohort_call_snakemake/run_cohort_call_pipeline.py --unlock -O cohort_calls
+python cohort_call_snakemake/run_cohort_call_pipeline.py --unlock -O cohort_calls
 ```
 
 This reads `cohort_calls/inputs/cohort_call.run.json`, asks Snakemake to unlock
@@ -310,22 +319,25 @@ The queue admits at most twice the worker count in unfinished tasks and 64 MiB
 of estimated input payload, with one oversized task admitted alone when needed.
 This bounds submitted payloads, not total chromosome or native-aligner memory.
 Small alignment batches and worker reuse limit sequence-copy and startup costs.
-Worker request files use Python's temporary directory (`TMPDIR` when set);
-durable checkpoints and ordered path-result spools stay in the merge directory.
+Serialized worker requests and results up to 1 MiB travel through pipes, with
+timeout/cancellation checks during transfers. Larger messages spill to Python's
+temporary directory (`TMPDIR` when set); durable checkpoints and ordered
+path-result spools stay in the merge directory.
 
 The two-hour alignment-first cluster deadline includes queue waiting. Expiry
 cancels that cluster's queued tasks and kills/reaps only its running worker
 process groups before entering KmerMatch fallback; other paths keep running.
 The affected slots are replaced as needed. Errors other than deadline expiry
 still fail the merge. Shutdown also cancels native work before joining path
-coordinators. Existing commands and checkpoint formats are unchanged.
+coordinators. Existing commands are unchanged, and older checkpoints stay readable.
 
 ## Register an existing run made by the older scripts
 
 These are local code changes; copying them to the cluster does not update a
 running Python process. Put the updated files in a separate copy of the existing
 repository first. Include `graphvcfmerge.py`, `graphvcfmerge_kmer.py`,
-`graphvcfmerge_nested.py`, `graphvcfmerge_scheduler.py`, `graphvcfmerge_checkpoints.py` and
+`graphvcfmerge_nested.py`, `graphvcfmerge_scheduler.py`, `graphvcfmerge_checkpoints.py`,
+`graphvcfmerge_snp_compact.py`, `graphvcfmerge_insertion_store.py` and
 `graphvcfmerge_resume.py`, plus `recover_graphvcfmerge.py` and
 `diagnose_graphvcfmerge.py`. Also update `cohort_call_snakemake/`'s launcher,
 `Snakefile`, and `workflow/scripts/graphvcfmerge_stages.py`. Keep their existing
@@ -337,13 +349,13 @@ From that updated repository copy, with the original Python environment:
 MERGE_ROOT=/project2/mchaisso_100/walfred/projects/newphase/newBuild/annotation/test2/cohort_calls/tmp/graphvcfmerge
 
 # Adopt already finished chromosome output pairs without rewriting them.
-python scripts/graphvcfmerge_resume.py mark-done --shards-dir "$MERGE_ROOT" --all-existing
+python graphvcfmerge_resume.py mark-done --shards-dir "$MERGE_ROOT" --all-existing
 
 # Preserve chr1's completed top-level groups BEFORE stopping the old job.
-python scripts/graphvcfmerge_resume.py mark-refined --shards-dir "$MERGE_ROOT" --chrom NC_060925.1
+python graphvcfmerge_resume.py mark-refined --shards-dir "$MERGE_ROOT" --chrom NC_060925.1
 
 # Check what the next scheduler run will do.
-python scripts/graphvcfmerge_resume.py status --shards-dir "$MERGE_ROOT"
+python graphvcfmerge_resume.py status --shards-dir "$MERGE_ROOT"
 ```
 
 The helper reads the original settings from
@@ -452,10 +464,12 @@ to newly submitted merge jobs; existing allocations are not resized. The saved
 scan shards can be reused when rerunning the chromosome merge stage. Local runs,
 scan/concatenation allocations, and wall-time limits are unchanged. More CPUs
 help parallel work; they do not guarantee a twofold speedup for serial alignment.
-## Original alternative calling intervals
+# Original alternative calling intervals
 
 Graph summarization writes `graph/summary/alternative_intervals.bed` from original
 template intervals. Cohort calling detects this file automatically; override it
 with `--alternative PATH`. The graph-CIGAR converter carries the projected calling
 regions to the VCF caller, which excludes whole boundary-crossing variants. The
-BED does not change path names or coordinate origins.
+BED does not change path names or coordinate origins. Existing graphs can obtain
+the BED with `python3 minsetref/tmp/make_alternative_bed.py --summary graph/summary/local_graphs.tsv`.
+See `tmp/alternative_intervals.md` for the four-column format and resume commands.

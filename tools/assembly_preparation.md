@@ -49,24 +49,18 @@ Prepare native `CHM13_h1` and `HG38_h1` references separately without
 For name fixing alone, without masking, use a separate output file:
 
 ```bash
-python3 tools/namecontigsfix.py -i assembly.fa -n HG002_h1
+python3 tools/namecontigsfix.py -i assembly.fa -n 'HG002#1' -o assembly.namefixed.fa
 samtools faidx assembly.namefixed.fa
 ```
-
-The name fixer accepts either `SAMPLE_hN` or `SAMPLE#N`, defaults to a new
-sibling FASTA, and never overwrites its input. Use the output path in the
-assembly list; pass `-o output.fa` to select a different destination.
 
 ## Behavior
 
 - A FASTA is considered soft-masked when at least one lowercase `a`, `c`, `g`,
   or `t` occurs in its sequence. An already masked FASTA skips WindowMasker.
 - `--remask` runs WindowMasker regardless of the detected input state.
-- Assembly-list names and FASTA prefixes use different formats:
-  `HG002_h1` in the list corresponds to contig IDs such as `HG002#1#chr1`.
-- `--contignamefix` checks every identifier against the list name, adds the
-  required prefix when absent, and collapses repeated copies of that same
-  prefix. Different embedded haplotype prefixes are rejected as collisions.
+- `--contignamefix` checks every identifier against the list name. For
+  `HG002_h1`, valid identifiers are `HG002#1` or start with `HG002#1#`. A
+  prefix is added only when necessary, and duplicate prefixes are collapsed.
 - Name repair aborts if it would create duplicate FASTA identifiers.
 - `samtools faidx` is always run on every resulting FASTA.
 - Inputs ending in gzip data are accepted and written as ordinary,
@@ -94,6 +88,20 @@ python3 tools/prepare_assemblies.py \
 `-j` controls how many assemblies are processed concurrently. Each
 WindowMasker process is single-threaded, so choose this based on available
 memory and I/O bandwidth.
+
+`-t/--threads` parallelizes masking within one assembly. WindowMasker first
+counts units once over the whole assembly (single-threaded), then the
+assembly is split into whole-record chunks that are masked concurrently with
+those genome-wide counts and joined back in input order. The mask is the same
+as a single whole-assembly run. Total CPU use is about `-j` x `--threads`;
+each masking process loads the counts file, and the chunks use temporary disk
+space next to the output. For one diploid sample:
+
+```bash
+python3 tools/prepare_assemblies.py \
+  -q query_paths.txt -O prepared_assemblies \
+  --contignamefix -j 2 --threads 8
+```
 
 For a list containing exactly one assembly, `--name` can override the name in
 the list. Both PATs list notation and FASTA-prefix notation are accepted:

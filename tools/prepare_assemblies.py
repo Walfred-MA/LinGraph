@@ -24,6 +24,9 @@ SAMPLE_RE = re.compile(
 PREFIX_RE = re.compile(
     r"^(?P<sample>[A-Za-z0-9.-]+)#(?P<haplotype>[1-9][0-9]*)$"
 )
+LEADING_PREFIX_RE = re.compile(
+    r"^(?P<sample>[A-Za-z0-9.-]+)#(?P<haplotype>[1-9][0-9]*)#"
+)
 LOWERCASE_DNA = frozenset(b"acgt")
 
 
@@ -91,6 +94,20 @@ def canonical_name(value: str) -> Tuple[str, str]:
     return f"{sample}_h{haplotype}", f"{sample}#{haplotype}"
 
 
+def colliding_prefix(record_name: str, prefix: str) -> Optional[str]:
+    """Return a SAMPLE#HAPLOTYPE prefix other than ``prefix`` on a contig name.
+
+    Leading copies of the assembly's own prefix are ignored, so both
+    ``HG002#2#chr1`` and ``HG002#1#HG002#2#chr1`` collide with ``HG002#1``.
+    """
+    prefix_parts = prefix.split("#")
+    record_parts = record_name.split("#")
+    while record_parts[:len(prefix_parts)] == prefix_parts:
+        record_parts = record_parts[len(prefix_parts):]
+    match = LEADING_PREFIX_RE.match("#".join(record_parts))
+    return f"{match.group('sample')}#{match.group('haplotype')}" if match else None
+
+
 def inspect_fasta(path: Path, prefix: str) -> FastaInspection:
     """Validate a FASTA and detect lowercase masking and header conformance."""
     records = 0
@@ -119,6 +136,15 @@ def inspect_fasta(path: Path, prefix: str) -> FastaInspection:
                         f"{identifier!r}"
                     )
                 seen_names.add(identifier)
+                collision = colliding_prefix(identifier, prefix)
+                if collision is not None:
+                    raise ValueError(
+                        f"{path}:{line_number}: contig {identifier!r} already "
+                        f"carries sample prefix {collision!r}, which collides "
+                        f"with this assembly's prefix {prefix!r}. Sample names "
+                        "may not collide: name the assembly after its existing "
+                        "prefix, or remove that prefix from the FASTA first."
+                    )
                 records += 1
                 names_correct = names_correct and (
                     identifier == prefix or identifier.startswith(prefix + "#")
@@ -221,12 +247,7 @@ def find_executable(value: str) -> str:
     return resolved
 
 
-def run_windowmasker(
-    windowmasker: str,
-    source: Path,
-    counts: Path,
-    output: Path,
-) -> None:
+def windowmasker_counts(windowmasker: str, source: Path, counts: Path) -> None:
     run_command(
         [
             windowmasker,
@@ -239,6 +260,14 @@ def run_windowmasker(
             str(counts),
         ]
     )
+
+
+def windowmasker_mask(
+    windowmasker: str,
+    source: Path,
+    counts: Path,
+    output: Path,
+) -> None:
     run_command(
         [
             windowmasker,
@@ -257,6 +286,121 @@ def run_windowmasker(
         ]
     )
     if not output.is_file() or output.stat().st_size == 0:
+        raise RuntimeError(f"WindowMasker did not create a nonempty FASTA: {output}")
+
+
+def run_windowmasker(
+    windowmasker: str,
+    source: Path,
+    counts: Path,
+    output: Path,
+) -> None:
+    windowmasker_counts(windowmasker, source, counts)
+    windowmasker_mask(windowmasker, source, counts, output)
+
+
+def split_fasta_chunks(
+    source: Path,
+    folder: Path,
+    target_bases: int,
+) -> List[Tuple[Path, int]]:
+    """Split a FASTA into contiguous whole-record chunks, in input order.
+
+    A new chunk starts at the first header after the current chunk reaches
+    ``target_bases``, so records are never split and concatenating the chunks
+    in order reproduces the input.
+    """
+    chunks: List[Tuple[Path, int]] = []
+    output_handle = None
+    chunk_path: Optional[Path] = None
+    chunk_bases = 0
+    try:
+        with open_fasta(source) as input_handle:
+            for raw in input_handle:
+                if raw.startswith(b">"):
+                    if output_handle is None or chunk_bases >= target_bases:
+                        if output_handle is not None:
+                            output_handle.close()
+                            chunks.append((chunk_path, chunk_bases))
+                        chunk_path = folder / f"chunk{len(chunks):05d}.fa"
+                        output_handle = chunk_path.open("wb")
+                        chunk_bases = 0
+                elif output_handle is None:
+                    # Blank lines before the first header; inspection rejects
+                    # any real sequence there.
+                    continue
+                else:
+                    chunk_bases += len(raw.strip())
+                output_handle.write(raw)
+    finally:
+        if output_handle is not None:
+            output_handle.close()
+    if output_handle is not None:
+        chunks.append((chunk_path, chunk_bases))
+    if not chunks:
+        raise ValueError(f"no FASTA records found: {source}")
+    return chunks
+
+
+def run_windowmasker_parallel(
+    windowmasker: str,
+    source: Path,
+    counts: Path,
+    output: Path,
+    threads: int,
+    total_bases: int,
+) -> None:
+    """Genome-wide counts once, then mask record chunks concurrently.
+
+    Unit counts and thresholds come from the whole assembly, and masking with
+    those counts is independent per record, so the concatenated chunk outputs
+    match a single whole-assembly ``-ustat`` run.
+    """
+    windowmasker_counts(windowmasker, source, counts)
+
+    folder = output.parent / "windowmasker_chunks"
+    folder.mkdir()
+    # About four chunks per thread keeps workers busy when record sizes vary.
+    target_bases = max(1, total_bases // (threads * 4))
+    chunks = split_fasta_chunks(source, folder, target_bases)
+    print(
+        f"[prepare] WindowMasker masking {len(chunks)} chunks with {threads} threads",
+        flush=True,
+    )
+
+    def mask_chunk(chunk: Path) -> Path:
+        masked = chunk.with_suffix(".masked.fa")
+        windowmasker_mask(windowmasker, chunk, counts, masked)
+        chunk.unlink()
+        return masked
+
+    masked_chunks: Dict[Path, Path] = {}
+    errors: List[str] = []
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        # Largest chunks first so a long chromosome does not start last.
+        futures = {
+            executor.submit(mask_chunk, chunk): chunk
+            for chunk, _bases in sorted(chunks, key=lambda item: -item[1])
+        }
+        for future in as_completed(futures):
+            chunk = futures[future]
+            try:
+                masked_chunks[chunk] = future.result()
+            except Exception as error:
+                errors.append(f"{chunk.name}: {error}")
+    if errors:
+        raise RuntimeError(
+            "WindowMasker chunk masking failed:\n  " + "\n  ".join(errors)
+        )
+
+    with output.open("wb") as output_handle:
+        for chunk, _bases in chunks:
+            masked = masked_chunks[chunk]
+            with masked.open("rb") as input_handle:
+                shutil.copyfileobj(input_handle, output_handle, length=1024 * 1024)
+            masked.unlink()
+    folder.rmdir()
+    if output.stat().st_size == 0:
         raise RuntimeError(f"WindowMasker did not create a nonempty FASTA: {output}")
 
 
@@ -323,6 +467,7 @@ def prepare_one(
     contignamefix: bool,
     windowmasker: Optional[str],
     samtools: str,
+    threads: int = 1,
 ) -> PreparationResult:
     prefix = expected_prefix(assembly.name)
     masking_ran = remask or not inspection.is_masked
@@ -343,12 +488,22 @@ def prepare_one(
             if windowmasker is None:
                 raise RuntimeError("internal error: WindowMasker was not resolved")
             masked = temporary / "masked.fa"
-            run_windowmasker(
-                windowmasker,
-                windowmasker_input,
-                temporary / "windowmasker.counts",
-                masked,
-            )
+            if threads > 1:
+                run_windowmasker_parallel(
+                    windowmasker,
+                    windowmasker_input,
+                    temporary / "windowmasker.counts",
+                    masked,
+                    threads,
+                    inspection.bases,
+                )
+            else:
+                run_windowmasker(
+                    windowmasker,
+                    windowmasker_input,
+                    temporary / "windowmasker.counts",
+                    masked,
+                )
             staged = masked
         else:
             staged = temporary / "copied.fa"
@@ -429,6 +584,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="assemblies to prepare concurrently (default: 1)",
     )
     parser.add_argument(
+        "-t", "--threads", type=int, default=1,
+        help=(
+            "WindowMasker masking processes per assembly: genome-wide counts "
+            "run once, then record chunks are masked concurrently; total CPUs "
+            "are about --jobs x --threads (default: 1, one whole-assembly run)"
+        ),
+    )
+    parser.add_argument(
         "--remask", action="store_true",
         help="run WindowMasker even when lowercase soft masking is detected",
     )
@@ -455,6 +618,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.jobs < 1:
         parser.error("--jobs must be positive")
+    if args.threads < 1:
+        parser.error("--threads must be positive")
     if args.input and not args.name:
         parser.error("--name is required with --input")
     return args
@@ -545,6 +710,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.contignamefix,
                 windowmasker,
                 samtools,
+                args.threads,
             ): assembly
             for assembly in assemblies
         }

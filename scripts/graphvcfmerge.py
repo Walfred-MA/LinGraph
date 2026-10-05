@@ -9202,6 +9202,66 @@ def _fast_scan_batch_task(task):
         writer.close()
 
 
+def _rebuild_tool() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, "tools", "rebuild_assemblies.py"),
+                      os.path.join(here, os.pardir, "tools", "rebuild_assemblies.py")):
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    raise FileNotFoundError(
+        "--exact fallback needs tools/rebuild_assemblies.py beside graphvcfmerge.py"
+    )
+
+
+def _rebuild_exact_assemblies(
+    samples: Sequence[str], sample_vcfs: Sequence[str],
+    reference_paths: Sequence[str], output_dir: str, processes: int,
+) -> Dict[str, Tuple[str, str]]:
+    """Rebuild unavailable --exact assemblies from their per-sample VCFs.
+
+    tools/rebuild_assemblies.py writes SAMPLE.fa and its faidx-format .fai,
+    with N over every unmapped base.  _fast_stage_concat deletes output_dir
+    when the merge finishes.
+    """
+    print(
+        "[merge:fast] warning: --exact: the original assembly FASTA or .fai is "
+        f"missing for {len(samples)} sample(s) "
+        f"({', '.join(samples[:8])}{', ...' if len(samples) > 8 else ''}); "
+        "rebuilding them from their per-sample VCFs (unmapped bases are N) "
+        f"in {output_dir}; these temporary assemblies are deleted when the "
+        "merge finishes",
+        file=sys.stderr, flush=True,
+    )
+    command = [sys.executable, _rebuild_tool(), "rebuild",
+               "-s", *sorted(set(sample_vcfs))]
+    for path in reference_paths:
+        command += ["-r", path]
+    command += ["-o", output_dir, "-t", str(max(1, int(processes)))]
+    completed = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    rebuilt = {}
+    for sample in samples:
+        fasta = os.path.join(output_dir, sample + ".fa")
+        if not (os.path.isfile(fasta) and os.path.isfile(fasta + ".fai")):
+            raise RuntimeError(
+                f"--exact fallback could not rebuild {sample!r} "
+                f"(exit {completed.returncode}): "
+                f"{completed.stderr.strip()[-2000:]}"
+            )
+        rebuilt[sample] = (fasta, fasta + ".fai")
+    if completed.returncode != 0:
+        # rebuild_assemblies.py exits 1 when a mapped run could not be
+        # reconstructed exactly; the assemblies are still written.
+        print(
+            "[merge:fast] warning: --exact fallback: some mapped runs were not "
+            "rebuilt exactly; see "
+            f"{os.path.join(output_dir, 'rebuild_summary.tsv')}",
+            file=sys.stderr, flush=True,
+        )
+    return rebuilt
+
+
 def _fast_stage_scan(
     input_paths: Sequence[str], shards_dir: str, processes: int,
     snp_shards_dir=None, ignore_full_locus_dup_insertions: bool = True,
@@ -9218,28 +9278,36 @@ def _fast_stage_scan(
     ) = _fast_prepare_inputs(input_paths)
     exact_queries: Dict[str, Tuple[str, str]] = {}
     reference_paths = [os.path.abspath(path) for path in reference_paths]
+    rebuilt_dir = None
     if exact_query_paths:
         exact_queries = read_query_paths(exact_query_paths)
-        missing = [name for name in sample_names if name not in exact_queries]
-        if missing:
-            raise ValueError(
-                f"--exact {exact_query_paths}: no assembly for sample(s) "
-                f"{missing[:8]}"
-            )
         if not reference_paths:
             raise ValueError("--exact requires --reference")
-        indexed = [exact_queries[name] for name in sample_names] + [
-            (path, path + ".fai") for path in reference_paths
-        ]
         unindexed = [
-            fasta for fasta, fai in indexed
-            if not (os.path.isfile(fasta) and os.path.isfile(fai))
+            path for path in reference_paths
+            if not (os.path.isfile(path) and os.path.isfile(path + ".fai"))
         ]
         if unindexed:
             raise ValueError(
-                "--exact needs indexed FASTA files (samtools faidx); "
+                "--exact needs indexed reference FASTA files (samtools faidx); "
                 f"missing FASTA or .fai: {unindexed[:8]}"
             )
+        # A sample whose original assembly or .fai is missing falls back to
+        # an assembly rebuilt from its own per-sample VCF.
+        unavailable = [
+            name for name in sample_names
+            if not all(os.path.isfile(path) for path in exact_queries.get(name, ("", "")))
+        ]
+        if unavailable:
+            vcf_by_sample: Dict[str, str] = {}
+            for file_index, indexes in enumerate(file_sample_indexes):
+                for index in indexes:
+                    vcf_by_sample.setdefault(sample_names[index], input_paths[file_index])
+            rebuilt_dir = os.path.join(os.path.abspath(shards_dir), "rebuilt_assemblies")
+            exact_queries.update(_rebuild_exact_assemblies(
+                unavailable, [vcf_by_sample[name] for name in unavailable],
+                reference_paths, rebuilt_dir, processes,
+            ))
     records_dir = os.path.join(shards_dir, "records")
     os.makedirs(records_dir, exist_ok=True)
     os.makedirs(os.path.join(shards_dir, "parts"), exist_ok=True)
@@ -9412,6 +9480,7 @@ def _fast_stage_scan(
         } if exact_queries else None,
         "reference_paths": list(reference_paths),
         "snp_shards_dir": os.path.abspath(snp_shards_dir) if snp_shards_dir else None,
+        "rebuilt_assemblies": rebuilt_dir,
     }
     with open(_fast_manifest_path(shards_dir), "wb") as handle:
         pickle.dump(manifest, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -10004,6 +10073,13 @@ def _fast_stage_concat(
     if insertion_snps:
         from graphvcfmerge_snp_compact import finalize_insertions
         finalize_insertions(insertion_snps, insertion_ids=insertion_ids)
+    rebuilt = manifest.get("rebuilt_assemblies")
+    if rebuilt and os.path.isdir(rebuilt):
+        shutil.rmtree(rebuilt, ignore_errors=True)
+        print(
+            f"[merge:fast] deleted the temporary --exact assemblies in {rebuilt}",
+            file=sys.stderr,
+        )
 
 
 def merge_sample_vcfs_fast(

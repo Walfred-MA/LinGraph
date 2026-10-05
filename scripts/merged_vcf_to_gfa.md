@@ -8,8 +8,8 @@ and deletions; `--insertion-only` remains a separate filter. `--gfa-mode query` 
 query-flank GFA behavior; that mode is not suitable as an anchored rGFA.
 
 ```bash
-python scripts/merged_vcf_to_gfa.py \
-  -v cohort_calls/cohort.sv.vcf cohort_calls/cohort.indel.vcf cohort_calls/cohort.snp.vcf \
+python merged_vcf_to_gfa.py \
+  -v cohort_calls/cohort.all.vcf \
   -q query_paths.txt \
   --graph-folder graph \
   --local-reference-templates cohort_calls/checkpoints/local_reference_templates.fa \
@@ -160,6 +160,30 @@ not the cluster envelope. For example, `POS=248386058;SVLEN=-659` deletes
 The representative interval must still fit inside its parent; invalid intervals
 are rejected rather than clipped to the FASTA length.
 
+The caller now also rejects deletion operations outside a reference/template
+before its coordinate helpers can clip them. Previously, a `108D` operation
+starting at a path's length could produce `start == end == length` while
+retaining a deletion size of 108; the merger then extended its END from that
+size. This is separate from insertion-alignment splitting. The merged record
+alone cannot establish a corrected position for such a call.
+
+Audit all root deletions in an existing cohort before another graph export:
+
+```bash
+python3 minsetref/tools/audit_deletion_bounds.py \
+  -v cohort_calls/cohort.sv.vcf \
+  --fai reference.fa.fai --fai alternatives.fa.fai \
+  --report cohort_calls/invalid_deletions.tsv
+```
+
+The audit writes a report and does not modify or exclude any VCF records.
+It uses representative SVLEN, so an out-of-bounds cluster END alone is not
+flagged when the representative fits. It checks only DEL records whose parents
+appear in the supplied FASTA indexes; it does not validate nested insertion
+parents, other variant types, sequences, or graph topology. Fixing the caller
+does not repair already-written VCF records or require regenerating every
+unaffected chromosome.
+
 Older cohort merges could split internal `I`/`D` operations in an insertion's
 template alignment into a chromosome deletion, including records named
 `DEL_INS_..._DEL`. The corrected merger keeps an `INS` with `END == POS` as
@@ -193,6 +217,95 @@ With `-G graph/summary`, the default catalog is located in the parent graph
 directory. Template selection/lift checkpoints record backbone identity; the
 cohort DAG also tracks lifted templates as inputs to the calling stages.
 
+## Unverifiable variants
+
+Every literal allele must match a carrier's assembly bases at its `QUERYCOORD`
+(on a `-` strand, a single SNP position is the traversal boundary, so its base
+is at `QUERYCOORD - 1`). A SNP called on a reverse-traversed graph path, or
+projected through a reverse mapping, has a complemented ALT while QUERYCOORD
+keeps the query strand, and the VCF does not record that direction: both
+orientations are tried at that position, and only a carrier base equal to ALT
+is accepted. By default one mismatch stops the conversion. With
+`--drop-unverified`, variants that no carrier verifies, and variants nested in
+or aligned onto them, are left out of the graph instead; they are listed in
+`OUTPUT.anchors.bed.unresolved.tsv` (dependents with `depends_on_dropped`) and
+marked not exported (path `.`) in `OUTPUT.variants.tsv`. Bases that fail the
+check are never exported.
+
+## Alternative paths from the graph catalog
+
+With `--alternative-catalog GRAPH/summary/alternatives.fasta` (the default when
+the graph folder has it and neither `--local-path-fasta` nor
+`--local-reference-templates` is given), every VCF target outside `-r` is found in
+the catalog by source interval, never by name. Its source interval comes from the
+VCF header's `##alternativeLocus` line, or from its own catalog header.
+`--reference-haplotype` is required: records from that haplotype map straight
+onto the backbone.
+
+Graph construction can cut one alternative sequence into several local loci. On
+each source contig, all other catalog records whose source intervals overlap or
+touch are stitched into one forward path, `alt_SAMPLE_CONTIG_START_END`, covering
+their union. Overlapping bases must agree; otherwise the pieces stay separate.
+Each VCF target maps onto its merged path at its source offset.
+
+A path built from one record uses that record's catalog placement (header fields
+3-4, a graph CIGAR on a backbone contig) without realignment. Any other path is
+aligned once, as a whole, with `lift_local_templates.lift_templates` (minimap2).
+Only ends aligned exactly at the path boundary link into the backbone; other
+paths stay in the graph with `UP:Z:unplaced`. The stitched sequences are written
+to `OUTPUT.alternative_paths.fa`, and `OUTPUT.alternative_paths.tsv` lists each
+path's records, placement, and VCF names. Targets that no merged path covers stop
+the conversion.
+
+## Full-locus duplications
+
+An insertion with `INFO/PACLASS=fulllocusdup` copies a reference PA. All such
+copies whose aligned source intervals (from `INFO/ALTERNATIVECIGAR`, pieces
+joined by `&`) overlap on one reference path share a single new path,
+`dup_<path>_<start>_<end>` with `TP:Z:duplication`, copying the union of those
+intervals. Each copy's own P path walks the shared path where it aligns:
+mismatches and inserted bases are literal bubbles, and deleted or uncovered PA
+bases are skipped (deletions). Insertion bases outside every aligned piece stay
+literal pieces. Copies of the same PA inserted at different places reuse the
+same shared nodes.
+
+A piece is used only if its bases, rebuilt from the PA sequence and the CIGAR
+payloads, occur in the literal `INFO/SEQ` after the previous piece; otherwise it
+stays literal. The log line `Full-locus duplications: ...` counts shared paths,
+placed pieces, and pieces left literal. `graphvcfmerge.py` drops these
+insertions unless it runs with `--keep-full-locus-dup-insertions`.
+
+## Variant index sidecar
+
+rGFA output also writes `OUTPUT.variants.tsv`, one row per exported VCF record:
+`vcf_index` (data lines numbered from 0 across all `-v` inputs, in order),
+`variant_id`, `path` (the allele's P line), `kind`, and `parent`,
+`parent_start`, `parent_end`, `parent_strand`: the breakpoints on the parent P
+path. A deletion's P line includes flanks; its allele is the parent interval.
+
+## Per-sample GAF
+
+`gfa_sample_gaf.py` writes `SAMPLE.gaf` for each sample VCF from its
+`##pseudoLinearMapping` header and the merged-VCF alleles it carries. Pass the
+same merged VCFs in the same order as to the converter:
+
+```bash
+python gfa_sample_gaf.py -g cohort.gfa -v cohort.sv.vcf cohort.indel.vcf cohort.snp.vcf \
+  -s samples/*/*.vcf -q query_paths.txt -o gaf -t 8
+```
+
+It streams the merged VCFs once into per-sample shards (flushed every
+`--shard-records`, default 100000, closing files after each flush), then
+processes samples in parallel. Each contig's intervals are walked in query
+order along the reference P path, splicing every carried variant's allele
+(nested variants inside their parent insertion) at its breakpoints. One GAF
+record covers a contig until the walk cannot continue: an unmapped interval,
+an insertion without a graph allele, a missing link, or a mid-node jump.
+Columns 10/11 assume the walked sequence equals the query; no CIGAR is written.
+`nv:i:` counts spliced variants. `gaf_stats.tsv` summarizes breaks and unplaced
+variants, and `variant_offsets.npy` holds each merged-VCF record's byte offset
+(uint64, cumulative across files). Requires numpy.
+
 ## Sequence checks and large files
 
 The converter reads the VCF body sequentially and retains coordinate/run
@@ -201,6 +314,45 @@ Query extraction uses scaffold batches and temporary files. Sequence copying
 uses bounded chunks. Memory still scales with the number of events, graph
 segments, and edges; emitting the full reference and chopping nodes increases
 both graph size and memory relative to the legacy local graph.
+
+Topology (`gfa_topology.py`) is built from integer arrays rather than Python
+sets and tuples: each cut point is one int64 key (source ID in segment order,
+then coordinate), segments are pairs of consecutive keys, and links are
+deduplicated with their minimum rank by sorting. Path leaves are resolved,
+and S/P lines written, by `--processes` forked workers that each exit after
+one batch; the parent concatenates the blocks in order, so the GFA is
+byte-identical for any worker count. Log lines `Topology: ...` report the
+time of each stage.
+
+## Very large cohorts: `--partition-records`
+
+Without it, memory grows with the total number of variants (roughly 3-4 KB
+per variant). `--partition-records N` bounds it by N instead, trading extra
+passes for memory (`gfa_partitioned.py`):
+
+1. A light scan of the VCFs (no sample columns) records each record's byte
+   offset, which variants are nested in or copy from which, the target names
+   reachable variants need, and the full-locus duplication alignments.
+2. Templates, catalog paths and shared duplication paths are resolved once,
+   globally, exactly as in a one-pass run.
+3. Whole variant trees (a variant plus everything nested in it or built on
+   it) are packed in VCF order into partitions of about N records. Each
+   partition is read by byte offset (streamed and skipped for `.vcf.gz`) and
+   converted in its own forked process, so its memory is released afterwards.
+4. Root segments are numbered first, as in one pass; variant ranks and
+   segment IDs follow the one-pass dependency order (the partitions' orders
+   merged by VCF line). Each partition then writes its S/P blocks and links;
+   the blocks are copied in global rank order and links merged in ranges.
+
+The GFA, `variants.tsv`, BED, mapping, local-path and template-lift outputs
+are byte-identical to a one-pass run; only the unresolved report is ordered
+by partition. A partition uses about 4 KB per record (e.g. N = 10,000,000
+needs about 40 GB); the parent keeps roughly 40 bytes per variant plus about
+100 bytes per reference-path segment. Temporary files beside the BED need
+about the GFA's size plus ~30 GB per 100 million variants. Requires
+`--gfa-mode rgfa` and a GFA output. Without `--drop-unverified`, the first
+partition with an unverifiable variant stops the run (its variants are in
+the unresolved report); later partitions are not checked.
 
 The sample selector collects observations with both `SIZE == SVLEN` and query
 span `== SVLEN`. In rGFA mode it first selects full-length exact representative
@@ -264,10 +416,32 @@ report the explicit reference P line as a duplicate. VG conversion does not
 promise to retain every original optional GFA tag; keep the rGFA as the stable
 coordinate source.
 
-The exporter includes SNP, insertion, deletion, and replacement branches by
-default. Use `--insertion-only` to restrict it to insertion alleles. It does not
-reconstruct phased, whole-sample haplotype walks. Building haplotype indexes for
-downstream tools requires those additional paths and indexing steps.
+Run the regression suite with native tools installed:
+
+```bash
+VG=/path/to/vg GFATOOLS=/path/to/gfatools \
+  python -m unittest discover -s tests -p 'test_gfa*.py' -v
+```
+
+With VG available, successful rGFA topology fixtures are imported, checked
+with `vg validate`, and compared against the exact expected path sequences.
+Coverage includes nested insertions, reverse walks, aliases, and chromosome
+endpoints. The dedicated native-tool tests are explicitly skipped if their
+tools are absent.
+
+On 2026-09-13, all 40 converter tests passed without skips using native VG 1.77.0 and
+gfatools 0.5-r296 on this Mac. VG is installed in the `vg-gfa-test` conda
+environment. Another 23 LinGraph, 13 cohort, and 9 template/lift tests passed,
+including a real minimap2 alignment. Snakemake 6.15.1 dry-runs verified the
+template selection/lift DAG for default and switched backbones. Tests cover every root/local strand combination, reused
+mapped runs, flanks beyond trimmed local paths, empty novel catalogs, and
+failure on ambiguous or mismatched source mappings. This validates the fixtures, not the full mounted cohort or
+all downstream indexing workflows.
+
+The exporter represents retained **insertion alleles**, including their
+replacement spans. It does not export standalone DEL/SNP records or reconstruct
+phased, whole-sample haplotype walks. Producing a complete Minigraph-Cactus
+pangenome or haplotype indexes for Giraffe requires those additional steps.
 
 Format references: [rGFA specification](https://github.com/lh3/gfatools/blob/master/doc/rGFA.md),
 [VG conversion options](https://github.com/vgteam/vg/wiki/vg-manpage),
