@@ -427,6 +427,23 @@ You can choose **any haplotype in the cohort as the reference/backbone** with
 `-r HAPLOTYPE_NAME` (for example, `-r HG002_h2`). If `-r` is omitted, the
 first haplotype in `cohort.list` is used.
 
+To switch the backbone after a cohort run has already produced prealigned
+results, rerun the normal `graph` command with the same `-I`, `-G`, and `-O`,
+the same graph-construction options, and a different `-r`. LinGraph resumes the
+existing graph build and reuses prealigned results whose inputs still match;
+reference-dependent lifting and variant calls are updated for the new
+backbone. For example:
+
+```bash
+python3 scripts/LinGraph.py graph \
+  -I cohort.list -G cohort_graph -O cohort_calls \
+  -b windowprofs/geneblocks.bed --bed-grouped \
+  -r HG002_h2 --exact --mc-graph -t 16
+```
+
+Use a normal `graph` run for a reference change. `--recall-only` uses the
+reference saved by the previous run and cannot switch backbones.
+
 Build with **gene blocks**, the recommended windows for pangenome graph
 construction:
 
