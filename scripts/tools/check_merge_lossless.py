@@ -38,7 +38,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(1, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(1, str(Path(__file__).resolve().parents[1] / "scripts"))
 from allele_edges import edge_owned  # noqa: E402  (pipeline scripts)
 from check_vcf_lossless import (  # noqa: E402
     FastaIndex, _open, check, orient, parse_coord, read_header, vcf_unescape,
