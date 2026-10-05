@@ -1,10 +1,10 @@
 # LinGraph
 
-**LinGraph is an assembly-based structural variant (SV) caller and pangenome
-graph builder.** Use `singular` for independent VCF calling against an existing
+LinGraph is a variants-guided **pangenome graph builder** and an
+assembly-based structural variant (SV) caller. Use `singular` for independent VCF calling against an existing
 graph cache, or `graph` for a cohort run that calls variants together while
-building a pangenome graph. LinGraph records variant sequences and assembly
-coordinates in grVCF and can export cohort calls as a pangenome graph.
+building a pangenome graph. LinGraph records lossless variant sequences and assembly coordinates
+information in grVCF and can export cohort calls as a pangenome graph.
 
 ## Contents
 
@@ -20,7 +20,7 @@ coordinates in grVCF and can export cohort calls as a pangenome graph.
 
 ## Workflow overview
 
-![LinGraph workflow: prepare and align local graphs, pair query and reference sequences, call and merge grVCF variants, and export a pangenome GFA.](docs/figures/lingraph_workflow.png)
+![LinGraph workflow: prepare and align local graphs, pair query and reference sequences, call and merge grVCF variants, and export a pangenome GFA.](figures/lingraph_workflow.png)
 
 LinGraph partitions assemblies into loci, builds and aligns local graphs, and
 uses those alignments to call variants. Cohort calls retain sequence and graph
@@ -30,7 +30,7 @@ graph cache; a cohort `graph` run builds or resumes the graph from the cohort
 assemblies. The downloadable summary below supplies precomputed graph
 information for singular calling.
 
-[Download the workflow figure (PDF)](docs/figures/lingraph_workflow.pdf).
+[Download the workflow figure (PDF)](figures/lingraph_workflow.pdf).
 
 ## Installation and requirements
 
@@ -42,10 +42,10 @@ The workflows use Unix command-line tools and support local execution or SLURM.
 
 ```bash
 cd /path/to/LinGraph
-python3 scripts/install.py --conda-env lingraph -j 8
+python3 install.py --conda-env lingraph -j 8
 conda activate lingraph
 export PATH="$PWD/scripts:$PATH"
-python3 scripts/install.py --check-only
+python3 install.py --check-only
 ```
 
 The installer creates or updates the named environment, builds the C++ tools
@@ -423,6 +423,30 @@ HG003_h1 /data/prepared/HG003.h1.prepared.fasta
 HG003_h2 /data/prepared/HG003.h2.prepared.fasta
 ```
 
+### Recommended alternatives for CHM13
+
+[data/alternatives.fa](data/alternatives.fa) is the recommended alternative
+sequence catalog to use alongside CHM13. Its adjacent `.fai` index is included.
+If you edit or replace the FASTA, regenerate the index:
+
+```bash
+samtools faidx data/alternatives.fa
+```
+
+Import the catalog when building a new cohort graph against CHM13:
+
+```bash
+python3 scripts/LinGraph.py graph \
+  -I cohort.list -G cohort_graph -O cohort_calls \
+  -b windowprofs/geneblocks.bed --bed-grouped \
+  -r CHM13_h1 --alternative data/alternatives.fa --exact -t 16
+```
+
+The catalog complements the CHM13 reference; it does not replace its FASTA or
+its entry in `cohort.list`. Imported alternatives become part of the saved
+graph inputs. Use the same catalog when resuming a build. Reuse the resulting
+graph and its saved templates for later calling and GFA export.
+
 ### Choose or change the reference/backbone
 
 Follow these steps to choose which cohort haplotype is used as the reference
@@ -551,58 +575,39 @@ These details are resolved by LinGraph's converters.
 
 ### Convert to standard VCF
 
-Use **`tools/grvcf_to_vcf.py`** with the same reference FASTA used for calling
-and its adjacent `.fai` index. This example converts the SV file; repeat for
-the indel and SNP files with distinct output names:
+`tools/grvcf_to_vcf.py` exports a plain VCF in one streaming pass, without
+reading a reference FASTA. Convert one file at a time:
 
 ```bash
 python3 tools/grvcf_to_vcf.py \
   -i cohort_calls/cohort.sv.vcf \
-  -r /data/references/chm13.fa \
   -o cohort_calls/cohort.sv.standard.vcf
 ```
 
-Individual grVCFs and merged `.sv.vcf`, `.indel.vcf`, and `.snp.vcf` files are
-accepted, including gzip-compressed inputs and older combined `.all.vcf`
-files. Convert one file per invocation. The converter:
+Repeat for the indel and SNP files. Plain and gzip-compressed inputs are
+accepted. The converter:
 
-- Writes explicit REF/ALT bases, adds indel padding, checks the reference, and
-  sorts records. A `<SUB>` becomes one replacement allele.
-- Preserves sample names, genotype ploidy/phasing, missing calls, IDs, QUAL,
-  and FILTER. It replaces graph annotations with `GT` and recalculated
-  `AC`, `AN`, `AF`, and `NS`.
-- Converts the merged representative allele. Supporting observations and their
-  `TEMPLATEOFFSET` values are not expanded into separate alleles.
-- Preserves rows whose `CHROM` is absent from the reference FASTA in
-  `OUTPUT.unplaced.gr.vcf`. Use `--unplaced FILE` to choose that path. These
-  graph-only calls remain available in their original coordinate system.
+- Removes nested records on `INS_`, `DEL_`, `SUB_`, or `DUP_` parents, and
+  records at `POS=0`, which lack a VCF anchor base.
+- Converts `<INS>` with plain `INFO/SEQ` into explicit bases (`ALT=REF+SEQ`).
+  Other symbolic alleles, including insertions with graph-encoded sequence,
+  remain symbolic; it does not decode them during this export.
+- Preserves record order, IDs, REF, QUAL, FILTER, sample names, and GT values.
+  INFO retains only `SVTYPE`, `END`, `SVLEN`, and `NSUP`; FORMAT retains GT.
+- Does not validate against a reference, normalize or sort alleles, calculate
+  allele frequencies, or produce an unplaced-record sidecar. Non-nested
+  alternative-locus coordinates remain in their original coordinate system.
 
-If encoded sequences reference additional graph or alternative FASTAs, supply
-each indexed catalog with `-a`. For normalized, compressed output:
+This is a representative-allele export, **not a lossless assembly export**.
+Keep the original grVCF and its dependencies for nested variation and graph
+construction. Check the reported `written`, `nested_removed`, and
+`position_zero_removed` counts before using the output downstream.
 
-```bash
-python3 tools/grvcf_to_vcf.py \
-  -i cohort_calls/cohort.sv.vcf \
-  -r /data/references/chm13.fa \
-  -a cohort_graph/summary/alternatives.fasta \
-  -o cohort_calls/cohort.sv.standard.vcf.gz --normalize
-```
-
-`--normalize` uses `bcftools norm` for left alignment. A `.vcf.gz` output uses
-BGZF compression and gets a `.csi` index; both options require bcftools.
-All supplied FASTAs need `.fai` indexes. Use `--force` to replace existing
-outputs. Keep the original grVCF for graph construction and detailed annotation.
-
-Auxiliary FASTAs supply sequence for decoding; they do not project graph-only
-coordinates onto the chosen reference. Check the conversion summary's
-`converted` and `unplaced` counts, and retain the unplaced grVCF alongside the
-standard VCF. Encoded alleles referring to other variant IDs need those
-definitions in the input grVCF, or the corresponding named sequences in an
-auxiliary FASTA. Missing sequence dependencies or reference mismatches stop
-conversion with an error.
-
-See [the converter guide](tools/README.md#convert-grvcf-to-standard-vcf) or run
-`python3 tools/grvcf_to_vcf.py --help` for all conversion options.
+Use `.vcf.gz` output for BGZF compression (requires `bgzip`); the converter
+does not create an index. `--force` replaces an existing output. The legacy
+`-r` option is accepted but ignored; `-a` and `--normalize` are not supported.
+See [the converter guide](tools/README.md#convert-grvcf-to-standard-vcf) or
+`python3 tools/grvcf_to_vcf.py --help` for supported options.
 
 ## Build a pangenome GFA from grVCF
 
@@ -631,7 +636,7 @@ To build with gene blocks, call the cohort, and export the GFA in one run, add
 python3 scripts/LinGraph.py graph \
   -I cohort.list -G cohort_graph -O cohort_calls \
   -b windowprofs/geneblocks.bed --bed-grouped \
-  -r CHM13_h1 --exact --mc-graph -t 16
+  -r CHM13_h1 --alternative data/alternatives.fa --exact --mc-graph -t 16
 ```
 
 The default export is **rGFA**, a GFA graph with stable sequence coordinates.
@@ -700,11 +705,14 @@ Use calls made against the same reference and retain their coverage headers.
 
 ```text
 readme.md
-scripts/                 Main pipeline scripts and installation helper
+install.py               Root installer entry point
+scripts/                 Main pipeline scripts and installer implementation
   graph_build_snakemake/ Graph-building workflow
   cohort_call_snakemake/ Cohort-calling workflow
   src/                   C++ sources
-  docs/figures/          Workflow figure (PNG and PDF)
+figures/                 Workflow figure (PNG and PDF)
+data/                    Recommended CHM13 alternatives and FASTA index
+docs/                    Format and usage guides
 tools/                   Preparation and VCF conversion utilities
 windowprofs/             Gene and balanced block-interval BED files
 benchmark/               Trio benchmarks and a README for each script

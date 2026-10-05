@@ -146,65 +146,35 @@ for batch preparation, masking options, and dependencies.
 
 ## Convert grVCF to standard VCF
 
-```bash
-python tools/grvcf_to_vcf.py \
-  -i calls/cohort.sv.vcf \
-  -r reference.fa \
-  -o calls/cohort.sv.standard.vcf
-```
-
-Use the same reference FASTA used for calling, with its adjacent `reference.fa.fai`.
-Individual VCFs and merged `.snp.vcf`, `.sv.vcf`, or `.indel.vcf` files are
-accepted, including older combined `.all.vcf` files. Input can be plain VCF or
-gzip-compressed VCF. Convert one file per invocation; use separate output names
-for the SV, indel, and SNP files produced by a current `--all` run.
-
-The converter:
-
-- Writes explicit REF/ALT bases for SNPs, insertions, deletions, and replacements.
-  A grVCF `<SUB>` becomes one replacement allele.
-- Uses the row's representative sequence and displayed breakpoint. Each
-  carrier's GT continues to indicate support for that merged representative;
-  the per-observation alleles and `TEMPLATEOFFSET` values are not expanded.
-- Saves rows whose CHROM is absent from the reference FASTA to
-  `OUTPUT.unplaced.gr.vcf`; use `--unplaced FILE` to choose another path.
-  Auxiliary FASTAs supply decoding sequences, not new output reference contigs.
-- Preserves sample names, genotype ploidy, phasing, missing calls, IDs, QUAL,
-  and FILTER. Old packed `HSV` and `HSNP` sample fields are accepted.
-- Replaces graph-specific INFO/FORMAT annotations with standard `GT`, `AC`,
-  `AN`, `AF`, and `NS`, computing the counts from the output genotypes.
-- Checks REF against the FASTA, supplies padding bases for indels, and sorts
-  output by FASTA contig order and POS. A grVCF insertion or deletion at
-  boundary zero receives right padding at VCF position 1.
-- Decodes graph-encoded `INFO/SEQ` or `INFO/EXTENDGRAPHCIGAR` using literal
-  query bases, named FASTA targets, and other grVCF allele IDs. Forward
-  references to later rows are supported. Missing sequence, ambiguous `M`
-  operations, conflicting IDs, and reference mismatches cause an error.
-
-For encoded sequences referencing additional graph or alternative FASTAs,
-provide each catalog with `-a`. Each needs an adjacent `.fai`:
+`tools/grvcf_to_vcf.py` exports a plain VCF in one streaming pass, without
+reading a reference FASTA. Convert one file at a time:
 
 ```bash
-python tools/grvcf_to_vcf.py \
-  -i calls/cohort.sv.vcf -r reference.fa \
-  -a savegraph/summary/alternatives.fasta \
-  -o calls/cohort.sv.standard.vcf
+python3 tools/grvcf_to_vcf.py \
+  -i cohort_calls/cohort.sv.vcf \
+  -o cohort_calls/cohort.sv.standard.vcf
 ```
 
-Plain `.vcf` output uses Python and the repository's existing sequence helpers.
-Use `--normalize` for left alignment with `bcftools norm`. Compressed output
-uses BGZF and includes a CSI index; it also requires `bcftools`:
+Repeat for the indel and SNP files. Plain and gzip-compressed inputs are
+accepted. The converter:
 
-```bash
-python tools/grvcf_to_vcf.py \
-  -i calls/cohort.sv.vcf -r reference.fa \
-  -o calls/cohort.sv.standard.vcf.gz --normalize
-```
+- Removes nested records on `INS_`, `DEL_`, `SUB_`, or `DUP_` parents, and
+  records at `POS=0`, which lack a VCF anchor base.
+- Converts `<INS>` with plain `INFO/SEQ` into explicit bases (`ALT=REF+SEQ`).
+  Other symbolic alleles, including insertions with graph-encoded sequence,
+  remain symbolic; it does not decode them during this export.
+- Preserves record order, IDs, REF, QUAL, FILTER, sample names, and GT values.
+  INFO retains only `SVTYPE`, `END`, `SVLEN`, and `NSUP`; FORMAT retains GT.
+- Does not validate against a reference, normalize or sort alleles, calculate
+  allele frequencies, or produce an unplaced-record sidecar. Non-nested
+  alternative-locus coordinates remain in their original coordinate system.
 
-Temporary records and resolved graph sequences are stored on disk beside the
-output, limiting memory use to individual records and sequences. Existing
-output requires `--force`. Input files are never overwritten; final output
-is installed after all conversion and optional normalization steps succeed.
+This is a representative-allele export, **not a lossless assembly export**.
+Keep the original grVCF and its dependencies for nested variation and graph
+construction. Check the reported `written`, `nested_removed`, and
+`position_zero_removed` counts before using the output downstream.
 
-The output follows the
-[VCF 4.3 allele and genotype conventions](https://samtools.github.io/hts-specs/VCFv4.3.pdf).
+Use `.vcf.gz` output for BGZF compression (requires `bgzip`); the converter
+does not create an index. `--force` replaces an existing output. The legacy
+`-r` option is accepted but ignored; `-a` and `--normalize` are not supported.
+Run `python3 tools/grvcf_to_vcf.py --help` for supported options.
