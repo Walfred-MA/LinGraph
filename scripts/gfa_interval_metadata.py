@@ -214,7 +214,7 @@ def _other_variant(fields, info, samples, samples_available, cutoff,
                         continue
                     # INS_SNP: a SNP inside a merged insertion, placed on the
                     # insertion or projected to the destination its bases copy
-                    # (tools/extract_insertion_snps.py), possibly a chromosome.
+                    # (projected insertion SNPs), possibly a chromosome.
                     projected = kind == 'snp' and values[1] == 'INS_SNP'
                     if values[1] != svtype and not projected:
                         continue

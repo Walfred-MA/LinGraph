@@ -9,7 +9,7 @@ read: each row is the merged representative allele, not a base-for-base
 haplotype.
 
 The sequence helpers below (Catalog, Sequences, ...) decode graph-encoded
-alleles for tools/extract_insertion_snps.py and tools/insertion_coordinates.py.
+alleles for tools/insertion_coordinates.py.
 """
 from __future__ import annotations
 
