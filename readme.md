@@ -423,42 +423,47 @@ HG003_h1 /data/prepared/HG003.h1.prepared.fasta
 HG003_h2 /data/prepared/HG003.h2.prepared.fasta
 ```
 
-You can choose **any haplotype in the cohort as the reference/backbone** with
-`-r HAPLOTYPE_NAME` (for example, `-r HG002_h2`). If `-r` is omitted, the
-first haplotype in `cohort.list` is used.
+### Choose or change the reference/backbone
 
-You can create outputs against another backbone without rebuilding the local
-graphs. Once `cohort_graph` is complete, rerun `graph` using that same `-G`,
-omit `-I` and graph-construction options, and set `-r` to another haplotype in
-the saved cohort. The saved local graph alignments are reused; LinGraph
-recomputes the reference-dependent match, lifting, VCF, merge, and GFA steps.
-Give each backbone a separate `-O` directory to keep its VCFs and GFA. For
-example:
+Follow these steps to choose which cohort haplotype is used as the reference
+for variant calling and graph output:
 
-```bash
-python3 scripts/LinGraph.py graph \
-  -G cohort_graph -O cohort_calls_HG002_h2 \
-  -r HG002_h2 --exact --mc-graph -t 16
-```
+1. **Check `cohort.list`.** Every row starts with a unique haplotype name,
+   followed by the path to its prepared assembly. Use the exact name from this
+   column.
+2. **Choose any haplotype in the cohort.** For example, to use `HG002_h2`, add
+   `-r HG002_h2`. If you leave out `-r`, LinGraph uses the first haplotype in
+   `cohort.list`.
+3. **Build the graph and calls.** For a fresh run, pass the cohort list,
+   graph-cache directory, output directory, and your selected backbone:
 
-Use a normal `graph` run for a reference change. `--recall-only` uses the
-reference saved by the previous run and cannot switch backbones.
+   ```bash
+   python3 scripts/LinGraph.py graph \
+     -I cohort.list -G cohort_graph -O cohort_calls_HG002_h2 \
+     -b windowprofs/geneblocks.bed --bed-grouped \
+     -r HG002_h2 --exact --mc-graph -t 16
+   ```
 
-Build with **gene blocks**, the recommended windows for pangenome graph
-construction:
+4. **Create results with a different backbone later.** After the first run has
+   completed, reuse the same `-G` cache, omit `-I` and graph-construction
+   options, change `-r`, and give `-O` a new directory. For example:
 
-```bash
-python3 scripts/LinGraph.py graph \
-  -I cohort.list -G cohort_graph -O cohort_calls \
-  -b windowprofs/geneblocks.bed --bed-grouped \
-  -r CHM13_h1 --exact --mc-graph -t 16
-```
+   ```bash
+   python3 scripts/LinGraph.py graph \
+     -G cohort_graph -O cohort_calls_HG003_h1 \
+     -r HG003_h1 --exact --mc-graph -t 16
+   ```
 
-This writes per-assembly calls under `cohort_calls/samples/NAME/` and the
-merged cohort SV, indel, and SNP grVCFs in `cohort_calls/`. Keep these grVCFs
-for downstream graph export. The `--all`, `--svonly`, `--svindel`, and `--snp`
-options are primarily for selecting VCF contents in singular runs; they do not
-control graph construction.
+   LinGraph reuses the saved local graph alignments and reruns the
+   reference-dependent matching, lifting, VCF, merge, and GFA steps. Use a
+   normal `graph` run for this switch; `--recall-only` uses the reference from
+   the previous run and cannot change backbones.
+
+The selected `-O` directory receives per-assembly calls under
+`samples/NAME/` and the merged cohort SV, indel, and SNP grVCFs. Keep these
+grVCFs for downstream graph export. The `--all`, `--svonly`, `--svindel`, and
+`--snp` options are primarily for selecting VCF contents in singular runs;
+they do not control graph construction.
 
 Keep `-G` and `-O` **separate and non-nested**. Repeat the same command to resume
 completed work and retry unfinished stages. A completed graph retains its
