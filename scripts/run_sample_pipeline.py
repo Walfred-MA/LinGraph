@@ -1046,10 +1046,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--maxtasksperchild",
         type=int,
-        default=1,
+        default=256,
         metavar="N",
         help="recycle graphcigartoref workers after N comparisons, returning their "
-             "memory (default: 1; 0 disables)",
+             "memory (default: 256; 0 disables)",
     )
     parser.add_argument(
         "--edge-blackregion",

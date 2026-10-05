@@ -3251,48 +3251,6 @@ def _read_required_graph_summary_data_from_sources(
     return found
 
 
-def _candidate_graph_entries(
-    graph_entries: Sequence[GraphEntry], pairs: Sequence[core.PairRow]
-) -> List[GraphEntry]:
-    """Prefer the pair matrices, falling back to the complete ordered list."""
-    by_prefix = {entry.graph_prefix: entry for entry in graph_entries}
-    labels = pair_matrix_labels(pairs)
-    if labels and labels.issubset(by_prefix):
-        wanted = labels
-        return [entry for entry in graph_entries if entry.graph_prefix in wanted]
-    unknown = sorted(labels.difference(by_prefix))
-    if unknown:
-        examples = ", ".join(repr(value) for value in unknown[:5])
-        suffix = f" (and {len(unknown) - 5} more)" if len(unknown) > 5 else ""
-        sys.stderr.write(
-            "[graphcigartoref_persample] warning: pair matrix label(s) not found "
-            f"in -L: {examples}{suffix}; searching the full graph list\n"
-        )
-    return list(graph_entries)
-
-
-def pair_matrix_labels(pairs: Sequence[core.PairRow]) -> Set[str]:
-    """Return every original matrix represented by simple/composite pairs."""
-    labels: Set[str] = set()
-    for pair in pairs:
-        # query_name/ref_name are the actual prepared graph-CIGAR record names.
-        # label/ref_label may instead be display/ownership fields, so consult
-        # them only for legacy PairRows that have not yet resolved record names.
-        for encoded in (
-            pair.query_name or pair.label,
-            pair.ref_name or pair.ref_label,
-        ):
-            if not encoded:
-                continue
-            # Mixed-strand composite query names carry this internal suffix.
-            encoded = encoded.split("|outer_strand=", 1)[0]
-            for allele in encoded.split(";"):
-                allele = allele.strip()
-                if allele:
-                    labels.add(allele_matrix_name(allele))
-    return labels
-
-
 def required_graph_paths(
     pairs: Sequence[core.PairRow], gcigars: Dict[str, str]
 ) -> Set[str]:
@@ -3332,7 +3290,6 @@ def read_required_graph_data(
     mappings: Dict[str, str] = {}
     found: Set[str] = set()
     files_read = 0
-    pair_labels = pair_matrix_labels(pairs)
     template_by_graph_path = {
         (template.graph_prefix, core.path_key(template.graph_path)): template
         for template in local_templates
@@ -3358,7 +3315,7 @@ def read_required_graph_data(
             "fallback\n"
         )
 
-    for entry in _candidate_graph_entries(graph_entries, pairs):
+    for entry in graph_entries:
         if required.issubset(found):
             break
         if not os.path.isfile(entry.fasta_path):
@@ -4708,6 +4665,34 @@ def _evaluate_column10_candidate_rows(
     }
 
 
+def _load_malloc_trim():
+    """Return glibc ``malloc_trim``, or None where it is unavailable."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+        return ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return None
+
+
+_MALLOC_TRIM = _load_malloc_trim()
+
+
+def _release_task_memory() -> None:
+    """Free one finished task's memory so a reused worker stays small.
+
+    Results never depend on this: the query cache only saves re-slicing the
+    in-memory assembly, and objects shared from the parent are frozen by
+    ``gc.freeze()`` so the collection only scans this worker's own objects.
+    """
+    if _WORKER_QUERY_CACHE is not None:
+        _WORKER_QUERY_CACHE.clear()
+    gc.collect()
+    if _MALLOC_TRIM is not None:
+        _MALLOC_TRIM(0)
+
+
 def _worker_build_column10_candidates(
     task: Tuple[
         int,
@@ -4749,6 +4734,7 @@ def _worker_build_column10_candidates(
     finally:
         if stop_report is not None:
             stop_report.set()
+        _release_task_memory()
 
 
 _MEMORY_REPORT_SECONDS = 60.0
@@ -5128,7 +5114,7 @@ def _write_parallel(
                     or _group_product(group) >= _HUGE_GROUP_PRODUCT]
             huge_set = set(huge)
             phases = [([index for index in range(len(candidate_groups))
-                        if index not in huge_set], args.processes)]
+                        if index not in huge_set], args.processes, maxtasksperchild)]
             if huge:
                 sys.stderr.write(
                     f"[graphcigartoref_persample] deferring {len(huge)} candidate "
@@ -5136,8 +5122,10 @@ def _write_parallel(
                     f"reference x query >= {_HUGE_GROUP_PRODUCT:.0e} to run one "
                     f"at a time at the end: {_pending_group_labels(candidate_groups, set(range(len(candidate_groups))) - huge_set, limit=10)}\n"
                 )
-                phases.append((huge, 1))
-            for phase_indices, phase_processes in phases:
+                # A fresh worker per huge group returns all of its memory
+                # before the next one starts.
+                phases.append((huge, 1, 1))
+            for phase_indices, phase_processes, phase_recycle in phases:
                 if not phase_indices:
                     continue
                 sys.stderr.write(
@@ -5151,7 +5139,7 @@ def _write_parallel(
                     processes=phase_processes,
                     initializer=_init_worker_state,
                     initargs=initargs,
-                    maxtasksperchild=(maxtasksperchild or None),
+                    maxtasksperchild=(phase_recycle or None),
                 ) as pool:
                     # Conversion costs vary by orders of magnitude. Dispatch one
                     # merged comparison per pool task and consume results as they
@@ -5407,13 +5395,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--maxtasksperchild",
         type=int,
-        default=1,
+        default=256,
         metavar="N",
         help=(
-            "recycle each worker after N comparison tasks. Results are returned "
-            "as text, so a worker exiting after its task returns all memory it "
-            "grew to (idle workers otherwise keep it); 0 keeps workers for the "
-            "whole run (default: 1)"
+            "recycle each worker after N comparison tasks. Each task frees its "
+            "query cache and returns freed heap to the OS; recycling also drops "
+            "pages a long-lived worker has copied from the parent. 0 keeps "
+            "workers for the whole run (default: 256)"
         ),
     )
     parser.add_argument(

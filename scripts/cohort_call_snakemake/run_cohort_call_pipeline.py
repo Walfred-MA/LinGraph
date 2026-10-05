@@ -425,7 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buffer-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--progress-every", type=int, default=1000)
     parser.add_argument("--progress-seconds", type=float, default=60.0)
-    parser.add_argument("--maxtasksperchild", type=int, default=1)
+    parser.add_argument("--maxtasksperchild", type=int, default=256)
     parser.add_argument("--non-reference-tags", default="")
     parser.add_argument(
         "--no-local-template-fallback",
