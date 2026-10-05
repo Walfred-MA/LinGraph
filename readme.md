@@ -30,7 +30,7 @@ graph cache; a cohort `graph` run builds or resumes the graph from the cohort
 assemblies. The downloadable summary below supplies precomputed graph
 information for singular calling.
 
-[Download the workflow figure (PDF)](scripts/docs/figures/lingraph_workflow.pdf).
+[Download the workflow figure (PDF)](docs/figures/lingraph_workflow.pdf).
 
 ## Installation and requirements
 
