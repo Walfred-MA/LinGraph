@@ -36,18 +36,26 @@ def absolute(value, base=None):
 
 def parser(show_advanced=False):
     p = argparse.ArgumentParser(
-        description="LinGraph — build graphs and call assembly variants.",
+        description=(
+            "LinGraph — independent per-haplotype VCF calling or cohort "
+            "pangenome graph construction."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Common run options (place after graph or singular):
+        epilog="""Run modes:
+  singular   Call each sample/haplotype independently; write individual VCFs
+             against an existing graph cache. A reference cache can be reused.
+  graph      Build/resume a pangenome graph from a cohort run; variants are
+             called across the assemblies as part of graph construction.
+
+Common run options (place after graph or singular):
   -G/--graph DIR          Graph save/resume directory; existing graph for singular
   -O/--output DIR         Calling output directory
   -I/--input-list FILE    Assembly list: NAME FASTA per row
   -r/--reference NAME     Reference assembly name or FASTA
   -t/--threads INT        CPU budget (default: up to 16)
-  --rigorous             Run both aligners; singular always uses this mode
   --all / --svonly / --svindel / --snp
-                         Variant selection (default: --all);
-                         --svcutoff defaults to 20 bp
+                         VCF output selection, primarily for singular calls
+  --exact                Cohort merge using indexed assemblies (graph default)
   --merge-only           Merge existing per-sample VCFs
   --slurm                Submit work through SLURM
   --slurm-args TEXT      Quoted sbatch options
@@ -56,7 +64,6 @@ def parser(show_advanced=False):
 Graph-only options:
   --mc-graph             Also export cohort.gfa
   --gfa-only             Export existing merged VCFs
-  --fast / --fast-mode    Selective alignment (default for graph mode)
   --static-block         Keep initial templates; skip additional novel loci
   --recall-only          Recall and merge from saved calling alignments
   --slurm-jobs INT       Maximum simultaneous SLURM jobs (default: 20)
@@ -69,8 +76,8 @@ Full options:
   python LinGraph.py prepare --help
 
 Examples:
-  python LinGraph.py graph -I cohort.list -G savegraph -O calls --all
-  python LinGraph.py singular -I new_samples.list -G graph -O calls
+  python LinGraph.py singular -I samples.list -G graph_cache -O sample_calls
+  python LinGraph.py graph -I cohort.list -G cohort_graph -O cohort_calls --exact
   python LinGraph.py --unlock
 """)
     p.add_argument("--unlock", action="store_true",
@@ -81,13 +88,13 @@ Examples:
     prepare.add_argument('arguments', nargs=argparse.REMAINDER)
     for mode in ("graph", "singular"):
         q = modes.add_parser(mode, formatter_class=argparse.RawDescriptionHelpFormatter,
-            help=("build/resume a graph, call cohort samples, and merge VCFs (default: --fast)"
+            help=("build/resume a pangenome graph from a cohort run"
                   if mode == "graph" else
-                  "call new samples against an existing graph (rigorous alignment only)"),
-            description=("Build/resume a graph, call every cohort sample, and merge VCFs." if mode == "graph"
-                         else "Call new assemblies against an existing graph; report coverage per sample."),
-            epilog=("Examples:\n  python LinGraph.py graph -I cohort.list -G savegraph -O calls\n"
-                    "  python LinGraph.py graph -I cohort.list -r CHM13_h1 -G savegraph -O calls --MC-graph"
+                  "independent VCF calling per sample/haplotype against an existing graph"),
+            description=("Build/resume the pangenome graph from a cohort run; call variants across its assemblies." if mode == "graph"
+                         else "Independent calling: write a VCF for each input sample/haplotype using an existing graph."),
+            epilog=("Examples:\n  python LinGraph.py graph -I cohort.list -G cohort_graph -O calls --exact\n"
+                    "  python LinGraph.py graph -I cohort.list -r CHM13_h1 -G cohort_graph -O calls --exact --MC-graph"
                     if mode == "graph" else
                     "Examples:\n  python LinGraph.py singular -i query.fa --sample HG002_h1 -G graph -O calls\n"
                     "  python LinGraph.py singular -I samples.list -G graph -r reference.fa -O calls --merge")
@@ -119,10 +126,24 @@ Examples:
         alignment = q.add_mutually_exclusive_group()
         if mode == "graph":
             alignment.add_argument("--fast", "--fast-mode", dest="alignment_mode", action="store_const", const="fast",
-                                   help="BLASTN first; Winnowmap for qualifying unfinished queries (graph default)")
+                                   help=("BLASTN first; Winnowmap for qualifying unfinished queries (graph default)"
+                                         if show_advanced else argparse.SUPPRESS))
         alignment.add_argument("--rigorous", "--slow-rigorous", dest="alignment_mode", action="store_const", const="rigorous",
-                               help="run BLASTN and Winnowmap for every query (always used by singular)")
-        cohort_merge.add_modes(q)
+                               help=("run BLASTN and Winnowmap for every query (always used by singular)"
+                                     if show_advanced else argparse.SUPPRESS))
+        merge_modes = cohort_merge.add_modes(q)
+        for action in merge_modes._group_actions:
+            if action.dest == "exact" and mode == "graph":
+                action.help = (
+                    "cohort merged VCFs (default); realign merged SVs against "
+                    "the indexed assemblies"
+                )
+        if not show_advanced:
+            for action in merge_modes._group_actions:
+                if (mode == "graph" and action.dest == "merge_mode") or (
+                    mode == "singular" and action.dest == "exact"
+                ):
+                    action.help = argparse.SUPPRESS
         stages = q.add_mutually_exclusive_group()
         stages.add_argument("--merge-only", action="store_true", help="merge existing per-sample VCFs" +
                             ("; add --mc-graph to also export GFA" if mode == "graph" else ""))

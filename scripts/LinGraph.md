@@ -3,8 +3,11 @@
 Use `scripts/LinGraph.py` as the public command-line entry point for assembly
 preparation, graph construction, variant calling, merging, and GFA export.
 Run the examples from the repository root.
-Local execution is the default. Top-level `-h` summarizes the commands, default
-alignment modes, and common run options. Put run options after `graph` or
+Local execution is the default. Top-level `-h` explains the two run types:
+`singular` for independent per-haplotype VCFs against an existing graph, and
+`graph` to build or resume a pangenome graph from a cohort run. The cohort's
+variants are called as part of graph construction. Put
+run options after `graph` or
 `singular`; use that command's `--help-all` for the complete calling, merging,
 construction, SLURM, and GFA tuning options.
 Users do not need to invoke the backend scripts directly.
@@ -21,8 +24,8 @@ python3 scripts/LinGraph.py prepare --help
 
 | Task | Options |
 | --- | --- |
-| Variant selection | `--all`, `--svonly`, `--svindel`, `--snp`, `--svcutoff` |
-| Local graph alignment | `--fast` (graph only), `--rigorous` |
+| Singular VCF selection | `--all`, `--svonly`, `--svindel`, `--snp`, `--svcutoff` |
+| Cohort merge | `--exact` (default for cohort graph runs) |
 | Partial runs | `--recall-only`, `--merge-only`, `--gfa-only`, `--vcf-list` |
 | GFA export | `--mc-graph`, `--insertion-only [SIZE]`, `--gfa-mode`, `--max-node-length`, anchor and size filters |
 | Workflow inspection | `--dry-run`, `--dag-dry-run`, `--snakemake-args`, standalone `--unlock` |
@@ -36,27 +39,21 @@ the cohort caller's original-template intervals. Settings that cannot apply to
 a partial run are rejected. `--sequence-similarity` is retained for compatibility;
 the SV backend currently uses its fixed KmerMatch insertion-similarity rule.
 
-Graph mode defaults to `--fast`: bulk BLASTN first, then Winnowmap for qualifying
-incomplete, repeat-heavy queries. `--rigorous` / `--slow-rigorous` runs both
-aligners for every query. Singular mode always uses rigorous alignment for
-both the query and reference; it does not accept `--fast` or `--fast-mode`.
-Its added query anchors can otherwise trigger fast-mode fallback repeatedly.
-An explicit alignment mode makes a normal graph run check the construction
-workflow even when a graph already exists; changing the mode can invalidate
-alignment results.
+The default settings are suitable for ordinary runs. Use `--help-all` only
+when you need to tune advanced workflow options.
 
 Add `--static-block` to a graph run to use the initial block templates without
 calling additional novel loci. New builds still create the initial blocks from
 the reference, supplied BED, and any supplied alternative templates. Within
 each block, this option skips minset discovery and local template refinement;
 the original template coordinates, orientation, and sequence are retained.
-Sample alignment, variant calling, and merging still run, with `--all`,
-`--svonly`, `--svindel`, or `--snp` controlling the VCF contents as usual.
-Graph mode retains both `--fast` and `--rigorous` with static blocks too.
+Sample alignment, variant calling, and merging still run. Cohort graph runs
+use `--exact` for merged call inputs; VCF selection options are documented with
+singular calling.
 
 ```bash
 python scripts/LinGraph.py graph --graph graph -I NA19240trios.txt \
-  -O HG38SVs -r HG38_h1 --all --static-block -t 16
+  -O HG38SVs -r HG38_h1 --exact --static-block -t 16
 ```
 
 `--static-block` cannot be combined with `--find-novel-loci` or
@@ -126,7 +123,7 @@ failures print a `tools/prepare_assemblies.py` command. The standalone
 `run_sample_pipeline.py` prepares query names and masks in its output directory,
 but does not alter the source assembly.
 
-## Graph mode
+## Cohort graph mode
 
 ```bash
 python3 scripts/LinGraph.py graph \
@@ -155,37 +152,35 @@ python3 scripts/LinGraph.py graph -I prepared_assemblies/query_paths.prepared.tx
 
 `-L partitions.list` restricts calling to those partitions. Omit it to call
 all active graph partitions. Construction still completes the graph workflow.
-The default merge is `--svonly`, writing `cohort.sv.vcf`. With `--mc-graph`
-(or `--MC-graph`), the default becomes `--all`, writing `cohort.sv.vcf`,
-`cohort.indel.vcf`, and `cohort.snp.vcf` and converting them to `cohort.gfa`. Explicit modes override these defaults:
-`--snp` writes only `cohort.snp.vcf`; `--svindel` writes `cohort.sv.vcf` and
-`cohort.indel.vcf`, splitting the same merged SV calls at `--svcutoff` (default
-20 bp). `--all` includes SNPs and SVs of every size in these three separate VCFs.
+Use `--exact` for the cohort merge (the default). It writes
+`cohort.sv.vcf`, `cohort.indel.vcf`, and `cohort.snp.vcf`, and realigns merged
+SVs against the indexed assemblies. Add `--mc-graph` to also export
+`cohort.gfa`; it does not change the merge mode. The alternative merge modes
+(`--all`, `--svonly`, `--svindel`, and `--snp`) are available for specialized
+cohort output, but are generally used to select contents for singular VCF
+calling.
 
-Individual calling extracts SNPs from encoded insertion alignments by default,
-including short insertions; `--svonly` suppresses SNPs. Existing VCFs must be
-recalled to add these SNPs. Use `--recall-only --all` to require existing
-alignments and regenerate only the VCFs and merged output (see below).
+Use `--recall-only --exact` to require existing alignments and regenerate the
+cohort VCF outputs without rebuilding the graph (see below).
 
-The GFA converter receives `--svonly` when the main run uses `--svonly`, and
-`--all` otherwise. To merge existing calls without graph building, calling,
-or GFA export, use:
+To merge existing calls without graph building, calling, or GFA export, use:
 
 ```bash
-python scripts/LinGraph.py graph -G graph -O cohort_calls --merge-only --all -t 16
+python scripts/LinGraph.py graph -G graph -O cohort_calls --merge-only --exact -t 16
 ```
 
 ### Recall individual VCFs and merge, using existing alignments
 
 ```bash
 python scripts/LinGraph.py graph -G graph -O HG38SVs -r HG38_h1 \
-  --recall-only --all -t 16
+  --recall-only --exact -t 16
 ```
 
 This reads `HG38SVs/inputs/cohort_call.run.json` and directly runs the individual
 VCF caller on each saved `samples/NAME/NAME.graphcigartoreffix.tsv`, then merges
 the recalled VCFs into `cohort.sv.vcf`, `cohort.indel.vcf`, and `cohort.snp.vcf`
-under `HG38SVs/`. No Snakemake DAG is launched.
+under `HG38SVs/`. `--exact` uses the saved query paths and indexed assemblies
+for the cohort merge. No Snakemake DAG is launched.
 Template discovery, graph alignment, gap filling, graph completeness checks,
 and preparation scans are skipped. A missing required input stops the run
 before any individual VCF is changed.
@@ -194,7 +189,7 @@ The saved reference, FASTA paths, templates, coordinate maps, and biological
 calling settings are reused. `-r`, if supplied, must match that reference.
 `-I samples.list` can select a subset of saved samples using the same FASTA
 paths; the saved reference is always included. Omit `-I` for all samples in
-the saved calling run. `--svonly`, `--snp`, and `--svindel` also work.
+the saved calling run. Specialized merge modes are available when needed.
 `--samples` can select saved sample names. Calling overrides such as
 `--no-realignment`, `--edge-blackregion`, `--no-pa-tag`, and
 `--separate-adjacent-indels`, plus merge thresholds, can be supplied explicitly;
@@ -211,15 +206,15 @@ Add `--mc-graph` to a merge-only or recall-only run to export its merged result.
 To export an existing merged VCF by itself:
 
 ```bash
-python3 scripts/LinGraph.py graph -G graph -O HG38SVs -r HG38_h1 --gfa-only --all -t 16
+python3 scripts/LinGraph.py graph -G graph -O HG38SVs -r HG38_h1 --gfa-only -t 16
 ```
 
 `--merge-only --vcf-list vcfs.list` selects an explicit list of individual VCFs.
 
 The cohort calling workflow ignores script modification times when deciding
 whether to reuse completed stages, including template discovery and lifting.
-Switching `--svonly` to `--all` changes VCF calling and merging settings; it does
-not invalidate templates or alignments. Changed data or stage settings, missing
+Changing the merge mode changes VCF merging settings; it does not invalidate
+templates or alignments. Changed data or stage settings, missing
 outputs, and incomplete jobs can still schedule upstream work. To apply a script
 update to completed outputs, explicitly force the affected rule or change its
 stage protocol. `--forcerun graphreftovcf_sample` does not restrict the upstream
@@ -384,9 +379,9 @@ OUTPUT/
   samples/NAME/NAME.coverage.summary.tsv        # singular mode
   samples/NAME/NAME.coverage.missing_reference.bed
   samples/NAME/NAME.coverage.missing_query.bed
-  cohort.snp.vcf                             # --snp or --all
-  cohort.indel.vcf                           # below-cutoff SVs with --svindel or --all
-  cohort.sv.vcf                              # --svonly (default), --svindel, or --all
+  cohort.snp.vcf                             # --exact (default), --all, or --snp
+  cohort.indel.vcf                           # --exact (default), --all, or --svindel
+  cohort.sv.vcf                              # --exact (default), --all, --svonly, or --svindel
   cohort.gfa                                  # --MC-graph
   lingraph/run.json
   lingraph/logs/
@@ -420,7 +415,7 @@ this is an orchestration preview, not a Snakemake DAG validation.
 For the actual Snakemake job plan on an existing completed graph:
 
 ```bash
-python3 scripts/LinGraph.py graph -G graph -O HG38SVs -r HG38_h1 --all -t 16 --dag-dry-run
+python3 scripts/LinGraph.py graph -G graph -O HG38SVs -r HG38_h1 --exact -t 16 --dag-dry-run
 ```
 
 This refreshes the saved cohort list and stage configurations, then runs the
@@ -435,7 +430,7 @@ its required upstream dependencies.
 
 ```bash
 python scripts/LinGraph.py graph --graph graph -O HG38SVs -r HG38_h1 \
-  --all --rigorous -t 16 --slurm --slurm-jobs 40 \
+  --exact -t 16 --slurm --slurm-jobs 40 \
   --slurm-args '--time=20:00:00 --account=mchaisso_100 --partition=qcb' \
   --dry-run
 ```

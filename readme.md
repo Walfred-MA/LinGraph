@@ -1,23 +1,22 @@
 # LinGraph
 
-**LinGraph is an assembly-based structural variant (SV) caller for challenging
-repetitive regions of the genome and a pangenome graph builder. It supports
-both cohort SV calling and graph construction for cohorts containing thousands
-of haplotypes.** LinGraph records variant sequences and assembly coordinates
-in grVCF and can export cohort calls as a pangenome graph.
+**LinGraph is an assembly-based structural variant (SV) caller and pangenome
+graph builder.** Use `singular` for independent VCF calling against an existing
+graph cache, or `graph` for a cohort run that calls variants together while
+building a pangenome graph. LinGraph records variant sequences and assembly
+coordinates in grVCF and can export cohort calls as a pangenome graph.
 
 ## Contents
 
 1. [Workflow overview](#workflow-overview)
 2. [Installation and requirements](#installation-and-requirements)
-3. [Modes and input preparation](#modes-and-input-preparation)
-4. [Choose windows for graph construction](#choose-windows-for-graph-construction)
-5. [Download and reconstruct Win50KGraph](#download-and-reconstruct-win50kgraph)
-6. [Call one or many samples independently](#call-one-or-many-samples-independently)
-7. [Call variants in a cohort](#call-variants-in-a-cohort)
-8. [grVCF format and standard VCF conversion](#grvcf-format-and-standard-vcf-conversion)
-9. [Build a pangenome GFA from grVCF](#build-a-pangenome-gfa-from-grvcf)
-10. [Benchmark trio consistency](#benchmark-trio-consistency)
+3. [Choose a run mode and prepare inputs](#choose-a-run-mode-and-prepare-inputs)
+4. [For singular mode: download and reconstruct Win50KGraph](#for-singular-mode-download-and-reconstruct-win50kgraph)
+5. [Call one or many samples independently](#call-one-or-many-samples-independently)
+6. [Build a new pangenome graph from a fresh cohort run](#build-a-new-pangenome-graph-from-a-fresh-cohort-run)
+7. [grVCF format and standard VCF conversion](#grvcf-format-and-standard-vcf-conversion)
+8. [Build a pangenome GFA from grVCF](#build-a-pangenome-gfa-from-grvcf)
+9. [Benchmark trio consistency](#benchmark-trio-consistency)
 
 ## Workflow overview
 
@@ -26,8 +25,10 @@ in grVCF and can export cohort calls as a pangenome graph.
 LinGraph partitions assemblies into loci, builds and aligns local graphs, and
 uses those alignments to call variants. Cohort calls retain sequence and graph
 relationships in grVCF and can be exported as a pangenome GFA. Novel-locus
-discovery is optional. The downloadable summary below supplies precomputed
-graph information for individual sample calling.
+discovery is optional. For independent VCF calls, `singular` reuses a supplied
+graph cache; a cohort `graph` run builds or resumes the graph from the cohort
+assemblies. The downloadable summary below supplies precomputed graph
+information for singular calling.
 
 [Download the workflow figure (PDF)](scripts/docs/figures/lingraph_workflow.pdf).
 
@@ -79,23 +80,30 @@ high repeat complexity may need more memory and temporary storage. For cohorts
 with thousands of haplotypes, use shared storage and the SLURM options described
 in [the full command guide](scripts/LinGraph.md#slurm-and-dependencies).
 
-## Modes and input preparation
+## Choose a run mode and prepare inputs
 
-LinGraph has two calling modes:
+Choose the mode based on the result you need:
 
-| Mode | Use it for | Graph input | Default alignment |
-| --- | --- | --- | --- |
-| `singular` | **Independent SV calling for one or many samples**; one VCF per input haplotype | An existing LinGraph graph or compact summary | `--rigorous` only |
-| `graph` | Joint cohort SV calling and pangenome graph construction | Builds, resumes, or reuses a cohort graph | `--fast` |
+| Mode | Use it for | Data needed and reuse |
+| --- | --- | --- |
+| `singular` | **Independent VCF calling**; one call per input haplotype, optionally merged afterward | A reconstructed graph cache and reference FASTA. Reuse a matching reference alignment cache when available. |
+| `graph` (cohort mode) | **Call a cohort together while building or resuming its pangenome graph** | Cohort assembly list and reference. A fresh run builds the graph under `-G`; a completed graph can be resumed. |
 
-**`singular` means independent sample calling. It supports multiple samples in
-one command.** Each input haplotype is called separately using the same existing
-graph and reference alignments. Use `graph` for the cohort graph-building and
-calling workflow.
+`singular` can process multiple samples in one command, but calls each
+haplotype independently and writes a separate VCF. The `graph` command is the
+cohort workflow: it calls the cohort as part of building the graph.
 
-Both modes write **grVCF**, LinGraph's graph-aware variant format, using `.vcf`
-filenames. In `graph` mode, add `--mc-graph` to export a pangenome graph as
-`cohort.gfa`.
+Recommended windows: for singular calls, reuse a graph cache built with
+balanced blocks (the supplied Win50KGraph cache uses these). For cohort graph
+construction, use gene blocks; balanced blocks are an alternative when
+prioritizing SV calling. The supplied gene and balanced BEDs use CHM13
+coordinates, so use the matching CHM13 reference.
+
+**Automatic blocks** are also available for cohort graph construction. Omit
+`-b` and `--bed-grouped` and LinGraph chooses windows from the construction
+inputs. Singular mode does not choose windows; it uses the ones in its graph
+cache. Add `--mc-graph` to a cohort run when you also want the pangenome GFA
+file `cohort.gfa`.
 
 ### Prepare assembly FASTAs
 
@@ -168,35 +176,7 @@ Input rules:
 
 See [assembly preparation](tools/assembly_preparation.md) for more options.
 
-## Choose windows for graph construction
-
-LinGraph builds local graphs within genomic windows, also called **blocks**.
-Choose one of these three options when constructing a new graph:
-
-| Block option | Purpose and recommendation | Selection in `graph` mode |
-| --- | --- | --- |
-| **Gene blocks** | Use genes to define windows, making the graphs useful for annotation and phylogenetic analysis. **Recommended for pangenome graph building.** | `-b windowprofs/geneblocks.bed --bed-grouped` |
-| **Balanced blocks** | Balance window sizes for slightly better SV calling accuracy. **Recommended for individual sample SV calling; a graph cache is already provided.** | `-b windowprofs/balanceblocks.bed --bed-grouped` |
-| **Automatic blocks** | Let LinGraph generate its own blocks from the construction inputs. | Omit both `-b` and `--bed-grouped`. |
-
-The supplied [gene blocks](windowprofs/geneblocks.bed) and
-[balanced blocks](windowprofs/balanceblocks.bed) use **CHM13 coordinates**.
-Build with the matching CHM13 reference and contig names. `-b` selects the BED
-file; `--bed-grouped` preserves its supplied grouping of related windows.
-Automatic blocking is the default when no BED is supplied.
-
-The [cohort example](#call-variants-in-a-cohort) below uses gene blocks. To use
-balanced blocks, replace `windowprofs/geneblocks.bed` with
-`windowprofs/balanceblocks.bed`. To use automatic blocks, remove `-b` and
-its BED path together with `--bed-grouped`. Use a separate graph directory for
-each block choice.
-
-For **individual sample SV calling**, download and reconstruct the provided
-balanced-block graph cache, [Win50KGraph](#download-and-reconstruct-win50kgraph),
-then use `singular` mode. Its windows are already defined, so no block BED is
-needed when reconstructing the cache or calling new samples against it.
-
-## Download and reconstruct Win50KGraph
+## For singular mode: download and reconstruct Win50KGraph
 
 **`Win50KGraph.tar.gz`** is the precomputed LinGraph graph-summary package for
 the **balanced-block option**, recommended for individual sample SV calling.
@@ -283,8 +263,8 @@ that reference's alignments.
 Use `singular` to call and annotate **one sample or a batch of samples
 independently** against an **existing LinGraph graph**.
 Pass the graph root or its `summary/` directory with `-G`. To obtain a graph,
-[download and reconstruct Win50KGraph](#download-and-reconstruct-win50kgraph)
-or build one with [graph mode](#call-variants-in-a-cohort).
+[download and reconstruct Win50KGraph](#for-singular-mode-download-and-reconstruct-win50kgraph)
+or build one with [cohort mode](#build-a-new-pangenome-graph-from-a-fresh-cohort-run).
 
 The examples below use `cohort_graph` as that existing graph. Reference names
 such as `CHM13_h1` must occur in its saved cohort list; otherwise, supply the
@@ -359,10 +339,10 @@ To supply one FASTA directly, replace `-I ...` with
 `singular` caches reference preparation under the graph root:
 
 ```text
-cohort_graph/references/CHM13_h1_rig/   # singular always uses rigorous alignment
+cohort_graph/references/CHM13_h1_rig/
 ```
 
-It first selects the rigorous directory by reference sample name,
+LinGraph selects the reference cache directory by reference sample name,
 then checks the SHA-256 hash of sorted chromosome-name/length pairs from the
 first two `.fai` columns. The hash ignores FASTA contents, file names, masking,
 wrapping, `.fai` row order, offsets, and timestamps. It is saved in
@@ -403,7 +383,6 @@ The coverage files report represented and uncovered assembly bases.
 
 | Option | Effect |
 | --- | --- |
-| `--rigorous` / `--slow-rigorous` | Run BLASTN and Winnowmap for every query; always used in singular mode. |
 | `--all` | Include SNPs, indels, and SVs of all sizes; multiple inputs also produce separate merged VCFs. |
 | `--merge` | Merge calls when more than one haplotype is supplied; by default, writes `cohort.sv.vcf`. |
 | `--svcutoff 50` | Set the SV size boundary to 50 bp; the default is 20 bp. |
@@ -420,19 +399,19 @@ individual `.vcf` files can retain smaller candidate events for merging.
 
 A compact summary contains `local_graphs.tsv` and `alternatives.fasta`.
 Reconstruct it with the package's source reference before selecting a different
-calling reference. See the [Win50KGraph instructions](#download-and-reconstruct-win50kgraph).
+calling reference. See the [Win50KGraph instructions](#for-singular-mode-download-and-reconstruct-win50kgraph).
 
-## Call variants in a cohort
+## Build a new pangenome graph from a fresh cohort run
 
-**Graph mode supports thousand-scale cohorts**, enabling joint SV calling and
-pangenome graph construction across thousands of haplotypes.
+**Cohort mode builds or resumes a pangenome graph from a cohort run.** The
+workflow calls variants across the assemblies as part of graph construction.
+Use this mode for a fresh graph build; use `singular` when you already have a
+graph cache and need individual VCFs. It supports thousands of haplotypes.
 
-Use `graph` to build or reuse local graphs, call the cohort, and merge its
-variants. Cohort calling can be slightly faster than separate singular runs
-because it reuses the cohort graph alignments. Graph mode defaults to `--fast`,
-which runs BLASTN first and sends qualifying unfinished queries to Winnowmap.
-Singular mode does not accept `--fast` or `--fast-mode`. Total runtime includes
-graph construction when a graph is not already available.
+The `graph` command builds/resumes local graphs and runs cohort variant calling
+as part of that workflow. Use `--exact` for the merged cohort output; it is the
+default and uses the indexed assemblies to realign merged SVs. Add `--mc-graph`
+to export the resulting pangenome GFA in the same run.
 
 Create `cohort.list` with the reference and prepared haplotypes:
 
@@ -445,24 +424,20 @@ HG003_h2 /data/prepared/HG003.h2.prepared.fasta
 ```
 
 Build with **gene blocks**, the recommended windows for pangenome graph
-construction, and call the cohort:
+construction:
 
 ```bash
 python3 scripts/LinGraph.py graph \
   -I cohort.list -G cohort_graph -O cohort_calls \
   -b windowprofs/geneblocks.bed --bed-grouped \
-  -r CHM13_h1 --all -t 16
+  -r CHM13_h1 --exact --mc-graph -t 16
 ```
 
-This writes individual calls to `cohort_calls/samples/NAME/NAME.vcf` and the
-merged SV, indel, and SNP grVCFs to separate files in `cohort_calls/`. Choose the output contents with:
-
-| Option | Merged output | Contents |
-| --- | --- | --- |
-| `--svonly` | `cohort.sv.vcf` | SV representatives at or above `--svcutoff`; default without GFA export |
-| `--all` | `cohort.sv.vcf`, `cohort.indel.vcf`, `cohort.snp.vcf` | SNPs, indels, and SVs of all sizes; default with `--mc-graph` |
-| `--svindel` | `cohort.sv.vcf` and `cohort.indel.vcf` | SVs split at the cutoff, without SNPs |
-| `--snp` | `cohort.snp.vcf` | SNPs only |
+This writes per-assembly calls under `cohort_calls/samples/NAME/` and the
+merged cohort SV, indel, and SNP grVCFs in `cohort_calls/`. Keep these grVCFs
+for downstream graph export. The `--all`, `--svonly`, `--svindel`, and `--snp`
+options are primarily for selecting VCF contents in singular runs; they do not
+control graph construction.
 
 Keep `-G` and `-O` **separate and non-nested**. Repeat the same command to resume
 completed work and retry unfinished stages. A completed graph retains its
@@ -470,7 +445,6 @@ cohort list, so `-I` can then be omitted.
 
 Useful additions:
 
-- `--rigorous`: use both aligners for every query during graph alignment.
 - `--static-block`: retain initial templates and skip additional novel-locus
   discovery and refinement. Calling and merging still run.
 - `--slurm --slurm-jobs 20 --slurm-args '--account=myaccount --partition=compute'`:
@@ -478,11 +452,11 @@ Useful additions:
 
 For existing results, use `--merge-only` to merge saved individual VCFs, or
 `--recall-only` to regenerate VCFs and merge from saved calling alignments. For
-example, to add small variants to a previous SV-only calling run:
+example, to regenerate exact merged cohort outputs:
 
 ```bash
 python3 scripts/LinGraph.py graph -G cohort_graph -O cohort_calls \
-  -r CHM13_h1 --recall-only --all -t 16
+  -r CHM13_h1 --recall-only --exact -t 16
 ```
 
 Recall requires the saved alignments and calling inputs. See
@@ -613,15 +587,15 @@ information needed for graph reconstruction.
 
 ### Export through LinGraph
 
-To export the merged SV, indel, and SNP VCFs produced above without calling or merging again:
+To export the merged cohort VCFs produced above without calling or merging again:
 
 ```bash
 python3 scripts/LinGraph.py graph -G cohort_graph -O cohort_calls \
-  -r CHM13_h1 --gfa-only --all -t 16
+  -r CHM13_h1 --gfa-only -t 16
 ```
 
 The output is **`cohort_calls/cohort.gfa`**. Use the same graph, reference, and
-variant-selection mode as the calling run. Keep its original assembly FASTAs,
+merged cohort VCFs as the calling run. Keep its original assembly FASTAs,
 indexes, and saved template files available: graph export needs their sequences.
 
 To build with gene blocks, call the cohort, and export the GFA in one run, add
@@ -631,15 +605,15 @@ To build with gene blocks, call the cohort, and export the GFA in one run, add
 python3 scripts/LinGraph.py graph \
   -I cohort.list -G cohort_graph -O cohort_calls \
   -b windowprofs/geneblocks.bed --bed-grouped \
-  -r CHM13_h1 --all --mc-graph -t 16
+  -r CHM13_h1 --exact --mc-graph -t 16
 ```
 
 The default export is **rGFA**, a GFA graph with stable sequence coordinates.
 It includes the reference backbone and branches for the selected SNPs, indels,
 and SVs. Its named paths describe source sequences and variant alleles.
 
-- `--all` retains variants of all sizes. Use `--svonly --svcutoff 50` for
-  an SV-only export, or `--insertion-only 50` to retain insertions of at least 50 bp.
+- Cohort graph runs use `--exact` for merged call inputs. Use
+  `--insertion-only 50` to export only insertions of at least 50 bp.
 - `--max-node-length` sets the maximum segment length; the default is 1,024 bases.
 - An explicit `-r` selects that haplotype as the backbone. Without `-r`, export
   uses `GRAPH/inputs/reference_alternatives_novels.fa`, the combined catalog of
@@ -647,9 +621,11 @@ and SVs. Its named paths describe source sequences and variant alleles.
 
 ### Convert grVCF files directly
 
-To select the input files explicitly, use `merged_vcf_to_gfa.py`. A cohort run
-with `--all` produces three files; pass all three so nested variants can resolve
-their parent alleles across files:
+To select the input files explicitly, use `merged_vcf_to_gfa.py`. An exact
+cohort run produces SV, indel, and SNP files; pass all three so nested variants
+can resolve their parent alleles across files. Here `--all` tells this
+standalone converter which input categories were supplied; cohort runs use
+`--exact` as shown above.
 
 ```bash
 python3 scripts/merged_vcf_to_gfa.py \
