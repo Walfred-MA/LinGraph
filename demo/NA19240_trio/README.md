@@ -1,79 +1,227 @@
-# Getting started: NA19240 trio (HGSVC3)
+# Getting started: NA19240 trio
 
-This demo runs LinGraph end to end on the YRI trio from HGSVC3:
-NA19240 (child), NA19238 (mother) and NA19239 (father), two haplotypes each.
+This tutorial runs LinGraph on the YRI trio assembled by HGSVC3: NA19240
+(child), NA19238 (mother) and NA19239 (father), two haplotypes each. It shows
+two ways to use LinGraph:
 
-1. Install LinGraph.
-2. Download and prepare CHM13 and GRCh38.
-3. Download the Win50KGraph package and reconstruct its local graphs.
-4. Download and prepare the six trio assemblies.
-5. Call SVs per haplotype with Win50KGraph, on CHM13 and on GRCh38.
-6. Benchmark trio consistency.
-7. Build a new trio pangenome graph on CHM13 (gene windows plus the bundled
-   alternative catalog), call every haplotype, merge on CHM13 and export GFA.
+- **SV calling with a precomputed graph** (`singular`): call each haplotype
+  against Win50KGraph, on CHM13 or GRCh38, then check trio consistency.
+- **Building a new pangenome graph** (`graph`): build a trio graph on CHM13
+  with gene-based windows and the bundled alternative sequences, call every
+  haplotype, merge the calls on CHM13 and export the graph as GFA.
 
-Each step is a script in this folder. Scripts are rerunnable: downloads and
-long stages resume where they stopped.
-
-## Setup
-
-Pick an absolute folder with about **300 GB** free, clone LinGraph into it and
-run the demo scripts from the clone:
+Run every command from one demo folder. Plan for about **300 GB** of disk.
+Steps that take hours are marked; run them on a compute node, for example under
+`nohup ... > log 2>&1 &`.
 
 ```bash
-export DEMO=/absolute/path/lingraph_demo
-mkdir -p $DEMO && git clone https://github.com/Walfred-MA/LinGraph.git $DEMO/LinGraph
-cd $DEMO/LinGraph/demo/NA19240_trio
-source 00_env.sh          # repeat (with DEMO exported) in every new shell
+mkdir lingraph_demo && cd lingraph_demo
 ```
 
-Long steps are run with `nohup` on a compute node and log to `$LOGS`
-(`$DEMO/logs`). `THREADS` (default 64) sets the CPU budget of steps 3 and 5.
-
-## Steps
-
-| Step | Command | Output |
-| --- | --- | --- |
-| 1 Install | `bash 01_install.sh` | `$DEMO/LinGraph`, conda envs `LinGraph` and `truvari` |
-| 2 References | `bash 02_references.sh` | `$CHM13`, `$HG38` (+ `.fai`) |
-| 3 Graph package | `bash 03_graph_package.sh` | `$DEMO/Win50KGraph` |
-| 4 Assemblies | `bash 04_assemblies.sh` | `$ASM/prepared/query_paths.prepared.txt` |
-| 5 SV calling | `bash 05_singular.sh CHM13` and `bash 05_singular.sh HG38` | `$DEMO/calls_win50k_chm13`, `$DEMO/calls_win50k_hg38` |
-| 6 Benchmark | `bash 06_benchmark.sh $DEMO/calls_win50k_chm13` (likewise for the others) | `OUTPUT/benchmark/trio.*.tsv` |
-| 7 Graph construction | `bash 07_graph_build.sh` | `$DEMO/trio_graph`, `$DEMO/trio_calls` (`cohort.*.vcf`, `cohort.gfa`) |
-
-Steps 2–6 and 7 run inside the LinGraph environment (`conda activate
-LinGraph`). Steps 2, 3 and 4 are independent of each other once step 1 is
-done, except that step 3 needs `$CHM13` from step 2.
-
-On the cluster, for example:
+## 1. Install LinGraph
 
 ```bash
-bash 01_install.sh > $LOGS/01.log 2>&1
+git clone https://github.com/Walfred-MA/LinGraph.git
+cd LinGraph
+python3 install.py --conda-env LinGraph -j 16
 conda activate LinGraph
-nohup bash 02_references.sh > $LOGS/02.log 2>&1 &
-nohup bash 04_assemblies.sh > $LOGS/04.log 2>&1 &
-# after step 2 finishes:
-nohup bash 03_graph_package.sh > $LOGS/03.log 2>&1 &
-# after steps 3 and 4:
-nohup bash 05_singular.sh CHM13 > $LOGS/05_chm13.log 2>&1 &
-nohup bash 07_graph_build.sh > $LOGS/07.log 2>&1 &
+python3 install.py --check-only
+cd ..
 ```
 
-## Notes
+`install.py` creates the `LinGraph` conda environment (using mamba when
+available), installs the dependencies and compiles the native tools into
+`LinGraph/scripts/`. Activate the environment in every new shell.
 
-- **Reference choice.** Win50KGraph ships alignment caches for both CHM13
-  (`CHM13_h1`) and GRCh38 (`HG38_h1`); use either with the same graph. The
-  GRCh38 FASTA is the 25 main contigs of the no-alt analysis set, matching the
-  shipped cache. LinGraph calls on chr1–22, X and Y. Keep one output folder per
-  reference.
-- **Preparation.** The HGSVC3 assemblies are unmasked and use contig names like
-  `haplotype1-0000001`. Step 4 soft-masks them with WindowMasker and renames
-  contigs to `NA19240#1#haplotype1-0000001`. References keep their native names.
-- **Benchmarks.** Both benchmarks read the per-haplotype VCFs in
-  `OUTPUT/samples/NAME/NAME.vcf` directly and restrict to the reference
-  intervals covered by all four parental haplotypes. Child calls without a
-  parental match are not confirmed errors; de novo variants and missed parental
-  calls also count there.
-- **Graph construction** submits its stages as SLURM jobs (`SLURM_ACCOUNT`,
-  `SLURM_PARTITION` in `00_env.sh`); keep the launcher running.
+## 2. Prepare the references
+
+LinGraph needs references as uncompressed, indexed FASTAs. Use the same
+sequences as the Win50KGraph reference caches:
+
+- **CHM13**: NCBI RefSeq T2T-CHM13v2.0, 24 chromosomes (`NC_060925.1` ...).
+- **GRCh38**: the 25 main contigs (chr1–22, X, Y, M) of the no-alt analysis
+  set. LinGraph calls on chr1–22, X and Y.
+
+```bash
+mkdir references && cd references
+
+curl -L -O https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/009/914/755/GCF_009914755.1_T2T-CHM13v2.0/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna.gz
+python3 ../LinGraph/tools/prepare_assemblies.py \
+  -i GCF_009914755.1_T2T-CHM13v2.0_genomic.fna.gz --name CHM13_h1 \
+  -O chm13 --remask --threads 16
+
+curl -L -O https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz
+gzip -dc GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz > GRCh38_no_alt.fna
+samtools faidx GRCh38_no_alt.fna
+samtools faidx GRCh38_no_alt.fna chr{1..22} chrX chrY chrM > GRCh38_main.fa
+python3 ../LinGraph/tools/prepare_assemblies.py \
+  -i GRCh38_main.fa --name HG38_h1 -O hg38 --remask --threads 16
+
+cd ..
+```
+
+`prepare_assemblies.py` soft-masks with WindowMasker (`--remask` replaces the
+masking that comes with the download), writes an uncompressed FASTA and runs
+`samtools faidx`. Reference contigs keep their native names. The results are
+`references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna` and
+`references/hg38/GRCh38_main.fa`.
+
+## 3. Download and reconstruct Win50KGraph
+
+Win50KGraph is a precomputed graph summary (balanced 50 kb windows) for
+calling individual samples.
+
+```bash
+curl -L -C - https://ndownloader.figshare.com/files/69451449 -o Win50KGraph.tar.gz
+tar -xzf Win50KGraph.tar.gz
+
+python3 LinGraph/scripts/reconstruct_local_graph_folders.py \
+  -i cohort_minsetref_v3/summary \
+  -r references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
+  --reference-haplotype CHM13_h1 \
+  -o Win50KGraph -j 32 --resume
+```
+
+Reconstruction (hours) rebuilds every local graph into `Win50KGraph/`. Its
+`summary/` and `references/` entries link back to the extracted
+`cohort_minsetref_v3/summary`, so keep that folder. Repeat the command to
+resume an interrupted reconstruction.
+
+## 4. Prepare the trio assemblies
+
+Download both haplotypes of each sample from HGSVC3:
+
+```bash
+mkdir assemblies && cd assemblies
+URL=https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/HGSVC3/working/20240201_verkko_batch3/assemblies
+for sample in NA19240 NA19238 NA19239; do
+  for hap in 1 2; do
+    curl -L -C - -O $URL/$sample/$sample.vrk-ps-sseq.asm-hap$hap.fasta.gz
+  done
+done
+```
+
+List one assembly per haplotype, named `SAMPLE_hN`:
+
+```bash
+cat > raw_assemblies.list <<'EOF'
+NA19240_h1 NA19240.vrk-ps-sseq.asm-hap1.fasta.gz
+NA19240_h2 NA19240.vrk-ps-sseq.asm-hap2.fasta.gz
+NA19238_h1 NA19238.vrk-ps-sseq.asm-hap1.fasta.gz
+NA19238_h2 NA19238.vrk-ps-sseq.asm-hap2.fasta.gz
+NA19239_h1 NA19239.vrk-ps-sseq.asm-hap1.fasta.gz
+NA19239_h2 NA19239.vrk-ps-sseq.asm-hap2.fasta.gz
+EOF
+
+python3 ../LinGraph/tools/prepare_assemblies.py \
+  -q raw_assemblies.list -O prepared --contignamefix -j 6 --threads 8
+cd ..
+```
+
+These assemblies are unmasked and name contigs like `haplotype1-0000001`.
+Preparation (hours) masks them and renames each contig with its haplotype
+prefix, e.g. `NA19240#1#haplotype1-0000001`. `-j 6` prepares all six at once;
+`--threads 8` masks each one in eight parallel chunks. The calling input list
+is `assemblies/prepared/query_paths.prepared.txt`.
+
+## 5. Call SVs with Win50KGraph
+
+Call all six haplotypes against CHM13 (hours):
+
+```bash
+python3 LinGraph/scripts/LinGraph.py singular \
+  -I assemblies/prepared/query_paths.prepared.txt \
+  -G Win50KGraph \
+  -r references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna --reference-name CHM13_h1 \
+  --reference-caches Win50KGraph/references/CHM13_h1_rig \
+  -O calls_chm13 -t 64 --merge
+```
+
+The same graph also calls on GRCh38; only the reference and its cache change.
+Use a separate output folder:
+
+```bash
+python3 LinGraph/scripts/LinGraph.py singular \
+  -I assemblies/prepared/query_paths.prepared.txt \
+  -G Win50KGraph \
+  -r references/hg38/GRCh38_main.fa --reference-name HG38_h1 \
+  --reference-caches Win50KGraph/references/HG38_h1_rig \
+  -O calls_hg38 -t 64 --merge
+```
+
+Each haplotype is called independently into `calls_chm13/samples/NAME/NAME.vcf`
+with coverage reports; `--merge` also writes the merged trio VCFs
+(`calls_chm13/cohort.*.vcf`). `--reference-caches` reuses the alignment of the
+reference that ships with the package instead of recomputing it.
+
+## 6. Check trio consistency
+
+Both checks compare each child haplotype with the four parental haplotypes,
+inside the reference intervals covered by all parents.
+
+**QuickTriocheck** (Python only):
+
+```bash
+python3 LinGraph/benchmark/QuickTriocheck.py \
+  --child  calls_chm13/samples/NA19240_h1/NA19240_h1.vcf calls_chm13/samples/NA19240_h2/NA19240_h2.vcf \
+  --mother calls_chm13/samples/NA19238_h1/NA19238_h1.vcf calls_chm13/samples/NA19238_h2/NA19238_h2.vcf \
+  --father calls_chm13/samples/NA19239_h1/NA19239_h1.vcf calls_chm13/samples/NA19239_h2/NA19239_h2.vcf \
+  -q assemblies/prepared/query_paths.prepared.txt \
+  --fp calls_chm13/trio.quick.fp.vcf \
+  > calls_chm13/trio.quick.tsv
+```
+
+`-q` supplies the child contig lengths used to skip calls near assembly-contig
+edges.
+
+**Truvari** (eight pairwise benchmarks; needs its own environment):
+
+```bash
+conda create -y -n truvari -c conda-forge -c bioconda truvari htslib
+conda activate truvari
+bash LinGraph/benchmark/truvari_trio.sh \
+  --child  calls_chm13/samples/NA19240_h1/NA19240_h1.vcf calls_chm13/samples/NA19240_h2/NA19240_h2.vcf \
+  --mother calls_chm13/samples/NA19238_h1/NA19238_h1.vcf calls_chm13/samples/NA19238_h2/NA19238_h2.vcf \
+  --father calls_chm13/samples/NA19239_h1/NA19239_h1.vcf calls_chm13/samples/NA19239_h2/NA19239_h2.vcf \
+  --distance 500 --jobs 8 --fp calls_chm13/trio.truvari.fp.vcf \
+  > calls_chm13/trio.truvari.tsv
+conda activate LinGraph
+```
+
+Replace `calls_chm13` with `calls_hg38` (or `trio_calls` from step 7) to check
+the other call sets. A child call without a parental match is not necessarily
+an error: de novo variants and calls missed in a parent also land there.
+
+## 7. Build a trio pangenome graph on CHM13
+
+List CHM13 first, then the six prepared haplotypes:
+
+```bash
+printf 'CHM13_h1\t%s\n' "$PWD/references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna" > cohort.list
+cat assemblies/prepared/query_paths.prepared.txt >> cohort.list
+```
+
+Build the graph, call every haplotype, merge on CHM13 and export the GFA. On a
+SLURM cluster, graph stages run as jobs; keep this launcher running:
+
+```bash
+python3 LinGraph/scripts/LinGraph.py graph \
+  -I cohort.list -G trio_graph -O trio_calls \
+  -b LinGraph/windowprofs/geneblocks.bed --bed-grouped \
+  -r CHM13_h1 --alternative LinGraph/data/alternatives.fa \
+  --exact --mc-graph -t 32 \
+  --slurm --slurm-jobs 50 --slurm-account YOUR_ACCOUNT --slurm-partition YOUR_PARTITION
+```
+
+Without SLURM, drop the last line and set `-t` to the local CPU count.
+
+- `-b LinGraph/windowprofs/geneblocks.bed --bed-grouped`: gene-based windows.
+- `--alternative LinGraph/data/alternatives.fa`: the recommended alternative
+  sequences for CHM13, imported into the graph.
+- `--exact`: merges the cohort calls and realigns merged SVs to the assemblies.
+- `--mc-graph`: exports `trio_calls/cohort.gfa`.
+
+`trio_graph/` holds the graph cache (resume by repeating the command);
+`trio_calls/` holds per-haplotype VCFs in `samples/`, the merged
+`cohort.sv.vcf`, `cohort.indel.vcf`, `cohort.snp.vcf` and `cohort.gfa`. Check
+these calls with step 6, using `trio_calls` as the folder.
