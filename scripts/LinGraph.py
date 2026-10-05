@@ -118,6 +118,8 @@ Examples:
             q.add_argument("--reference-caches", metavar="DIR",
                            help="use supplied reference alignment and blocks without cache validation; default: GRAPH/references/NAME_rig")
             q.add_argument("--merge", action="store_true", help="also write cohort SNP/indel/SV VCFs when calling multiple samples (off by default)")
+            q.add_argument("--reference-only", action="store_true",
+                           help="build or resume the reference cache for -r FASTA (in --reference-caches DIR, default GRAPH/references/NAME_rig), then stop; no samples are called")
         q.add_argument("-r", "--reference", help="reference NAME or FASTA; default: first saved cohort assembly")
         q.add_argument("-L", "--graph-list", help="partition names or paths, one per row; default: all")
         q.add_argument("-t", "-j", "--threads", "--cores", type=int,
@@ -673,7 +675,7 @@ def singular_reference(args, runner, graph, ref, graphroot, listing, index,
     )
     align = refdir / f'{refname}.align.txt'
     blocks = refdir / f'{refname}.align.txt_blocks.bed'
-    if supplied:
+    if supplied and not getattr(args, 'reference_only', False):
         say(f'Use supplied reference results without validation: {refdir}')
         return align, blocks
 
@@ -841,6 +843,9 @@ def singular_mode(args, runner, graph, output, samples, ref, cohort):
         args, runner, graph, ref, graphroot, listing, index, graph_dependencies,
         names, searcher,
     )
+    if args.reference_only:
+        say(f"Reference cache ready: {align.parent}")
+        return []
     vcfs = []
     template_sources = {name: fasta for name, fasta in cohort if fasta.is_file()}
     template_sources.update(samples)
@@ -1120,8 +1125,13 @@ def main(argv=None):
             return 0
     if args.gfa_only and args.slurm:
         return submit(args, argv)
+    if args.mode == "singular" and args.reference_only:
+        if args.input or args.input_list:
+            p.error("--reference-only builds a reference cache; omit -i/-I")
+        if not args.reference:
+            p.error("--reference-only requires -r reference.fa")
     if args.mode == "singular":
-        if not (args.input or args.input_list) and not partial:
+        if not (args.input or args.input_list or args.reference_only) and not partial:
             p.error("singular calling requires -i/--input or -I/--input-list")
         if not graph.is_dir():
             p.error("singular mode requires an existing graph directory or compact summary directory")
@@ -1153,9 +1163,11 @@ def main(argv=None):
         fasta = absolute(args.input)
         check_fasta(fasta)
         samples = [(args.sample, fasta)]
+    elif args.mode == "singular" and args.reference_only:
+        samples = []
     else:
         samples = cohort
-    if not samples:
+    if not samples and not (args.mode == "singular" and args.reference_only):
         p.error("Supply -I cohort.list to build or resume this graph")
     ref = reference(args, cohort, samples)
     checked_samples = samples
@@ -1214,7 +1226,7 @@ def main(argv=None):
             say(f"Merged VCF: {path}")
     if args.mc_graph:
         say(f"GFA: {output / 'cohort.gfa'}")
-    if args.mode == "singular":
+    if args.mode == "singular" and not args.reference_only:
         say(f"Coverage: {output}/samples/NAME/NAME.coverage.summary.tsv (plus missing-region BEDs)")
     return 0
 

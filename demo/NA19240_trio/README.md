@@ -11,11 +11,14 @@ two ways to use LinGraph:
   haplotype, merge the calls on CHM13 and export the graph as GFA.
 
 Run every command from one demo folder. Plan for about **300 GB** of disk.
-Steps that take hours are marked; run them on a compute node, for example under
-`nohup ... > log 2>&1 &`.
+The tools print detailed progress, so each long command below writes it to a
+file in `logs/`; follow one with `tail -f logs/NAME.log`. Steps that take hours
+are marked; run them on a compute node, for example by prefixing the command
+with `nohup` and appending `&`.
 
 ```bash
 mkdir lingraph_demo && cd lingraph_demo
+mkdir logs
 ```
 
 ## 1. Install LinGraph
@@ -23,7 +26,7 @@ mkdir lingraph_demo && cd lingraph_demo
 ```bash
 git clone https://github.com/Walfred-MA/LinGraph.git
 cd LinGraph
-python3 install.py --conda-env LinGraph -j 16
+python3 install.py --conda-env LinGraph -j 16 > ../logs/install.log 2>&1
 conda activate LinGraph
 python3 install.py --check-only
 cd ..
@@ -48,21 +51,23 @@ mkdir references && cd references
 curl -L -O https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/009/914/755/GCF_009914755.1_T2T-CHM13v2.0/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna.gz
 python3 ../LinGraph/tools/prepare_assemblies.py \
   -i GCF_009914755.1_T2T-CHM13v2.0_genomic.fna.gz --name CHM13_h1 \
-  -O chm13 --remask --threads 16
+  -O chm13 --remask --threads 16 > ../logs/prepare_chm13.log 2>&1
 
 curl -L -O https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz
 gzip -dc GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz > GRCh38_no_alt.fna
 samtools faidx GRCh38_no_alt.fna
 samtools faidx GRCh38_no_alt.fna chr{1..22} chrX chrY chrM > GRCh38_main.fa
 python3 ../LinGraph/tools/prepare_assemblies.py \
-  -i GRCh38_main.fa --name HG38_h1 -O hg38 --remask --threads 16
+  -i GRCh38_main.fa --name HG38_h1 -O hg38 --remask --threads 16 > ../logs/prepare_hg38.log 2>&1
 
 cd ..
 ```
 
-`prepare_assemblies.py` soft-masks with WindowMasker (`--remask` replaces the
-masking that comes with the download), writes an uncompressed FASTA and runs
-`samtools faidx`. Reference contigs keep their native names. The results are
+`prepare_assemblies.py` soft-masks with WindowMasker, writes an uncompressed
+FASTA and runs `samtools faidx`. Both downloads are already soft-masked;
+`--remask` replaces that masking with WindowMasker's, as used to build
+Win50KGraph, because alignment seeding and several calling thresholds use the
+soft-masking. Reference contigs keep their native names. The results are
 `references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna` and
 `references/hg38/GRCh38_main.fa`.
 
@@ -79,7 +84,7 @@ python3 LinGraph/scripts/reconstruct_local_graph_folders.py \
   -i cohort_minsetref_v3/summary \
   -r references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
   --reference-haplotype CHM13_h1 \
-  -o Win50KGraph -j 32 --resume
+  -o Win50KGraph -j 32 --resume > logs/reconstruct.log 2>&1
 ```
 
 Reconstruction (hours) rebuilds every local graph into `Win50KGraph/`. Its
@@ -114,7 +119,8 @@ NA19239_h2 NA19239.vrk-ps-sseq.asm-hap2.fasta.gz
 EOF
 
 python3 ../LinGraph/tools/prepare_assemblies.py \
-  -q raw_assemblies.list -O prepared --contignamefix -j 6 --threads 8
+  -q raw_assemblies.list -O prepared --contignamefix -j 6 --threads 8 \
+  > ../logs/prepare_assemblies.log 2>&1
 cd ..
 ```
 
@@ -134,7 +140,7 @@ python3 LinGraph/scripts/LinGraph.py singular \
   -G Win50KGraph \
   -r references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna --reference-name CHM13_h1 \
   --reference-caches Win50KGraph/references/CHM13_h1_rig \
-  -O calls_chm13 -t 64 --merge
+  -O calls_chm13 -t 64 --merge > logs/singular_chm13.log 2>&1
 ```
 
 The same graph also calls on GRCh38; only the reference and its cache change.
@@ -146,7 +152,7 @@ python3 LinGraph/scripts/LinGraph.py singular \
   -G Win50KGraph \
   -r references/hg38/GRCh38_main.fa --reference-name HG38_h1 \
   --reference-caches Win50KGraph/references/HG38_h1_rig \
-  -O calls_hg38 -t 64 --merge
+  -O calls_hg38 -t 64 --merge > logs/singular_hg38.log 2>&1
 ```
 
 Each haplotype is called independently into `calls_chm13/samples/NAME/NAME.vcf`
@@ -168,7 +174,7 @@ python3 LinGraph/benchmark/QuickTriocheck.py \
   --father calls_chm13/samples/NA19239_h1/NA19239_h1.vcf calls_chm13/samples/NA19239_h2/NA19239_h2.vcf \
   -q assemblies/prepared/query_paths.prepared.txt \
   --fp calls_chm13/trio.quick.fp.vcf \
-  > calls_chm13/trio.quick.tsv
+  > calls_chm13/trio.quick.tsv 2> logs/quicktriocheck_chm13.log
 ```
 
 `-q` supplies the child contig lengths used to skip calls near assembly-contig
@@ -177,14 +183,14 @@ edges.
 **Truvari** (eight pairwise benchmarks; needs its own environment):
 
 ```bash
-conda create -y -n truvari -c conda-forge -c bioconda truvari htslib
+conda create -y -n truvari -c conda-forge -c bioconda truvari htslib > logs/truvari_env.log 2>&1
 conda activate truvari
 bash LinGraph/benchmark/truvari_trio.sh \
   --child  calls_chm13/samples/NA19240_h1/NA19240_h1.vcf calls_chm13/samples/NA19240_h2/NA19240_h2.vcf \
   --mother calls_chm13/samples/NA19238_h1/NA19238_h1.vcf calls_chm13/samples/NA19238_h2/NA19238_h2.vcf \
   --father calls_chm13/samples/NA19239_h1/NA19239_h1.vcf calls_chm13/samples/NA19239_h2/NA19239_h2.vcf \
   --distance 500 --jobs 8 --fp calls_chm13/trio.truvari.fp.vcf \
-  > calls_chm13/trio.truvari.tsv
+  > calls_chm13/trio.truvari.tsv 2> logs/truvari_chm13.log
 conda activate LinGraph
 ```
 
@@ -210,7 +216,8 @@ python3 LinGraph/scripts/LinGraph.py graph \
   -b LinGraph/windowprofs/geneblocks.bed --bed-grouped \
   -r CHM13_h1 --alternative LinGraph/data/alternatives.fa \
   --exact --mc-graph -t 32 \
-  --slurm --slurm-jobs 50 --slurm-account YOUR_ACCOUNT --slurm-partition YOUR_PARTITION
+  --slurm --slurm-jobs 50 --slurm-account YOUR_ACCOUNT --slurm-partition YOUR_PARTITION \
+  > logs/graph_trio.log 2>&1
 ```
 
 Without SLURM, drop the last line and set `-t` to the local CPU count.

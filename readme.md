@@ -334,6 +334,56 @@ non-primary scaffolds are excluded.
 To supply one FASTA directly, replace `-I ...` with
 `-i /data/prepared/HG002.h1.prepared.fasta --sample HG002_h1`.
 
+### Add another reference: HG19 example
+
+A graph can call against any reference once that reference's cache exists in
+`GRAPH/references/NAME_rig`. Win50KGraph ships caches for `CHM13_h1` and
+`HG38_h1`; this example builds one for HG19 (UCSC, chr1–22, X and Y).
+
+Download HG19, keep the main chromosomes and prepare it. A reference other than
+CHM13 or GRCh38 uses the `NAME#1#` contig prefix, so `--contignamefix` renames
+`chr1` to `HG19#1#chr1`:
+
+```bash
+mkdir -p logs references && cd references
+curl -L -O https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/hg19.fa.gz
+gzip -dc hg19.fa.gz > hg19.fa
+samtools faidx hg19.fa
+samtools faidx hg19.fa chr{1..22} chrX chrY > hg19_main.fa
+python3 ../LinGraph/tools/prepare_assemblies.py \
+  -i hg19_main.fa --name HG19_h1 -O hg19 \
+  --contignamefix --remask --threads 16 > ../logs/prepare_hg19.log 2>&1
+cd ..
+```
+
+Build the cache once. `--reference-only` aligns the reference to every local
+graph (hours, like calling one haplotype), writes
+`Win50KGraph/references/HG19_h1_rig`, and calls no samples. Rerun the same
+command to resume:
+
+```bash
+python3 LinGraph/scripts/LinGraph.py singular \
+  -G Win50KGraph -r references/hg19/hg19_main.fa \
+  --reference-only -O hg19_cache -t 64 > logs/hg19_cache.log 2>&1
+```
+
+The name `HG19_h1` is read from the contig prefix; `--reference-name HG19_h1`
+states it explicitly. To keep the cache elsewhere, add `--reference-caches DIR`:
+the cache is built in `DIR`, and later calls use it with the same
+`--reference-caches DIR`. Then call against HG19 like any other reference; the
+cache is found and reused automatically:
+
+```bash
+python3 LinGraph/scripts/LinGraph.py singular \
+  -I prepared_assemblies/query_paths.prepared.txt \
+  -G Win50KGraph -r references/hg19/hg19_main.fa \
+  -O sample_calls_hg19 -t 64 > logs/calls_hg19.log 2>&1
+```
+
+VCF records use the prepared names, e.g. `HG19#1#chr1`. To restore plain names
+in a standard VCF, rename them, for example with `bcftools annotate
+--rename-chrs`.
+
 ### Reuse reference alignments
 
 `singular` caches reference preparation under the graph root:
