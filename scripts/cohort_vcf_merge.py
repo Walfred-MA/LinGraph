@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import pickle
 import shutil
+import garbage
 import sys
 import time
 
@@ -199,7 +200,7 @@ def cleanup_merge_directories(output, directories, *, protected=()):
         if path.exists():
             for attempt in range(2):
                 try:
-                    shutil.rmtree(path)
+                    garbage.discard(path)
                     print(f'[cohort-merge] removed temporary directory: {path}', flush=True)
                     break
                 except OSError as error:

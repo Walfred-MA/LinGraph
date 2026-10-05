@@ -4,7 +4,8 @@ import shlex
 import sys
 
 
-configfile: "config/config.yaml"
+# Absolute: launchers run Snakemake with --directory set to the run folder.
+configfile: str(Path(workflow.basedir) / "config" / "config.yaml")
 
 BASE = Path(workflow.basedir).resolve()
 HELPER_DIR = BASE / "workflow" / "scripts"

@@ -22,7 +22,10 @@ REQUIRED_PARTITION_DRIVER_OPTIONS = (
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parent
 sys.path.insert(0, str(HERE / "workflow" / "scripts"))
+sys.path.insert(0, str(REPOSITORY))
 from pipeline_inputs import read_assembly_list
+import snakemake_workdir
+import garbage
 
 
 def absolute(value: str, base: Optional[Path] = None) -> str:
@@ -546,10 +549,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     command = [
         args.snakemake,
         "--snakefile", str(HERE / "Snakefile"),
+        # Locks, incomplete markers and logs belong to this graph, not the code.
+        "--directory", graph_folder,
         "--cores", str(max(args.cores, args.slurm_jobs) if args.slurm else args.cores),
         "--rerun-incomplete",
         "--printshellcmds",
     ]
+    if not args.unlock:
+        snakemake_workdir.check_no_legacy_incomplete(HERE)
+        if not args.dry_run:
+            # Graph-building temporary trees go to GRAPH/garbage; the cohort
+            # launcher below switches to its own OUTPUT/garbage.
+            garbage.sweep(garbage.use_garbage(Path(graph_folder) / "garbage"))
     if args.slurm:
         command.extend(["--resources", f"slurm_jobs={args.slurm_jobs}"])
     annotation_marker = Path(graph_folder) / "cohort_annotations" / "_ANNOTATIONS_SUCCESS.json"

@@ -26,6 +26,7 @@ import multiprocessing as mp
 import os
 import re
 import shutil
+import garbage
 import subprocess
 import tempfile
 import threading
@@ -1902,7 +1903,11 @@ def prepare_direct_work_directory(
         except FileNotFoundError:
             resumable = False
         if not resumable:
-            shutil.rmtree(path)
+            raise RuntimeError(
+                f"existing work directory {path} was made for different inputs "
+                "or settings and cannot be resumed. Remove it yourself "
+                f"(rm -rf '{path}') and rerun."
+            )
     elif os.path.exists(path):
         os.remove(path)
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -1950,11 +1955,17 @@ def align_direct(args: argparse.Namespace) -> int:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         try:
             # Random work directories from older releases cannot be verified
-            # or resumed. Remove only this output's precisely scoped legacy
-            # directories before installing the stable checkpoint directory.
-            for legacy in Path(output_parent).glob(stable_prefix + ".*"):
-                if legacy.is_dir():
-                    shutil.rmtree(legacy)
+            # or resumed. Leave removing them to the user instead of deleting.
+            legacy = sorted(
+                str(path) for path in Path(output_parent).glob(stable_prefix + ".*")
+                if path.is_dir()
+            )
+            if legacy:
+                raise RuntimeError(
+                    "work directories from an older release cannot be resumed: "
+                    + ", ".join(legacy)
+                    + ". Remove them yourself (rm -rf ...) and rerun."
+                )
             resumed = prepare_direct_work_directory(work_root, signature)
             if resumed:
                 LOG.info(
@@ -2017,7 +2028,7 @@ def align_direct(args: argparse.Namespace) -> int:
                         work_root,
                     )
                 else:
-                    shutil.rmtree(work_root)
+                    garbage.discard(work_root)
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
     return 0
@@ -2117,7 +2128,7 @@ def align_all(args: argparse.Namespace) -> int:
         if args.keep_work:
             LOG.info("Retained work directory: %s", work_root)
         else:
-            shutil.rmtree(work_root)
+            garbage.discard(work_root)
     return 0
 
 

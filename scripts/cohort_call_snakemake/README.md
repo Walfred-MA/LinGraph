@@ -277,8 +277,10 @@ Snakemake controller is running, only the existing output directory is needed:
 python cohort_call_snakemake/run_cohort_call_pipeline.py --unlock -O cohort_calls
 ```
 
-This reads `cohort_calls/inputs/cohort_call.run.json`, asks Snakemake to unlock
-the cohort workflow directory, and exits without preparing or running jobs.
+This reads `cohort_calls/inputs/cohort_call.run.json`, asks Snakemake to remove
+the locks in `cohort_calls/.snakemake/`, and exits without preparing or running
+jobs. Each run keeps its Snakemake state in its own output folder, so other runs
+are not unlocked.
 
 The split Slurm merge now tracks each chromosome independently. Rerun the same
 `run_cohort_call_pipeline.py ... --slurm ... -- --keep-going graphvcfmerge_cohort`

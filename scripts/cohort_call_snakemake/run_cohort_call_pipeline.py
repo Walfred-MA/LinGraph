@@ -28,6 +28,8 @@ from graph_list_cache import graph_list_path
 from pipeline_inputs import read_assembly_list
 import graphvcfmerge_checkpoints as merge_checkpoints
 import cohort_vcf_merge as cohort_merge
+import snakemake_workdir
+import garbage
 
 
 def absolute(value: str, base: Optional[Path] = None) -> str:
@@ -544,6 +546,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.output_folder and not args.dry_run and not args.unlock:
+        # Cohort-calling temporary trees go to OUTPUT/garbage and are deleted
+        # in the background.
+        garbage.sweep(garbage.use_garbage(Path(absolute(args.output_folder)) / "garbage"))
     if args.recall_only and not args.unlock:
         if args.slurm:
             raise ValueError('--recall-only uses the current allocation; use LinGraph --slurm or an allocated shell')
@@ -576,6 +582,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         command = [
             args.snakemake,
             "--snakefile", str(HERE / "Snakefile"),
+            "--directory", str(output),
             "--unlock",
             "--config", f"run_config={run_config}",
         ]
@@ -913,9 +920,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     config_path = output / "inputs" / "cohort_call.run.json"
     write_json_if_changed(config_path, run_config)
 
+    snakemake_workdir.check_no_legacy_incomplete(HERE)
     command = [
         args.snakemake,
         "--snakefile", str(HERE / "Snakefile"),
+        # Locks, incomplete markers and logs belong to this run, not the code.
+        "--directory", str(output),
         "--cores", str(max(args.cores, args.slurm_jobs) if args.slurm else args.cores),
         "--rerun-incomplete",
         "--printshellcmds",

@@ -415,14 +415,18 @@ current input list enter the singular merge; old samples in `-O` are excluded.
 After an interrupted run has stopped, clear stale workflow locks with:
 
 ```bash
-python scripts/LinGraph.py --unlock
+python scripts/LinGraph.py --unlock cohort_graph cohort_calls
 ```
 
-This clears `.snakemake/locks` in this repository's `graph_build_snakemake/`
-and `cohort_call_snakemake/` directories, then exits. It requires no run mode,
-`-G`, `-O`, assembly inputs, or Snakemake executable. Checkpoints, incomplete-job
-records, and outputs are preserved. Use `--unlock --dry-run` to preview the
-directories. Unlocking does not stop running jobs; use it after those jobs exit.
+Name the run's graph (`-G`) and/or output (`-O`) folders. Each workflow keeps
+its Snakemake state in the folder of the run it belongs to (`-G/.snakemake` for
+graph building, `-O/.snakemake` for cohort calling), so this clears only that
+run's `.snakemake/locks`; other runs from the same checkout keep their locks.
+It requires no run mode, assembly inputs, or Snakemake executable. Checkpoints,
+incomplete-job records, and outputs are preserved. Use `--unlock ... --dry-run`
+to preview the directories. Unlocking does not stop running jobs; use it after
+those jobs exit. Without folders, `--unlock` only lists locks left in the code
+tree by runs started before this layout and removes nothing.
 
 Use `--dry-run` to validate prepared inputs and print the planned commands.
 It does not create files, launch genomics tools, or submit jobs. For an empty

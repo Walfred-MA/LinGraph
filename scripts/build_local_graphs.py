@@ -13,6 +13,7 @@ import mmap
 import os
 import re
 import shutil
+import garbage
 import struct
 import sys
 import tempfile
@@ -638,7 +639,7 @@ def build_hotspot_graphs(args: argparse.Namespace) -> None:
     finally:
         if success:
             LOG.info("Cleaning completed hotspot shard and merge-plan files")
-            shutil.rmtree(workdir, ignore_errors=True)
+            garbage.discard(workdir, ignore_errors=True)
         else:
             LOG.error("Retained failed hotspot shard directory: %s", workdir)
 

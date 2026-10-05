@@ -53,6 +53,7 @@ import os
 import pickle
 import re
 import shutil
+import garbage
 import signal
 import struct
 import threading
@@ -630,7 +631,7 @@ def work_directory(input_path: str, user_tmpdir: Optional[str], keep_tmpdir: boo
         if keep_tmpdir:
             print(f"[merge] kept temp folder: {path}", file=sys.stderr)
         else:
-            shutil.rmtree(path, ignore_errors=True)
+            garbage.discard(path, ignore_errors=True)
 
 
 def vcf_escape(x) -> str:

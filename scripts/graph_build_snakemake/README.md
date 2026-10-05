@@ -286,8 +286,10 @@ To remove stale locks, append `--unlock` (or `-- --unlock`) to the same
 launcher command. With `--continue-cohort-call`, this unlocks both workflows
 and exits without building graphs or calling variants; graph completion is
 not required. The cohort unlock reuses `DIR/inputs/cohort_call.run.json` from
-the existing run. Only unlock when no other instance of either workflow is
-running. Remove the unlock option to resume normal processing.
+the existing run. Snakemake state, including locks, lives in the run folders
+(`-G/.snakemake` and the cohort output's `.snakemake`), not in this directory,
+so unlocking affects only this run. Only unlock when this run's workflows are
+not running. Remove the unlock option to resume normal processing.
 
 Restart with the same command after a failure. Do not delete `-G`; it contains
 the Snakemake checkpoints and the native resume work directories.

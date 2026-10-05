@@ -20,6 +20,8 @@ import run_sample_pipeline as sample_pipeline
 import cohort_vcf_merge as cohort_merge
 import lingraph_options as cli_options
 from graph_list_cache import graph_list_path, template_list_path
+import snakemake_workdir
+import garbage
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE = re.compile(r"^[A-Za-z0-9.-]+_h[1-9][0-9]*$")
@@ -78,10 +80,10 @@ Full options:
 Examples:
   python LinGraph.py singular -I samples.list -G graph_cache -O sample_calls
   python LinGraph.py graph -I cohort.list -G cohort_graph -O cohort_calls --exact
-  python LinGraph.py --unlock
+  python LinGraph.py --unlock cohort_graph cohort_calls
 """)
-    p.add_argument("--unlock", action="store_true",
-                   help="clear graph-building and cohort-calling Snakemake locks for this repository, then exit")
+    p.add_argument("--unlock", nargs="*", metavar="RUN_DIR",
+                   help="clear the Snakemake locks of the given graph (-G) and/or output (-O) folders, then exit")
     p.add_argument("--dry-run", action="store_true", help="with --unlock, show lock directories without removing them")
     modes = p.add_subparsers(dest="mode", title="commands")
     prepare = modes.add_parser('prepare', add_help=False, help='explicitly prepare assemblies; use prepare --help for all options')
@@ -203,20 +205,29 @@ Examples:
     return p
 
 
-def unlock_workflows(dry_run=False):
-    # Both launchers run Snakemake with cwd set to their workflow directory.
-    # Snakemake 6.15.1 cleanup_locks() removes exactly .snakemake/locks. Do the
-    # same without loading a Snakefile, which may require unavailable run data.
-    for workflow in ("graph_build_snakemake", "cohort_call_snakemake"):
-        locks = ROOT / workflow / ".snakemake" / "locks"
+def unlock_workflows(run_dirs, dry_run=False):
+    # Both launchers run Snakemake with --directory set to the graph (-G) or
+    # output (-O) folder, so each run keeps its own .snakemake/locks.  Snakemake
+    # 6.15.1 cleanup_locks() removes exactly that directory; do the same without
+    # loading a Snakefile, which may require unavailable run data.
+    if not run_dirs:
+        # Runs started before state moved to the run folder locked the code
+        # tree. List those, but never release them for every run at once.
+        for workflow in ("graph_build_snakemake", "cohort_call_snakemake"):
+            locks = snakemake_workdir.state_dir(ROOT / workflow) / "locks"
+            if locks.exists():
+                say(f"Old in-tree locks (not removed): {locks}")
+        say("Name the run folders to unlock, e.g. LinGraph.py --unlock GRAPH_DIR OUTPUT_DIR")
+        return 0
+    for run_dir in map(absolute, run_dirs):
+        locks = snakemake_workdir.state_dir(run_dir) / "locks"
         if not locks.exists():
             say(f"No locks: {locks}")
-            continue
-        if dry_run:
+        elif dry_run:
             say(f"Would unlock: {locks}")
-            continue
-        shutil.rmtree(locks)
-        say(f"Unlocked: {locks}")
+        else:
+            snakemake_workdir.unlock(run_dir)
+            say(f"Unlocked: {locks}")
     return 0
 
 
@@ -1017,10 +1028,10 @@ def main(argv=None):
         return subprocess.call([sys.executable, str(ROOT / 'tools/prepare_assemblies.py'), *argv[1:]])
     p = parser(show_advanced="--help-all" in argv)
     args = p.parse_args(argv)
-    if args.unlock:
+    if args.unlock is not None:
         if args.mode is not None:
             p.error("--unlock is a standalone command; omit graph/singular and run options")
-        return unlock_workflows(args.dry_run)
+        return unlock_workflows(args.unlock, args.dry_run)
     if args.mode is None:
         p.error("choose graph or singular, or use --unlock")
     if args.mode == 'prepare':
@@ -1175,6 +1186,10 @@ def main(argv=None):
     if args.slurm and args.mode == "singular":
         return submit(args, argv)
     runner = Runner(args)
+    if not args.dry_run:
+        # Finished temporary trees go to OUTPUT/garbage and are deleted in the
+        # background; graph building sends its own to GRAPH/garbage.
+        garbage.sweep(garbage.use_garbage(output / "garbage"))
     say(f"Mode: {args.mode}; samples: {len(samples)}; reference: {ref[0]}; CPUs: {args.threads}; execution: {'SLURM workflow jobs' if args.slurm else 'local'}")
     say(f"Graph: {graph}\nOutput: {output}")
     write_text(runner.work / "run.json", json.dumps({"arguments": vars(args), "reference": [ref[0], str(ref[1])],
