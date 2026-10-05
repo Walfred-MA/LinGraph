@@ -768,7 +768,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_stage_config(
         liftover_config_path,
         {
-            "protocol": "cohort-call-liftover-v2-same-graph-alignment-priority",
+            "protocol": "cohort-call-liftover-v3-reference-aware",
+            "reference": args.reference,
+            "reference_fasta": assembly_by_name[args.reference].fasta,
             "max_extension": args.max_extension,
             "non_reference_tags": args.non_reference_tags,
         },
@@ -776,7 +778,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_stage_config(
         graphcigar_config_path,
         {
-            "protocol": "cohort-call-graphcigar-v1",
+            "protocol": "cohort-call-graphcigar-v2-reference-aware",
+            "reference": args.reference,
+            "reference_fasta": assembly_by_name[args.reference].fasta,
             "alternative": alternative_bed,
             "alternative_sha256": alternative_digest,
             "max_extension": args.max_extension,

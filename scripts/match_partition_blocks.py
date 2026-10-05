@@ -39,6 +39,7 @@ import collections as cl
 import dataclasses
 import gc
 import gzip
+import json
 import logging
 import math
 import multiprocessing
@@ -962,10 +963,13 @@ def _cohort_output_is_current(task: CohortTask) -> bool:
     if not task.resume:
         return False
     try:
+        metadata_path = task.output + ".resume.json"
+        metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+        if metadata != _cohort_resume_metadata():
+            return False
         # Script timestamps do not invalidate a completed RefMatch table, but
-        # its three semantic graph inputs must. Breakpoint consistency can be
-        # regenerated without rebuilding the local graph; reusing an older
-        # RefMatch table after that update would mix two blocking protocols.
+        # its semantic inputs must. Backbone changes reuse graph alignments,
+        # but require RefMatch to compare against the newly selected reference.
         return (
             os.path.isfile(task.output)
             and os.path.getsize(task.output) > 0
@@ -976,6 +980,31 @@ def _cohort_output_is_current(task: CohortTask) -> bool:
         )
     except OSError:
         return False
+    except (TypeError, ValueError):
+        return False
+
+
+def _cohort_resume_metadata() -> dict:
+    """Identity of inputs that affect one cohort RefMatch table."""
+    samples = sorted(set(_COHORT_SELECTED_SAMPLES) | {_COHORT_REFERENCE})
+    fasta_inputs = []
+    for sample in samples:
+        fasta = _COHORT_SAMPLE_FASTAS[sample]
+        for path in (fasta, fasta + ".fai"):
+            stat = os.stat(path)
+            fasta_inputs.append([
+                sample, os.path.realpath(path), stat.st_size, stat.st_mtime_ns,
+            ])
+    return {
+        "protocol": "cohort-refmatch-resume-v1",
+        "reference": _COHORT_REFERENCE,
+        "cohort_order": list(_COHORT_SAMPLE_ORDER),
+        "samples": samples,
+        "fasta_inputs": fasta_inputs,
+        "merge_small": _COHORT_MERGE_SMALL,
+        "mask_lowercase": _MASK_LOWERCASE,
+        "whitelist": list(_WHITELIST),
+    }
 
 
 def _read_committed_blocking(path: str) -> List[str]:
@@ -1157,6 +1186,10 @@ def _process_cohort_partition(task: CohortTask) -> CohortResult:
         task.output,
         [GraphResult(1, task.partition, tuple(lines), len(alleles))],
         True,
+    )
+    _atomic_text(
+        task.output + ".resume.json",
+        json.dumps(_cohort_resume_metadata(), sort_keys=True) + "\n",
     )
     return CohortResult(
         task.partition, "built", len(rows), len(blocked), len(lines),

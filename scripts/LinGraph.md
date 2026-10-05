@@ -163,6 +163,23 @@ calling.
 Use `--recall-only --exact` to require existing alignments and regenerate the
 cohort VCF outputs without rebuilding the graph (see below).
 
+### Reuse a completed graph with a different cohort backbone
+
+To build another calling/GFA version on a different cohort haplotype, reuse
+the completed graph directory and its saved cohort list. Omit `-I` and graph
+construction options so LinGraph skips graph construction; select the new
+backbone with `-r` and use a separate output directory for each version:
+
+```bash
+python3 scripts/LinGraph.py graph -G cohort_graph \
+  -O calls_HG002_h2 -r HG002_h2 --exact --mc-graph -t 16
+```
+
+This reuses local graph alignments under `cohort_graph/Graphs/`. It regenerates
+the reference-specific block matches, lifting, VCF calls, merge, and GFA for
+the selected backbone. Use a normal `graph` run; `--recall-only` keeps the
+reference saved with its prior run.
+
 To merge existing calls without graph building, calling, or GFA export, use:
 
 ```bash

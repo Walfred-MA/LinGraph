@@ -384,7 +384,7 @@ rule all:
 
 rule prepare_calling_layout:
     input:
-        layout_config=ancient(LAYOUT_CONFIG_PATH),
+        layout_config=LAYOUT_CONFIG_PATH,
         query=ancient(RUN["query_paths"]),
         partitions=ancient(RUN["partition_list"]),
     output:
@@ -407,10 +407,10 @@ rule prepare_calling_layout:
 
 rule match_partition_blocks_batch:
     input:
-        # Static layout inputs are existence-based checkpoints. A newly
-        # completed graph protocol does invalidate the batch so its internal
-        # per-partition checks can refresh stale RefMatch tables.
-        layout_config=ancient(LAYOUT_CONFIG_PATH),
+        # A selected-reference change must refresh RefMatch relationships.
+        # The matcher resumes its per-partition outputs when their recorded
+        # reference and graph-alignment inputs still match.
+        layout_config=LAYOUT_CONFIG_PATH,
         layout=ancient(rules.prepare_calling_layout.output.layout),
         query=ancient(rules.prepare_calling_layout.output.normalized),
         selected=ancient(rules.prepare_calling_layout.output.selected_samples),
@@ -453,7 +453,7 @@ rule match_partition_blocks_batch:
 
 rule extract_and_concatenate_samples:
     input:
-        stage_config=ancient(LAYOUT_CONFIG_PATH),
+        stage_config=LAYOUT_CONFIG_PATH,
         layout=ancient(rules.prepare_calling_layout.output.layout),
         helper=ancient(str(HELPER)),
         # Rebuilt graph matches change the extracted sample alignments.
@@ -555,7 +555,7 @@ rule local_reference_templates:
 
 rule genomelift_sample:
     input:
-        stage_config=ancient(LIFTOVER_CONFIG_PATH),
+        stage_config=LIFTOVER_CONFIG_PATH,
         refmatch=lambda wc: str(
             SAMPLES_ROOT / wc.sample / (wc.sample + ".refmatch.tsv")
         ),
