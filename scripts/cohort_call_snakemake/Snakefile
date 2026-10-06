@@ -207,7 +207,9 @@ MERGE_SCAN_MEMORY = (
 MERGE_CHROM_MEMORY = (
     MERGE_MEMORY_OVERRIDE or f"{2 * MERGE_PROCESSES}G"
 )
-MERGE_CONCAT_MEMORY = MERGE_MEMORY_OVERRIDE or "2G"
+# One job each: SV concat (writes the insertion SNP manifest), small-variant
+# concat and publish. 2G was too small even for a trio.
+MERGE_CONCAT_MEMORY = MERGE_MEMORY_OVERRIDE or "64G"
 LOCAL_TEMPLATE_FALLBACK = as_bool(
     LOCAL_TEMPLATE_RUN.get(
         "local_template_fallback", RUN.get("local_template_fallback", True)

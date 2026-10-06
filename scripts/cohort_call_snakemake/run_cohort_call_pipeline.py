@@ -464,8 +464,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--merge-memory", default="", metavar="MEMORY",
         help=(
-            "base memory for merge-stage Slurm jobs; by default each stage "
-            "requests 2G per allocated CPU; chr1 applies its resource multiplier"
+            "base memory for merge-stage Slurm jobs; by default scan and "
+            "chromosome stages request 2G per allocated CPU (chr1 applies its "
+            "resource multiplier) and the concat and publish jobs 64G"
         ),
     )
     parser.add_argument(
