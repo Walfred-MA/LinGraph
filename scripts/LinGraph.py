@@ -116,14 +116,17 @@ Examples:
             inputs.add_argument("-i", "--input", help="one query FASTA (requires --sample)")
             q.add_argument("--sample", help="query name, e.g. HG002_h1, for -i")
             q.add_argument("--reference-caches", metavar="DIR",
-                           help="use supplied reference alignment and blocks without cache validation; default: GRAPH/references/NAME_rig")
+                           help="use this reference cache folder without validation; default: a GRAPH/references/ cache "
+                                "matching the reference name, mode and contig fingerprint, else one built in OUTPUT/references/")
             q.add_argument("--merge", action="store_true", help="also write cohort SNP/indel/SV VCFs when calling multiple samples (off by default)")
             q.add_argument("--reuse-alignments", metavar="DIR",
                            help="reuse each sample's graph alignment (hotspots, align.txt, segment summary, blocks) "
                                 "from an earlier singular output DIR made with the same graph, e.g. to call the same "
                                 "assemblies against another reference; no content validation")
             q.add_argument("--reference-only", action="store_true",
-                           help="build or resume the reference cache for -r FASTA (in --reference-caches DIR, default GRAPH/references/NAME_rig), then stop; no samples are called")
+                           help="build or resume the reference cache for -r FASTA in GRAPH/references/NAME_rig "
+                                "(NAME_<fingerprint>_rig if that holds another reference; or --reference-caches DIR), "
+                                "then stop; no samples are called")
         q.add_argument("-r", "--reference", help="reference NAME or FASTA; default: first saved cohort assembly")
         q.add_argument("-L", "--graph-list", help="partition names or paths, one per row; default: all")
         q.add_argument("-t", "-j", "--threads", "--cores", type=int,
@@ -674,22 +677,84 @@ def reference_lengths_hash(fai):
     return hashlib.sha256(content.encode()).hexdigest()
 
 
+def reference_cache_signature(refdir):
+    """Return a cache folder's recorded signature, or None."""
+    try:
+        state = json.loads((Path(refdir) / 'reference_cache.json').read_text())
+    except (OSError, ValueError):
+        return None
+    signature = state.get('signature') if isinstance(state, dict) else None
+    return signature if isinstance(signature, dict) else None
+
+
+def reference_cache_complete(refdir, refname):
+    return all((Path(refdir) / name).is_file() and (Path(refdir) / name).stat().st_size > 0
+               for name in (f'{refname}.align.txt', f'{refname}.align.txt_blocks.bed'))
+
+
+def reference_cache_folders(root, refname, mode, lengths_hash):
+    """The two cache folders a reference may use: NAME_rig, then NAME_<fingerprint>_rig."""
+    suffix = '_fast' if mode == 'fast' else '_rig'
+    return (Path(root) / f'{refname}{suffix}',
+            Path(root) / f'{refname}_{lengths_hash[:12]}{suffix}')
+
+
+def find_reference_cache(root, refname, mode, lengths_hash):
+    """Return NAME_rig or NAME_<fingerprint>_rig under ROOT if it is a complete
+    cache for this reference name, mode and contig fingerprint."""
+    for folder in reference_cache_folders(root, refname, mode, lengths_hash):
+        signature = reference_cache_signature(folder) if folder.is_dir() else None
+        if (signature and signature.get('reference') == refname and signature.get('mode') == mode
+                and signature.get('fai_lengths_sha256') == lengths_hash
+                and reference_cache_complete(folder, refname)):
+            return folder
+    return None
+
+
 def singular_reference(args, runner, graph, ref, graphroot, listing, index,
                        graph_dependencies, ordered_names, searcher):
-    """Reuse completed reference files, or resume an unfinished preparation."""
+    """Find, reuse or build the reference cache.
+
+    --reference-caches DIR is used as given. Otherwise a complete cache with
+    the same reference name, mode and contig fingerprint is looked up in
+    GRAPH/references/NAME_rig, then GRAPH/references/NAME_<fingerprint>_rig;
+    without one, the cache is built (or resumed) in
+    OUTPUT/references/. --reference-only builds into GRAPH/references/NAME_rig,
+    or NAME_<fingerprint>_rig when that name holds a different reference.
+    """
     refname, reffa = ref
     template_listing = Path(index).with_suffix('')
     supplied = getattr(args, 'reference_caches', None)
+    reference_only = getattr(args, 'reference_only', False)
     mode = 'fast' if args.alignment_mode == 'fast' else 'rigorous'
+    suffix = '_fast' if mode == 'fast' else '_rig'
     graph_base = graph.parent if graph.name in {'summary', 'Graphs'} else graph
-    refdir = absolute(supplied) if supplied else (
-        graph_base / 'references' / (refname + ('_fast' if mode == 'fast' else '_rig'))
-    )
+    graph_caches = graph_base / 'references'
+    fingerprint = reference_lengths_hash(Path(str(reffa) + '.fai'))
+    say(f'Reference {refname}: {reffa} (contig name/length SHA-256 {fingerprint})')
+    if supplied:
+        refdir = absolute(supplied)
+        if not reference_only:
+            say(f'Use supplied reference results without validation: {refdir}')
+            return refdir / f'{refname}.align.txt', refdir / f'{refname}.align.txt_blocks.bed'
+    elif reference_only:
+        refdir, hashed = reference_cache_folders(graph_caches, refname, mode, fingerprint)
+        signature = reference_cache_signature(refdir)
+        occupied = (signature.get('fai_lengths_sha256') != fingerprint if signature
+                    else reference_cache_complete(refdir, refname))
+        if occupied:
+            say(f'{refdir} holds a different {refname}; using {hashed}')
+            refdir = hashed
+    else:
+        found = find_reference_cache(graph_caches, refname, mode, fingerprint)
+        if found is not None:
+            say(f'Use reference cache {found} (matches {refname}, {mode} mode, SHA-256 {fingerprint[:16]}...)')
+            return found / f'{refname}.align.txt', found / f'{refname}.align.txt_blocks.bed'
+        refdir = absolute(args.output) / 'references' / (refname + suffix)
+        say(f'No matching {refname} cache in ' + ' or '.join(map(str, reference_cache_folders(graph_caches, refname, mode, fingerprint)))
+            + f'; using {refdir} (built there if incomplete)')
     align = refdir / f'{refname}.align.txt'
     blocks = refdir / f'{refname}.align.txt_blocks.bed'
-    if supplied and not getattr(args, 'reference_only', False):
-        say(f'Use supplied reference results without validation: {refdir}')
-        return align, blocks
 
     # The directory is selected before reading any identity metadata. A lock
     # lets simultaneous callers share one completed reference preparation.
