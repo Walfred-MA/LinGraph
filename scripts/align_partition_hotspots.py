@@ -1539,7 +1539,7 @@ def fast_mask_statistics(
 def run_fast_direct_alignment(
     records: Sequence[DirectSequence], graph_fasta: str,
     args: argparse.Namespace, work_root: str, output_path: str,
-    hotspot_index: int = 1,
+    hotspot_index: int = 1, detail_logging: bool = True,
 ) -> Tuple[int, int]:
     """Run bulk BLASTN and bounded Winnowmap batches for one local graph.
 
@@ -1547,6 +1547,8 @@ def run_fast_direct_alignment(
     Winnowmap.  Slow-rigorous mode uses the same batched implementation but
     sends every query to Winnowmap regardless of masking or BLASTN coverage.
     """
+    # Per-graph detail; callers looping over many graphs log it at DEBUG.
+    info = LOG.info if detail_logging else LOG.debug
     slow_rigorous = bool(getattr(args, "slow_rigorous", False))
     prepared, oriented_fasta = prepare_fast_alignments(
         records, graph_fasta, work_root, args.timeout, args.threads,
@@ -1557,7 +1559,7 @@ def run_fast_direct_alignment(
     graph_lengths = fasta_sequence_lengths(graph_fasta)
     masked_bases, repeat_heavy_queries = fast_mask_statistics(prepared)
     use_masked_alignment = slow_rigorous or repeat_heavy_queries > 0
-    LOG.info(
+    info(
         "%s mode oriented %d records once; detected %d lowercase bases "
         "and %d queries above the %d-base mask threshold; Winnowmap "
         "eligibility is %s",
@@ -1573,7 +1575,7 @@ def run_fast_direct_alignment(
         os.path.join(work_root, "fast_blast_queries.fasta"),
     )
     if blast_query_aliases:
-        LOG.info(
+        info(
             "BLAST local-ID compatibility: replaced %d query ID(s) longer "
             "than %d bytes with Q-number aliases; full names will be restored",
             len(blast_query_aliases), BLAST_LOCAL_ID_MAXIMUM,
@@ -1585,7 +1587,7 @@ def run_fast_direct_alignment(
         ["-dust", "yes", "-lcase_masking"] if use_masked_alignment else []
     )
     if completed_command_output(combined_sam):
-        LOG.info("RESUME: reusing completed bulk BLASTN output: %s", combined_sam)
+        info("RESUME: reusing completed bulk BLASTN output: %s", combined_sam)
     else:
         for stale in (combined_sam, combined_sam + ".complete"):
             try:
@@ -1610,7 +1612,7 @@ def run_fast_direct_alignment(
             combined_sam, blast_query_aliases,
         )
         if blast_query_aliases:
-            LOG.info(
+            info(
                 "Restored full query IDs in %d BLAST SAM alignment row(s)",
                 restored_rows,
             )
@@ -1621,7 +1623,7 @@ def run_fast_direct_alignment(
     for item in prepared:
         name = item.prepared.query_name
         evidence[name].append((combined_sam, tuple(blast_offsets.get(name, ()))))
-    LOG.info(
+    info(
         "Fast BLASTN indexed %d SAM records for %d/%d queries in one scan",
         blast_rows, len(blast_offsets), len(prepared),
     )
@@ -1630,7 +1632,7 @@ def run_fast_direct_alignment(
         int(getattr(args, "conversion_workers", args.threads)), len(prepared),
     )
     conversion_workers = max(1, conversion_workers)
-    LOG.info(
+    info(
         "Converting indexed graph alignments with %d query process(es)",
         conversion_workers,
     )
@@ -1652,7 +1654,7 @@ def run_fast_direct_alignment(
         )
         if slow_rigorous:
             unfinished = list(prepared)
-            LOG.info(
+            info(
                 "Slow-rigorous mode sends all %d queries to Winnowmap after "
                 "bulk BLASTN",
                 len(prepared),
@@ -1662,7 +1664,7 @@ def run_fast_direct_alignment(
                 item for item in prepared
                 if fast_row_needs_winnowmap(rows[item.prepared.query_name])
             ]
-            LOG.info(
+            info(
                 "Fast BLASTN completed %d/%d queries with no unmapped gap "
                 "over %d bp",
                 len(prepared) - len(unfinished), len(prepared),
@@ -1671,7 +1673,7 @@ def run_fast_direct_alignment(
 
         if use_masked_alignment and unfinished:
             batches = list(iter_winnowmap_batches(unfinished))
-            LOG.info(
+            info(
                 "Sending %d unfinished queries to Winnowmap in %d batch(es), "
                 "each capped at %d MiB of complete records",
                 len(unfinished), len(batches),
@@ -1703,7 +1705,7 @@ def run_fast_direct_alignment(
                 if batch_bases > FAST_WINNOWMAP_BATCH_BASES:
                     raise AssertionError("internal Winnowmap batch limit violation")
                 if completed_command_output(batch_sam):
-                    LOG.info(
+                    info(
                         "RESUME: reusing completed Winnowmap batch %d/%d: %s",
                         batch_index, len(batches), batch_sam,
                     )
@@ -1726,7 +1728,7 @@ def run_fast_direct_alignment(
                     evidence[name].append((
                         batch_sam, tuple(winnow_offsets.get(name, ())),
                     ))
-                LOG.info(
+                info(
                     "Fast Winnowmap batch %d/%d: %d queries, %.2f MiB, "
                     "%d indexed SAM records",
                     batch_index, len(batches), len(batch),
@@ -1737,7 +1739,7 @@ def run_fast_direct_alignment(
                     min(conversion_workers, len(batch)), executor,
                 ))
         elif unfinished:
-            LOG.info(
+            info(
                 "Skipping Winnowmap because no query contains more than %d "
                 "lowercase bases",
                 FAST_MASKED_BASE_THRESHOLD,
@@ -1816,6 +1818,7 @@ def align_fast_hotspot_batch(
         output_rows, insertions = run_fast_direct_alignment(
             records, graph_fasta, group_args, group_root, group_output,
             hotspot_index=hotspot_index,
+            detail_logging=bool(getattr(args, "verbose", False)),
         )
         return hotspot_index, group_output, output_rows, insertions
 

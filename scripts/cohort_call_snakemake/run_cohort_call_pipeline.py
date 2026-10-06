@@ -442,6 +442,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--script-folder", default=str(REPOSITORY))
     parser.add_argument("--kmermatch", default=str(REPOSITORY / "KmerMatch"))
     parser.add_argument("--snakemake", default="snakemake")
+    parser.add_argument(
+        "--latency-wait", type=int, default=120, metavar="SECONDS",
+        help="seconds Snakemake waits for a finished job's output files to appear on a shared "
+             "filesystem before failing it (Snakemake --latency-wait; default: 120)",
+    )
     parser.add_argument("--skip-version-check", action="store_true")
     parser.add_argument("--dry-run", "-n", action="store_true")
     parser.add_argument("--slurm", action="store_true")
@@ -500,7 +505,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "max_extension", "cross_validation_extension", "edge_blackregion",
         "var_in_insert",
         "buffer_size", "buffer_bytes", "progress_every", "progress_seconds",
-        "maxtasksperchild",
+        "maxtasksperchild", "latency_wait",
     ):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} cannot be negative")
@@ -928,6 +933,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--directory", str(output),
         "--cores", str(max(args.cores, args.slurm_jobs) if args.slurm else args.cores),
         "--rerun-incomplete",
+        "--latency-wait", str(args.latency_wait),
         "--printshellcmds",
     ]
     resources = [f"io_jobs={args.io_jobs}"]
@@ -937,13 +943,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     command.extend(["--config", f"run_config={config_path}"])
     if args.dry_run:
         command.append("--dry-run")
+    # Same settings as the Snakefile's chromosome merge command, which the
+    # chromosome markers record (including the KmerMatch binary).
+    merge_settings = {
+        "minsvsize": final_minsvsize, "merge_distance": args.merge_distance,
+        "size_similarity": args.size_similarity, "sequence_similarity": args.sequence_similarity,
+        "var_in_insert": args.var_in_insert,
+        "emit_small": args.merge_mode in ('all', 'svindel'),
+        "kmermatch": str(kmermatch),
+    }
+    if args.merge_mode == "all":
+        merge_settings["insertion_snps"] = str(merge_tmpdir / "insertion_snps")
     if args.slurm and (merge_tmpdir / "chroms.complete.tsv").is_file() and merge_needs_resume(
-        merge_tmpdir, {
-            "minsvsize": final_minsvsize, "merge_distance": args.merge_distance,
-            "size_similarity": args.size_similarity, "sequence_similarity": args.sequence_similarity,
-            "var_in_insert": args.var_in_insert,
-            "emit_small": args.merge_mode in ('all', 'svindel'),
-        },
+        merge_tmpdir, merge_settings,
     ):
         # The helper will skip checked chromosomes and submit only unfinished
         # ones, even if a previous launch left a whole-stage marker behind.

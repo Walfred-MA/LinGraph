@@ -358,7 +358,8 @@ cd ..
 
 Build the cache once. `--reference-only` aligns the reference to every local
 graph (hours, like calling one haplotype), writes
-`Win50KGraph/references/HG19_h1_rig`, and calls no samples. Rerun the same
+`Win50KGraph/references/HG19_h1_rig` (or `HG19_h1_<fingerprint>_rig` if a
+different HG19 already uses that name), and calls no samples. Rerun the same
 command to resume:
 
 ```bash
@@ -370,7 +371,8 @@ python3 LinGraph/scripts/LinGraph.py singular \
 The name `HG19_h1` is read from the contig prefix; `--reference-name HG19_h1`
 states it explicitly. To keep the cache elsewhere, add `--reference-caches DIR`:
 the cache is built in `DIR`, and later calls use it with the same
-`--reference-caches DIR`. Then call against HG19 like any other reference; the
+`--reference-caches DIR`. Without this step, the first HG19 call builds the
+cache in its own output folder. Then call against HG19 like any other reference; the
 cache is found and reused automatically:
 
 ```bash
@@ -386,22 +388,29 @@ in a standard VCF, rename them, for example with `bcftools annotate
 
 ### Reuse reference alignments
 
-`singular` caches reference preparation under the graph root:
+Calling needs a reference cache: the reference aligned to every local graph.
+Caches live in folders such as `cohort_graph/references/CHM13_h1_rig/`, each
+with a `reference_cache.json` recording the reference name, the alignment mode
+and a **contig fingerprint**: the SHA-256 of sorted chromosome-name/length
+pairs from the `.fai`. The fingerprint ignores FASTA contents, file names,
+masking, wrapping, `.fai` row order, offsets and timestamps.
 
-```text
-cohort_graph/references/CHM13_h1_rig/
-```
+`singular` finds its cache automatically:
 
-LinGraph selects the reference cache directory by reference sample name,
-then checks the SHA-256 hash of sorted chromosome-name/length pairs from the
-first two `.fai` columns. The hash ignores FASTA contents, file names, masking,
-wrapping, `.fai` row order, offsets, and timestamps. It is saved in
-`reference_cache.json`. Cache metadata also tracks graph inputs, graph-list
-order, and reference alignment settings. Matching results can be reused across
-calling output directories and thread counts. Missing or failed stages resume
-from the completed reference stages; a mismatched identity rebuilds preparation.
+1. It checks `GRAPH/references/NAME_rig`, then
+   `GRAPH/references/NAME_<fingerprint>_rig` (the first 12 characters of the
+   reference's own fingerprint), and uses the first that is a complete cache
+   with the same reference name, mode and fingerprint. It prints the folder and
+   the fingerprint it matched.
+2. Without a match, it builds the cache in `OUTPUT/references/NAME_rig` and
+   uses it. Rerunning with the same `-O` resumes or reuses it.
 
-To use reference results you already have, add:
+To build a cache once for later calls, use `--reference-only` (see the HG19
+example above). It writes to `GRAPH/references/NAME_rig`; when that folder
+already holds a different reference of the same name, it writes to
+`GRAPH/references/NAME_<fingerprint>_rig` instead, which step 1 also finds.
+
+To use a specific cache folder instead, add:
 
 ```bash
 --reference-caches /path/to/reference-caches

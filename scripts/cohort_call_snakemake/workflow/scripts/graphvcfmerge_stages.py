@@ -257,6 +257,16 @@ def completion_context(command):
     _remaining, insertion_snps = take_option(command, "--insertion-snps")
     if insertion_snps:
         context["insertion_snps"] = insertion_snps
+    # Chromosome markers stamp the KmerMatch binary (checkpoints.settings), so
+    # the expected settings must name the same one: --kmermatch, else the
+    # merger's default beside graphvcfmerge.py.
+    _remaining, kmermatch = take_option(command, "--kmermatch")
+    if not kmermatch:
+        merger = next((token for token in command if Path(token).name == "graphvcfmerge.py"), None)
+        if merger:
+            kmermatch = str(Path(merger).resolve().with_name("KmerMatch"))
+    if kmermatch:
+        context["kmermatch"] = kmermatch
     return context
 
 

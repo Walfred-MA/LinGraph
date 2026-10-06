@@ -5089,6 +5089,8 @@ def main():
     )
     parser.add_argument("--tmpdir", default="", help="Temporary directory or existing debug dir")
     parser.add_argument("--reuse-split", action="store_true", help="Reuse existing split files in tmpdir/genomes")
+    parser.add_argument("--keep-tmpdir", action="store_true",
+                        help="Keep the temporary directory after a successful run (it is always kept after a failure)")
     parser.add_argument(
         "--filter-hg38-alts",
         dest="filter_hg38_alts",
@@ -5165,7 +5167,10 @@ def main():
         )
 
     tmpdir = args.tmpdir if args.tmpdir else "GenomeLiftTemp"
-    remove_tmpdir_after_finish = (not args.tmpdir)
+    # The split/out files are intermediates only; remove them once the output
+    # is written. A failure, --keep-tmpdir or a reused split keeps them.
+    remove_tmpdir_after_finish = not (args.keep_tmpdir or args.reuse_split)
+    succeeded = False
 
     try:
         genome_split_dir = os.path.join(tmpdir, "genomes")
@@ -5378,10 +5383,10 @@ def main():
                 flush=True,
             )
 
+        succeeded = True
     finally:
-        if remove_tmpdir_after_finish and os.path.isdir(tmpdir):
-            # shutil.rmtree(tmpdir)
-            pass
+        if succeeded and remove_tmpdir_after_finish and os.path.isdir(tmpdir):
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
