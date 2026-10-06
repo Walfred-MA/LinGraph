@@ -273,6 +273,36 @@ def read_many(sources, *, with_records=True):
     return result
 
 
+class DirectReader:
+    """Lock-free reads of committed entries at known offsets.
+
+    Only for stores no worker writes any more (a backfill after its SV merge):
+    each bundle is opened once and every batch is read in file order."""
+
+    def __init__(self):
+        self._handles = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        for handle, _size in self._handles.values():
+            handle.close()
+        self._handles.clear()
+
+    def read_many(self, sources, *, with_records=True):
+        result = [None] * len(sources)
+        for index in sorted(range(len(sources)),
+                            key=lambda item: (sources[item]['bundle'], sources[item]['offset'])):
+            path = sources[index]['bundle']
+            if path not in self._handles:
+                handle = open(path, 'rb')
+                self._handles[path] = (handle, os.fstat(handle.fileno()).st_size)
+            handle, size = self._handles[path]
+            result[index] = _read_entry(handle, path, size, sources[index], with_records)
+        return result
+
+
 def _read_entry(handle, path, size, source, with_records):
     """One committed entry through an open, share-locked bundle handle."""
     start = source['offset']

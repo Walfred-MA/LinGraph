@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import defaultdict
+from contextlib import nullcontext
 import hashlib
+import heapq
+import io
 import json
 import multiprocessing
 import os
@@ -405,44 +408,98 @@ def concat_insertions(manifest, insertion_snps=None):
     for source in index['sources']:
         identity = (source['bundle'], source['key'], source['offset'], source['digest']) if isinstance(source, dict) else str(Path(source).resolve())
         paths[identity] = source if isinstance(source, dict) else identity
-    bundled = [path for identity, path in paths.items()
-               if isinstance(path, dict) and identity not in embedded]
-    metadata_of = {id(path): entry[0] for path, entry in zip(
-        bundled, insertion_store.read_many(bundled, with_records=False))}
-    for identity, path in paths.items():
-        if identity in embedded:
-            continue
-        data = (metadata_of[id(path)] if isinstance(path, dict)
-                else json.loads(Path(path).read_text()))
-        if any(query[0] not in samples for query in data['queries']):
-            raise ValueError(f'insertion SNP source contains an unknown sample: {path}')
-        for key, name in data['chroms'].items():
-            if name in originals:
-                raise ValueError(f'insertion contig already occurs in chromosome parts: {name!r}')
-            length = str(data['lengths'][name])
-            if (name in definitions and definitions[name] != length or
-                    name in lengths and lengths[name] != length):
-                raise ValueError(f'conflicting insertion length for {name!r}')
-            lengths[name] = length
-            names[key] = name
-            by_locus[key].append(path)
-    plan = [(key, names[key], paths) for key, paths in sorted(by_locus.items(), key=lambda item: names[item[0]])]
+    finished, taken = _usable_finished(root, manifest['samples'], paths, embedded)
+    for key, (name, length) in taken.items():
+        if name in originals:
+            raise ValueError(f'insertion contig already occurs in chromosome parts: {name!r}')
+        if (name in definitions and definitions[name] != length or
+                name in lengths and lengths[name] != length):
+            raise ValueError(f'conflicting insertion length for {name!r}')
+        lengths[name] = length
+    # Read source metadata a batch at a time and keep only contig names and
+    # lengths: holding every source's metadata at once grows with the cohort.
+    pending = [path for identity, path in paths.items() if identity not in embedded
+               and not (isinstance(path, dict) and path['key'] in taken)]
+    for start in range(0, len(pending), METADATA_BATCH_SOURCES):
+        batch = pending[start:start + METADATA_BATCH_SOURCES]
+        bundled = [path for path in batch if isinstance(path, dict)]
+        metadata_of = {id(path): entry[0] for path, entry in zip(
+            bundled, insertion_store.read_many(bundled, with_records=False))}
+        for path in batch:
+            data = (metadata_of[id(path)] if isinstance(path, dict)
+                    else json.loads(Path(path).read_text()))
+            if any(query[0] not in samples for query in data['queries']):
+                raise ValueError(f'insertion SNP source contains an unknown sample: {path}')
+            for key, name in data['chroms'].items():
+                if name in originals:
+                    raise ValueError(f'insertion contig already occurs in chromosome parts: {name!r}')
+                length = str(data['lengths'][name])
+                if (name in definitions and definitions[name] != length or
+                        name in lengths and lengths[name] != length):
+                    raise ValueError(f'conflicting insertion length for {name!r}')
+                lengths[name] = length
+                names[key] = name
+                by_locus[key].append(path)
+        del metadata_of, bundled, batch
+    plan = InsertionPlan(
+        [(key, names[key], paths) for key, paths in sorted(by_locus.items(), key=lambda item: names[item[0]])],
+        finished)
     # Insertions follow every original chromosome in both the body and header.
     metadata = [line for line in manifest['metadata'] if not (
         line.startswith('##contig=<') and vcf._parse_structured_meta(line, 'contig')['ID'] in lengths)]
-    metadata.extend(f'##contig=<ID={name},length={lengths[name]}>' for _, name, _ in plan)
+    ordered_names = sorted([name for _, name, _ in plan] + [name for name, _ in taken.values()])
+    metadata.extend(f'##contig=<ID={name},length={lengths[name]}>' for name in ordered_names)
     return metadata, plan
 
 
 APPEND_BATCH_LOCI = 512
+# Insertion SNPs finished by the SV-merge chromosome jobs (finish_chrom_insertions).
+FINISHED_DIRECTORY = 'finished'
+FINISHED_PROTOCOL = 1
+
+
+class InsertionPlan(list):
+    """Insertion loci still to merge at concat, plus chromosome-finished parts."""
+    def __init__(self, loci=(), finished=()):
+        super().__init__(loci)
+        self.finished = list(finished)
+# Insertion sources whose metadata concat_insertions holds at once.
+METADATA_BATCH_SOURCES = 4096
 
 
 def append_insertions(handle, manifest, plan, root=None):
-    """Load, sort and emit one insertion locus at a time; never create sort runs.
+    """Append insertion SNP sites after the original chromosomes, by insertion name.
 
-    Bundled sources and realignment records are read APPEND_BATCH_LOCI loci
-    at a time with one open per bundle, not one per locus."""
+    Loci finished by the SV-merge chromosome jobs are copied from their parts;
+    the rest are merged here. Both streams are already in name order, so they
+    are interleaved without loading either."""
+    finished = getattr(plan, 'finished', [])
+    if not finished:
+        total = 0
+        for count, text in _merge_planned_loci(manifest, plan, root):
+            handle.write(text)
+            total += count
+        if plan:
+            print(f'[merge:snp] concat appended {total} sites from {len(plan)} insertion loci', file=sys.stderr)
+        return total
+    streams = [_finished_rows(part, names) for part, names in finished]
+    streams.append(line for _count, text in _merge_planned_loci(manifest, plan, root)
+                   for line in text.splitlines(keepends=True))
     total = 0
+    for line in heapq.merge(*streams, key=_row_chrom):
+        handle.write(line)
+        total += 1
+    loci = len(plan) + sum(len(names) for _part, names in finished)
+    print(f'[merge:snp] concat appended {total} sites from {loci} insertion loci '
+          f'({loci - len(plan)} finished by chromosome jobs)', file=sys.stderr)
+    return total
+
+
+def _merge_planned_loci(manifest, plan, root):
+    """Yield (sites, text) per planned locus, reading APPEND_BATCH_LOCI loci at a time.
+
+    Bundled sources and realignment records are read with one open per bundle
+    per batch, not one per locus."""
     realign_root = Path(root) / 'realign' if root else None
     # Older runs wrote realignment records as one JSON file per path.
     legacy = ({path.stem for path in realign_root.glob('*.json')}
@@ -457,42 +514,180 @@ def append_insertions(handle, manifest, plan, root=None):
             keys = list(found)
             realignments = dict(zip(keys, (entry[0] for entry in insertion_store.read_many(
                 [found[key] for key in keys], with_records=False))))
-        total += _append_chunk(handle, manifest, chunk, loaded, realignments, realign_root, legacy)
-    if plan:
-        print(f'[merge:snp] concat appended {total} sites from {len(plan)} insertion loci', file=sys.stderr)
+        for key, name, paths in chunk:
+            text = io.StringIO()
+            count = _emit_insertion_locus(text, manifest['samples'], key, name, paths, loaded,
+                                          realignments.get(key), realign_root, legacy)
+            yield count, text.getvalue()
+        del loaded, realignments
+
+
+def _row_chrom(line):
+    return line[:line.index('\t')]
+
+
+def _finished_rows(part, names):
+    with open(part) as handle:
+        for line in handle:
+            if _row_chrom(line) in names:
+                yield line
+
+
+def _usable_finished(root, samples, paths, embedded):
+    """Chromosome-finished parts whose loci still match this store.
+
+    A locus is taken from a part only when its single bundled source has the
+    digest the chromosome job merged, and the part used this sample order;
+    everything else is merged at concat as before."""
+    directory = Path(root) / FINISHED_DIRECTORY
+    if not directory.is_dir():
+        return [], {}
+    sources = defaultdict(list)
+    for identity, path in paths.items():
+        if identity in embedded:
+            continue
+        if not isinstance(path, dict):
+            return [], {}  # Legacy per-locus spools: keys unknown without reading them.
+        sources[path['key']].append(path)
+    finished, taken = [], {}
+    for index in sorted(directory.glob('*.json')):
+        try:
+            info = json.loads(index.read_text())
+        except (OSError, ValueError):
+            continue
+        part = index.with_suffix('.part')
+        if info.get('protocol') != FINISHED_PROTOCOL or not part.is_file():
+            continue
+        if info.get('samples') != list(samples):
+            print(f'[merge:snp] {index.name}: sample order differs; merging its loci at concat',
+                  file=sys.stderr)
+            continue
+        names = set()
+        for key, name, length, digest in info.get('loci', []):
+            found = sources.get(key, [])
+            if key not in taken and len(found) == 1 and found[0]['digest'] == digest:
+                taken[key] = (name, str(length))
+                names.add(name)
+        if names:
+            finished.append((str(part), names))
+    return finished, taken
+
+
+DIRECT_READ_BATCH = 1    # one insertion in memory per worker: a large one can take GBs
+
+
+def backfill_index(root):
+    """Entry offsets for a backfill, whose SV merge (the only writer) is done:
+    manifest.json's sources, plus one walk of realign/. None when the store
+    has no manifest or holds legacy per-insertion spools."""
+    root = Path(root)
+    path = root / 'manifest.json'
+    if not path.is_file():
+        return None
+    sources = json.loads(path.read_text())['sources']
+    if any(not isinstance(source, dict) for source in sources):
+        return None
+    realign_root = root / 'realign'
+    realign, legacy = {}, set()
+    if realign_root.is_dir():
+        legacy = {path.stem for path in realign_root.glob('*.json')}
+        realign = {source['key']: source for source in insertion_store.sources(realign_root)}
+    return {source['key']: source for source in sources}, realign, legacy
+
+
+def finish_chrom_insertions(root, part_paths, samples, label, index=None):
+    """Merge one chromosome's insertion SNPs right after its SV merge.
+
+    The SV merge has just saved every insertion of this chromosome (its INS
+    rows' owner paths), with nested realignments. Each is merged alone, as at
+    concat, into ROOT/finished/LABEL.part in insertion-name order; LABEL.json
+    records the loci, their source digests and the sample order used.
+
+    INDEX (backfill_index) is for a backfill only: entries are then read at
+    their indexed offsets through open, unlocked bundles, a batch at a time in
+    file order, instead of locating and locking per insertion."""
+    from graphvcfmerge_snp import atomic_output
+    root = Path(root)
+    owned = {}
+    for part in part_paths:
+        if not part or not Path(part).is_file():
+            continue
+        with open(part) as handle:
+            for raw in handle:
+                fields = raw.split('\t', 8)
+                if len(fields) >= 8 and 'SVTYPE=INS' in fields[7].split(';'):
+                    name = vcf.checkpoints.insertion_snp_owner(fields[2], fields[7])
+                    owned[chrom_key(name)] = name
+    realign_root = root / 'realign'
+    if index is None:
+        found = insertion_store.find_many(root, owned)
+        legacy, realign_found = set(), {}
+        if realign_root.is_dir():
+            legacy = {path.stem for path in realign_root.glob('*.json')}
+            realign_found = insertion_store.find_many(realign_root, found)
+    else:
+        sources, realign_sources, legacy = index
+        found = {key: sources[key] for key in owned if key in sources}
+        realign_found = {key: realign_sources[key] for key in found if key in realign_sources}
+    directory = root / FINISHED_DIRECTORY
+    directory.mkdir(parents=True, exist_ok=True)
+    samples = list(samples)
+    allowed = set(samples)
+    loci, total = [], 0
+    items = sorted((owned[key], key) for key in found)
+    batch_size = 1 if index is None else DIRECT_READ_BATCH
+    with atomic_output(directory / (label + '.part')) as handle, \
+            (insertion_store.DirectReader() if index is not None else nullcontext()) as reader:
+        read_many = insertion_store.read_many if reader is None else reader.read_many
+        for start in range(0, len(items), batch_size):
+            batch = items[start:start + batch_size]
+            entries = read_many([found[key] for _name, key in batch])
+            realigned = [key for _name, key in batch if key in realign_found]
+            realigned = dict(zip(realigned, read_many([realign_found[key] for key in realigned],
+                                                      with_records=False)))
+            for (name, key), entry in zip(batch, entries):
+                source = found[key]
+                if any(query[0] not in allowed for query in entry[0]['queries']):
+                    raise ValueError(f'insertion SNP source contains an unknown sample: {source}')
+                realignment = realigned[key][0] if key in realigned else None
+                total += _emit_insertion_locus(handle, samples, key, name, [source], {id(source): entry},
+                                               realignment, realign_root, legacy)
+                loci.append([key, name, str(entry[0]['lengths'][name]), source['digest']])
+            del entries, realigned
+    vcf.checkpoints.write_json(directory / (label + '.json'),
+                               dict(protocol=FINISHED_PROTOCOL, samples=samples, loci=loci))
+    print(f'[merge:snp] {label}: finished {total} insertion SNP sites from {len(loci)} insertions',
+          file=sys.stderr, flush=True)
     return total
 
 
-def _append_chunk(handle, manifest, chunk, loaded, realignments, realign_root, legacy):
-    total = 0
-    for key, name, paths in chunk:
-        queries, alleles, groups = {}, {}, {}
-        coverage, arrays = defaultdict(list), []
-        for path in paths:
-            array, data, _, _ = _load_source((path, key, 0), loaded.get(id(path)))
-            query_map = np.array([queries.setdefault(tuple(q), len(queries)) for q in data['queries']], dtype='<u4')
-            allele_map = np.array([alleles.setdefault(a, len(alleles)) for a in data['alleles']], dtype='<u4')
-            group_map = np.array([groups.setdefault(g, len(groups)) for g in data.get('label_groups', [])], dtype='<u4')
-            grouped_queries = np.array([q[5] == LABEL_GROUP for q in data['queries']], dtype=bool)
-            remap_records(array, query_map, allele_map, group_map, grouped_queries, path)
-            arrays.append(array)
-            for sample, start, end in data['coverage'].get(name, []):
-                coverage[sample].append((start, end))
-        ordered = np.concatenate(arrays)
-        del arrays, array
-        ordered.sort(kind='mergesort', order=DTYPE.names)
-        query_list, allele_list = list(queries), list(alleles)
-        if key in realignments:
-            # --exact nested realignment records for this insertion path.
-            ordered = apply_realignment(realign_root / (key + '.json'), ordered, query_list,
-                                        allele_list, kind='INS_SNP', data=realignments[key])
-        elif key in legacy:
-            ordered = apply_realignment(realign_root / (key + '.json'), ordered, query_list,
-                                        allele_list, kind='INS_SNP')
-        total += write_locus(handle, name, ordered, query_list, allele_list, list(groups),
-                             coverage, manifest['samples'])
-        del ordered
-    return total
+def _emit_insertion_locus(handle, samples, key, name, paths, loaded, realignment, realign_root, legacy):
+    """Merge one insertion's SNP observations from all its sources and write its sites."""
+    queries, alleles, groups = {}, {}, {}
+    coverage, arrays = defaultdict(list), []
+    for path in paths:
+        array, data, _, _ = _load_source((path, key, 0), loaded.get(id(path)))
+        query_map = np.array([queries.setdefault(tuple(q), len(queries)) for q in data['queries']], dtype='<u4')
+        allele_map = np.array([alleles.setdefault(a, len(alleles)) for a in data['alleles']], dtype='<u4')
+        group_map = np.array([groups.setdefault(g, len(groups)) for g in data.get('label_groups', [])], dtype='<u4')
+        grouped_queries = np.array([q[5] == LABEL_GROUP for q in data['queries']], dtype=bool)
+        remap_records(array, query_map, allele_map, group_map, grouped_queries, path)
+        arrays.append(array)
+        for sample, start, end in data['coverage'].get(name, []):
+            coverage[sample].append((start, end))
+    ordered = np.concatenate(arrays)
+    del arrays, array
+    ordered.sort(kind='mergesort', order=DTYPE.names)
+    query_list, allele_list = list(queries), list(alleles)
+    if realignment is not None:
+        # --exact nested realignment records for this insertion path.
+        ordered = apply_realignment(realign_root / (key + '.json'), ordered, query_list,
+                                    allele_list, kind='INS_SNP', data=realignment)
+    elif key in legacy:
+        ordered = apply_realignment(realign_root / (key + '.json'), ordered, query_list,
+                                    allele_list, kind='INS_SNP')
+    return write_locus(handle, name, ordered, query_list, allele_list, list(groups),
+                       coverage, samples)
 
 
 def merge_chrom(root, chrom, processes=1):

@@ -11,6 +11,7 @@ Exactly one renaming mode is required:
 
   --CHM13fix        NC_060925.1 .. NC_060948.1 -> chr1 .. chr22, chrX, chrY
   --noprefix        drop everything up to the last '#' (HG19#1#chr1 -> chr1)
+  --noprefix TEXT   drop only the leading TEXT (--noprefix 'HG19#1#')
   --fixtable FILE   two-column table: replace column 1 with column 2
 
 Names that the chosen mode does not match are left unchanged.
@@ -76,8 +77,11 @@ def load_fixtable(path: str) -> Dict[str, str]:
 def build_renamer(args: argparse.Namespace) -> Callable[[str], str]:
     if args.CHM13fix:
         return lambda name: CHM13_NAMES.get(name, name)
-    if args.noprefix:
+    if args.noprefix == "":
         return lambda name: name.rsplit("#", 1)[-1]
+    if args.noprefix is not None:
+        prefix = args.noprefix
+        return lambda name: name[len(prefix):] if name.startswith(prefix) and name != prefix else name
     table = load_fixtable(args.fixtable)
     return lambda name: table.get(name, name)
 
@@ -148,8 +152,9 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     mode.add_argument("--CHM13fix", action="store_true",
                       help="rename CHM13 RefSeq accessions NC_060925.1-NC_060948.1 "
                            "to chr1-chr22, chrX, chrY")
-    mode.add_argument("--noprefix", action="store_true",
-                      help="remove the prefix up to the last '#' (HG19#1#chr1 -> chr1)")
+    mode.add_argument("--noprefix", nargs="?", const="", metavar="TEXT",
+                      help="remove the prefix up to the last '#' (HG19#1#chr1 -> chr1); "
+                           "with TEXT, remove only that leading text (--noprefix 'HG19#1#')")
     mode.add_argument("--fixtable", metavar="FILE",
                       help="two-column table; names in column 1 become column 2")
     return parser.parse_args(argv)

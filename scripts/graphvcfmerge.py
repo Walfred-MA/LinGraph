@@ -9569,6 +9569,82 @@ def _fast_stage_scan(
     )
 
 
+_FINISH_INDEX = None
+
+
+def _set_finish_index(index):
+    """Pool initializer: a forked worker inherits the index without a copy."""
+    global _FINISH_INDEX
+    _FINISH_INDEX = index
+
+
+def _fast_finish_insertions_task(task):
+    insertion_snps, parts, samples, label = task
+    from graphvcfmerge_snp_compact import finish_chrom_insertions
+    return label, finish_chrom_insertions(insertion_snps, parts, samples, label, index=_FINISH_INDEX)
+
+
+def _fast_stage_finish_insertions(shards_dir, insertion_snps, processes=1, force=False, chroms_only=None):
+    """Backfill for runs whose chromosome jobs predate finishing their own
+    insertion SNPs: finish every merged chromosome from its saved parts.
+
+    Chromosomes run in parallel. Entries are located through the store's
+    manifest.json (one walk of realign/) and read through open, unlocked
+    bundles: nothing writes the store any more. A chromosome without
+    merge.done is skipped (cohort concat still merges its insertions); one
+    already finished is skipped unless ``force``. CHROMS_ONLY (names from
+    chroms.txt or their locus_ labels) restricts it, e.g. to one SLURM job each."""
+    from graphvcfmerge_snp_compact import backfill_index
+    core_path = os.path.join(shards_dir, "manifest_core.pkl")
+    with open(core_path if os.path.isfile(core_path) else _fast_manifest_path(shards_dir), "rb") as handle:
+        samples = list(pickle.load(handle)["sample_names"])
+    with open(os.path.join(shards_dir, "chroms.txt")) as handle:
+        chroms = [line.split("\t", 1)[0].strip() for line in handle if line.strip()]
+    if chroms_only is not None:
+        wanted = set(chroms_only)
+        unknown = wanted - set(chroms) - {_safe_locus_key(chrom) for chrom in chroms}
+        if unknown:
+            raise ValueError(f"--chrom not in {shards_dir}/chroms.txt: {', '.join(sorted(unknown))}")
+        chroms = [chrom for chrom in chroms if chrom in wanted or _safe_locus_key(chrom) in wanted]
+    parts_dir = os.path.join(shards_dir, "parts")
+    finished_dir = os.path.join(insertion_snps, "finished")
+    tasks, not_merged, already = [], 0, 0
+    for chrom in chroms:
+        safe = _safe_locus_key(chrom)
+        if not checkpoints.marker_path(shards_dir, chrom).is_file():
+            not_merged += 1
+            continue
+        if not force and os.path.isfile(os.path.join(finished_dir, safe + ".json")):
+            already += 1
+            continue
+        small = os.path.join(parts_dir, safe + ".small.part")
+        tasks.append((insertion_snps, [os.path.join(parts_dir, safe + ".part"),
+                                       small if os.path.isfile(small) else None], samples, safe))
+    # Largest chromosomes first so they do not start last.
+    tasks.sort(key=lambda task: -sum(os.path.getsize(path) for path in task[1] if path))
+    print(f"[merge:finish] {len(tasks)} chromosome(s) to finish with {processes} process(es); "
+          f"{already} already finished; {not_merged} without merge.done (merged at concat)",
+          file=sys.stderr, flush=True)
+    if not tasks:
+        return
+    index = backfill_index(insertion_snps)
+    print("[merge:finish] " + ("reading entries at indexed offsets from manifest.json" if index
+                               else "no usable manifest.json; locating entries in the bundles"),
+          file=sys.stderr, flush=True)
+    done = 0
+    if processes > 1 and len(tasks) > 1:
+        with mp_context().Pool(min(processes, len(tasks)), _set_finish_index, (index,)) as pool:
+            for label, _sites in pool.imap_unordered(_fast_finish_insertions_task, tasks):
+                done += 1
+                print(f"[merge:finish] {done}/{len(tasks)} done: {label}", file=sys.stderr, flush=True)
+    else:
+        _set_finish_index(index)
+        for task in tasks:
+            label, _sites = _fast_finish_insertions_task(task)
+            done += 1
+            print(f"[merge:finish] {done}/{len(tasks)} done: {label}", file=sys.stderr, flush=True)
+
+
 def _fast_stage_chrom(
     shards_dir: str,
     chroms: Sequence[str],
@@ -9826,6 +9902,15 @@ def _fast_stage_chrom(
                 ) as handle:
                     for name, length in sorted(promoted.items()):
                         handle.write(f"{name}\t{length}\n")
+                if context["insertion_snps"]:
+                    # Every insertion of this chromosome, nested rounds
+                    # included, is saved: merge its SNPs here, in parallel
+                    # with the other chromosomes, instead of at cohort concat.
+                    from graphvcfmerge_snp_compact import finish_chrom_insertions
+                    finish_chrom_insertions(
+                        context["insertion_snps"], [part_path, small_path],
+                        context["sample_names"], _safe_locus_key(chrom),
+                    )
                 checkpoints.mark_done(shards_dir, chrom, context)
                 shutil.rmtree(scratch, ignore_errors=True)
                 print(
@@ -10548,7 +10633,7 @@ def merge_locus_vcfs(args) -> None:
     input_values.extend(read_vcf_input_lists(args.input_list))
     paths = expand_vcf_inputs(input_values)
     stage = getattr(args, "stage", None)
-    if not paths and stage not in ("chrom", "concat"):
+    if not paths and stage not in ("chrom", "concat", "finish-insertions"):
         raise ValueError(
             "need at least one input VCF path via -i/--input or "
             "-I/--input-list"
@@ -10606,6 +10691,13 @@ def merge_locus_vcfs(args) -> None:
                 candidate_min_size=args.candidate_min_size,
                 exact_query_paths=args.exact,
                 reference_paths=args.reference or (),
+            )
+        elif args.stage == "finish-insertions":
+            if not args.insertion_snps:
+                raise ValueError("the finish-insertions stage needs --insertion-snps DIR")
+            _fast_stage_finish_insertions(
+                args.shards_dir, args.insertion_snps, processes=args.processes,
+                chroms_only=[c for c in args.chrom.split(",") if c] if args.chrom else None,
             )
         elif args.stage == "chrom":
             if not args.chrom:
@@ -10718,15 +10810,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "from the list file, and the option may be repeated"
         ),
     )
-    parser.add_argument("-o", "--output", default=None, help="output merged VCF path; .gz is supported (required except for --stage scan/chrom)")
+    parser.add_argument("-o", "--output", default=None, help="output merged VCF path; .gz is supported (required except for --stage scan/chrom/finish-insertions)")
     parser.add_argument(
-        "--stage", choices=("scan", "chrom", "concat"), default=None,
+        "--stage", choices=("scan", "chrom", "concat", "finish-insertions"), default=None,
         help=(
             "split the merge for cluster arrays: 'scan' reads the "
             "inputs once and saves record shards + manifest to "
             "--shards-dir; 'chrom' processes --chrom from those "
             "shards; 'concat' assembles the final VCFs from every "
-            "chromosome's parts"
+            "chromosome's parts; 'finish-insertions' merges the "
+            "insertion SNPs of already merged chromosomes (backfill "
+            "for runs made before chromosome jobs did this)"
         ),
     )
     parser.add_argument("--snp-shards-dir", help="scan: save original SNPs as separate 21-byte worker shards")
@@ -10742,7 +10836,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "for --stage chrom: locus name(s) or, better, the locus "
             "subfolder(s) written under <shards-dir>/chroms/ by the "
             "scan stage (glob-safe, no name quoting); the full list "
-            "is in <shards-dir>/chroms.txt"
+            "is in <shards-dir>/chroms.txt. For --stage finish-insertions: "
+            "only these chromosome name(s) or locus_ label(s)"
         ),
     )
     parser.add_argument("--tmpdir", default=None, help="local shard/work directory; default is <output>_samplevcftemps")

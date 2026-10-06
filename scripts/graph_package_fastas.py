@@ -165,6 +165,20 @@ def _copy_partition(pack, partition, manifest, folder, destination, global_ids):
     return [summaries[row['path_order']] for row in rows], count, bases
 
 
+def _templates_match_originals(pack, template, rows, graph_ids):
+    """Unified refinement may widen an original after PARTITION.fasta was written."""
+    from fixed_alternatives import template_source
+    originals = {_row_source(pack, row)[:4] for row in rows if row['role'] == 'original'}
+    needed = {_row_source(pack, row)[:4] for row in rows
+              if row['role'] == 'original' and pack.public_path_id(row) not in graph_ids}
+    found = set()
+    with open(template) as handle:
+        for raw in handle:
+            if raw.startswith('>'):
+                found.add(_source_key(pack, template_source(raw[1:].split()))[:4])
+    return found <= originals and needed <= found
+
+
 def write_graph_package(manifests, partition_sources, output_dir, jobs,
                         query_paths=None, reference_haplotype=None,
                         embed_all_templates=False, *, graph_folder):
@@ -173,6 +187,7 @@ def write_graph_package(manifests, partition_sources, output_dir, jobs,
     folder = Path(graph_folder)
     ready = set()
     fallback = []
+    refined_templates = 0
     for partition, manifest in manifests:
         graph = folder / partition / (partition + '.FA')
         template = folder / partition / (partition + '.fasta')
@@ -180,11 +195,17 @@ def write_graph_package(manifests, partition_sources, output_dir, jobs,
         graph_ids = {pack.public_path_id(row) for row in _graph_rows(rows)}
         extra_originals = any(row['role'] == 'original' and pack.public_path_id(row) not in graph_ids
                               for row in rows)
-        if (graph.is_file() and graph.stat().st_size
-                and (not extra_originals or (template.is_file() and template.stat().st_size))):
+        templates_ready = not extra_originals or (template.is_file() and template.stat().st_size)
+        if graph.is_file() and graph.stat().st_size and templates_ready and extra_originals:
+            templates_ready = _templates_match_originals(pack, template, rows, graph_ids)
+            refined_templates += not templates_ready
+        if graph.is_file() and graph.stat().st_size and templates_ready:
             ready.add(partition)
         else:
             fallback.append((partition, manifest))
+    if refined_templates:
+        pack.LOG.info('%d partitions have originals widened by refinement; '
+                      'reading them from assemblies', refined_templates)
     if not ready:
         pack.LOG.info('No complete retained partition FASTAs; using existing sequence extraction')
         return pack.write_package_indexes(manifests, partition_sources, output_dir, jobs,

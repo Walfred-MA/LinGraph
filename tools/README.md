@@ -79,6 +79,8 @@ plain VCFs. Choose exactly one mode:
 python3 tools/vcf_chromfix.py -i calls.vcf.gz -o calls.chr.vcf.gz --CHM13fix
 # Drop everything up to the last '#': HG19#1#chr1 -> chr1
 python3 tools/vcf_chromfix.py -i calls.vcf -o calls.chr.vcf --noprefix
+# Drop only this leading text; other names stay unchanged
+python3 tools/vcf_chromfix.py -i calls.vcf -o calls.chr.vcf --noprefix 'HG19#1#'
 # Two-column table (tab or whitespace): column 1 -> column 2
 python3 tools/vcf_chromfix.py -i calls.vcf -o calls.chr.vcf --fixtable names.tsv
 ```
@@ -97,3 +99,19 @@ Names that the chosen mode does not match stay unchanged. The tool:
   record IDs unchanged, so nested rows still point to their parents.
 - Drops a `##contig` line whose renamed ID repeats an earlier one, with a
   warning.
+
+## Count INS/DEL SVs
+
+`tools/count_sv.sh` counts insertions and deletions of at least 50 bp
+(`-m MIN` changes the threshold) in plain or gzip-compressed VCFs:
+
+```bash
+bash tools/count_sv.sh NA19240_h1/NA19240_h1.vcf NA19240_h2/NA19240_h2.vcf
+```
+
+Columns are exclusive: `INS_only` and `DEL_only` have one part at or above
+the threshold, `both` has an inserted and a deleted part at or above it, and
+`total = INS_only + DEL_only + 2*both`. Deleted size is
+`|SVLEN|` for DEL and `END - POS` otherwise; inserted size is `SVLEN` for INS
+and the length of a plain `INFO/SEQ` (or `SVINSSEQ`) otherwise. Records
+without `SVLEN` use explicit REF/ALT lengths. Nested grVCF rows are skipped.
