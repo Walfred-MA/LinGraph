@@ -9594,7 +9594,7 @@ def _fast_stage_finish_insertions(shards_dir, insertion_snps, processes=1, force
     merge.done is skipped (cohort concat still merges its insertions); one
     already finished is skipped unless ``force``. CHROMS_ONLY (names from
     chroms.txt or their locus_ labels) restricts it, e.g. to one SLURM job each."""
-    from graphvcfmerge_snp_compact import backfill_index
+    from graphvcfmerge_snp_compact import backfill_index, finished_info
     core_path = os.path.join(shards_dir, "manifest_core.pkl")
     with open(core_path if os.path.isfile(core_path) else _fast_manifest_path(shards_dir), "rb") as handle:
         samples = list(pickle.load(handle)["sample_names"])
@@ -9614,7 +9614,8 @@ def _fast_stage_finish_insertions(shards_dir, insertion_snps, processes=1, force
         if not checkpoints.marker_path(shards_dir, chrom).is_file():
             not_merged += 1
             continue
-        if not force and os.path.isfile(os.path.join(finished_dir, safe + ".json")):
+        info = finished_info(insertion_snps, safe)
+        if not force and info is not None and info["samples"] == samples:
             already += 1
             continue
         small = os.path.join(parts_dir, safe + ".small.part")
@@ -9625,7 +9626,9 @@ def _fast_stage_finish_insertions(shards_dir, insertion_snps, processes=1, force
     print(f"[merge:finish] {len(tasks)} chromosome(s) to finish with {processes} process(es); "
           f"{already} already finished; {not_merged} without merge.done (merged at concat)",
           file=sys.stderr, flush=True)
+    labels = [_safe_locus_key(chrom) for chrom in chroms]
     if not tasks:
+        _publish_finished_manifest(insertion_snps, labels, not_merged, chroms_only)
         return
     index = backfill_index(insertion_snps)
     print("[merge:finish] " + ("reading entries at indexed offsets from manifest.json" if index
@@ -9643,6 +9646,21 @@ def _fast_stage_finish_insertions(shards_dir, insertion_snps, processes=1, force
             label, _sites = _fast_finish_insertions_task(task)
             done += 1
             print(f"[merge:finish] {done}/{len(tasks)} done: {label}", file=sys.stderr, flush=True)
+    _publish_finished_manifest(insertion_snps, labels, not_merged, chroms_only)
+
+
+def _publish_finished_manifest(insertion_snps, labels, not_merged, chroms_only):
+    """Once every chromosome finished, replace an old per-insertion manifest.json
+    by the list of chromosomes, so concat streams their parts."""
+    from graphvcfmerge_snp_compact import finished_info, write_finished_manifest
+    if chroms_only is not None or not_merged:
+        return
+    if any(path.name != "manifest.json" for path in Path(insertion_snps).glob("*.json")):
+        return    # per-insertion spools of an older store: concat merges them
+    if all(finished_info(insertion_snps, label) is not None for label in labels):
+        write_finished_manifest(insertion_snps, labels)
+        print(f"[merge:finish] manifest.json now lists the {len(labels)} finished chromosome(s)",
+              file=sys.stderr, flush=True)
 
 
 def _fast_stage_chrom(
@@ -9772,6 +9790,10 @@ def _fast_stage_chrom(
                     print(f"[merge:skip] {chrom}: checked complete", file=sys.stderr, flush=True)
                     continue
                 directory = checkpoints.prepare(shards_dir, chrom, context)
+                if context["insertion_snps"]:
+                    # Saved again below: a part finished by an earlier attempt is stale.
+                    from graphvcfmerge_snp_compact import discard_finished
+                    discard_finished(context["insertion_snps"], _safe_locus_key(chrom))
                 _FAST_DUP_STATE.clear()
                 if manifest.get("exact_queries") and exact_coverage is not None:
                     # Passed to emission tasks for shifted-insertion realignment.
@@ -10146,19 +10168,30 @@ def _fast_stage_concat(
         manifest["sample_names"], "sv", kmer_method=True,
     )
     header_bytes = header.getvalue().encode("utf-8")
-    insertion_ids = set()
     for target, suffix in targets:
         paths = [os.path.join(parts_dir, _safe_locus_key(chrom) + suffix) for chrom in chroms]
-        count, ids = _fast_concat_parts(paths, target, header_bytes, processes, bool(insertion_snps))
-        insertion_ids.update(ids)
+        count, _ids = _fast_concat_parts(paths, target, header_bytes, processes)
         print(
             f"[merge:fast] concat stage wrote {count} merged SV "
             f"row(s) to {target}",
             file=sys.stderr,
         )
     if insertion_snps:
-        from graphvcfmerge_snp_compact import finalize_insertions
-        finalize_insertions(insertion_snps, insertion_ids=insertion_ids)
+        from graphvcfmerge_snp_compact import (
+            finish_chrom_insertions, finished_info, write_finished_manifest,
+        )
+        labels = [_safe_locus_key(chrom) for chrom in chroms]
+        for chrom, label in zip(chroms, labels):
+            info = finished_info(insertion_snps, label)
+            if info is None or info["samples"] != list(manifest["sample_names"]):
+                # A chromosome merged by older code: finish it here.
+                small = os.path.join(parts_dir, label + ".small.part")
+                finish_chrom_insertions(
+                    insertion_snps, [os.path.join(parts_dir, label + ".part"),
+                                     small if os.path.isfile(small) else None],
+                    manifest["sample_names"], label,
+                )
+        write_finished_manifest(insertion_snps, labels)
     rebuilt = manifest.get("rebuilt_assemblies")
     if rebuilt and os.path.isdir(rebuilt):
         shutil.rmtree(rebuilt, ignore_errors=True)

@@ -393,6 +393,8 @@ def concat_insertions(manifest, insertion_snps=None):
     if not root:
         return manifest['metadata'], []
     index = json.loads((Path(root) / 'manifest.json').read_text())
+    if index.get('layout') == MANIFEST_LAYOUT:
+        return _concat_finished(manifest, root, index['chromosomes'])
     # Old manifests included insertion spools in chromosome jobs. Their rows
     # already exist in those parts, so explicitly passing the same root is safe.
     embedded = {str(Path(path).resolve()) for path in manifest.get('sources', [])}
@@ -455,14 +457,119 @@ def concat_insertions(manifest, insertion_snps=None):
 APPEND_BATCH_LOCI = 512
 # Insertion SNPs finished by the SV-merge chromosome jobs (finish_chrom_insertions).
 FINISHED_DIRECTORY = 'finished'
-FINISHED_PROTOCOL = 1
+FINISHED_PROTOCOL = 2             # LABEL.part rows, LABEL.contigs, LABEL.json
+LEGACY_FINISHED_PROTOCOL = 1      # LABEL.json listing every locus with its digest
+# manifest.json of a store whose every chromosome finished its insertions:
+# only the chromosome labels, nothing per insertion.
+MANIFEST_LAYOUT = 'chromosome-finished'
 
 
 class InsertionPlan(list):
-    """Insertion loci still to merge at concat, plus chromosome-finished parts."""
-    def __init__(self, loci=(), finished=()):
+    """Insertion loci still to merge at concat, plus chromosome-finished parts:
+    (part, names to take or None for all, sample columns to reorder or None)."""
+    def __init__(self, loci=(), finished=(), finished_loci=None):
         super().__init__(loci)
         self.finished = list(finished)
+        self.finished_loci = finished_loci
+
+
+def finished_paths(root, label):
+    directory = Path(root) / FINISHED_DIRECTORY
+    return tuple(directory / (label + suffix) for suffix in ('.json', '.part', '.contigs'))
+
+
+def finished_info(root, label):
+    """LABEL.json of a complete current-format finished chromosome, else None."""
+    info_path, part, contigs = finished_paths(root, label)
+    try:
+        info = json.loads(info_path.read_text())
+    except (OSError, ValueError):
+        return None
+    if info.get('protocol') != FINISHED_PROTOCOL or not part.is_file() or not contigs.is_file():
+        return None
+    return info
+
+
+def discard_finished(root, label):
+    """A chromosome about to save its insertions again drops its old part first."""
+    for path in finished_paths(root, label):    # .json first: the part is then unusable
+        path.unlink(missing_ok=True)
+
+
+def write_finished_manifest(root, labels):
+    """manifest.json naming the finished chromosomes; nothing per insertion."""
+    missing = [label for label in labels if finished_info(root, label) is None]
+    if missing:
+        raise ValueError(f'{len(missing)} chromosome(s) have not finished their insertion SNPs: '
+                         f'{missing[:6]}')
+    vcf.checkpoints.write_json(Path(root) / 'manifest.json',
+                               dict(protocol=PROTOCOL, layout=MANIFEST_LAYOUT, chromosomes=list(labels)))
+
+
+class _InsertionHeader:
+    """Header lines: the small-variant metadata, then one ##contig per insertion
+    in name order, streamed from the finished chromosomes' .contigs files."""
+
+    def __init__(self, metadata, contigs, replaced):
+        self.metadata, self.contigs, self.replaced = metadata, contigs, replaced
+
+    def __iter__(self):
+        for line in self.metadata:
+            if not (line.startswith('##contig=<') and
+                    vcf._parse_structured_meta(line, 'contig')['ID'] in self.replaced):
+                yield line
+        for name, length in _contig_rows(self.contigs):
+            yield f'##contig=<ID={name},length={length}>'
+
+
+def _contig_rows(paths):
+    def rows(path):
+        with open(path) as handle:
+            for raw in handle:
+                name, length = raw.rstrip('\n').split('\t')
+                yield name, length
+    return heapq.merge(*(rows(path) for path in paths))
+
+
+def _concat_finished(manifest, root, labels):
+    """Plan a store whose chromosomes all finished: their parts are streamed,
+    nothing is read per insertion."""
+    originals = set(manifest.get('loci', manifest['chroms']).values())
+    definitions = {}
+    for line in manifest['metadata']:
+        if line.startswith('##contig=<'):
+            data = vcf._parse_structured_meta(line, 'contig')
+            definitions[data['ID']] = data.get('length')
+    finished, contigs = [], []
+    for label in labels:
+        info = finished_info(root, label)
+        if info is None:
+            raise ValueError(f'{root}: chromosome {label} has not finished its insertion SNPs; '
+                             'run graphvcfmerge.py --sv --stage finish-insertions')
+        _info, part, contig_path = finished_paths(root, label)
+        order = None
+        if info['samples'] != list(manifest['samples']):
+            if sorted(info['samples']) != sorted(manifest['samples']):
+                raise ValueError(f'{part}: samples differ from the small-variant merge')
+            position = {sample: index for index, sample in enumerate(info['samples'])}
+            order = [position[sample] for sample in manifest['samples']]
+        finished.append((str(part), None, order))
+        contigs.append(contig_path)
+    # One pass checks names against the chromosomes and earlier definitions.
+    replaced, previous, loci = set(), None, 0
+    for name, length in _contig_rows(contigs):
+        if name == previous:
+            # The store holds one entry per name: the other chromosome's was overwritten.
+            raise ValueError(f'insertion name {name!r} is used by two chromosomes')
+        if name in originals:
+            raise ValueError(f'insertion contig already occurs in chromosome parts: {name!r}')
+        if name in definitions:
+            if definitions[name] != length:
+                raise ValueError(f'conflicting insertion length for {name!r}')
+            replaced.add(name)
+        previous, loci = name, loci + 1
+    return (_InsertionHeader(manifest['metadata'], contigs, replaced),
+            InsertionPlan([], finished, finished_loci=loci))
 # Insertion sources whose metadata concat_insertions holds at once.
 METADATA_BATCH_SOURCES = 4096
 
@@ -482,14 +589,17 @@ def append_insertions(handle, manifest, plan, root=None):
         if plan:
             print(f'[merge:snp] concat appended {total} sites from {len(plan)} insertion loci', file=sys.stderr)
         return total
-    streams = [_finished_rows(part, names) for part, names in finished]
+    streams = [_finished_rows(*item) for item in finished]
     streams.append(line for _count, text in _merge_planned_loci(manifest, plan, root)
                    for line in text.splitlines(keepends=True))
     total = 0
     for line in heapq.merge(*streams, key=_row_chrom):
         handle.write(line)
         total += 1
-    loci = len(plan) + sum(len(names) for _part, names in finished)
+    finished_loci = plan.finished_loci
+    if finished_loci is None:
+        finished_loci = sum(len(names) for _part, names, _order in finished)
+    loci = len(plan) + finished_loci
     print(f'[merge:snp] concat appended {total} sites from {loci} insertion loci '
           f'({loci - len(plan)} finished by chromosome jobs)', file=sys.stderr)
     return total
@@ -526,11 +636,16 @@ def _row_chrom(line):
     return line[:line.index('\t')]
 
 
-def _finished_rows(part, names):
+def _finished_rows(part, names, order=None):
+    """A finished part's rows: those of NAMES (None: all), sample columns in ORDER."""
     with open(part) as handle:
         for line in handle:
-            if _row_chrom(line) in names:
-                yield line
+            if names is not None and _row_chrom(line) not in names:
+                continue
+            if order is not None:
+                fields = line.rstrip('\n').split('\t')
+                line = '\t'.join(fields[:9] + [fields[9 + index] for index in order]) + '\n'
+            yield line
 
 
 def _usable_finished(root, samples, paths, embedded):
@@ -556,7 +671,7 @@ def _usable_finished(root, samples, paths, embedded):
         except (OSError, ValueError):
             continue
         part = index.with_suffix('.part')
-        if info.get('protocol') != FINISHED_PROTOCOL or not part.is_file():
+        if info.get('protocol') != LEGACY_FINISHED_PROTOCOL or not part.is_file():
             continue
         if info.get('samples') != list(samples):
             print(f'[merge:snp] {index.name}: sample order differs; merging its loci at concat',
@@ -569,7 +684,7 @@ def _usable_finished(root, samples, paths, embedded):
                 taken[key] = (name, str(length))
                 names.add(name)
         if names:
-            finished.append((str(part), names))
+            finished.append((str(part), names, None))
     return finished, taken
 
 
@@ -584,8 +699,8 @@ def backfill_index(root):
     path = root / 'manifest.json'
     if not path.is_file():
         return None
-    sources = json.loads(path.read_text())['sources']
-    if any(not isinstance(source, dict) for source in sources):
+    sources = json.loads(path.read_text()).get('sources')
+    if sources is None or any(not isinstance(source, dict) for source in sources):
         return None
     realign_root = root / 'realign'
     realign, legacy = {}, set()
@@ -600,8 +715,9 @@ def finish_chrom_insertions(root, part_paths, samples, label, index=None):
 
     The SV merge has just saved every insertion of this chromosome (its INS
     rows' owner paths), with nested realignments. Each is merged alone, as at
-    concat, into ROOT/finished/LABEL.part in insertion-name order; LABEL.json
-    records the loci, their source digests and the sample order used.
+    concat, into ROOT/finished/LABEL.part in insertion-name order, with one
+    "name<TAB>length" line per insertion in LABEL.contigs (the ##contig header
+    lines). LABEL.json, written last, records only the sample order and counts.
 
     INDEX (backfill_index) is for a backfill only: entries are then read at
     their indexed offsets through open, unlocked bundles, a batch at a time in
@@ -629,14 +745,18 @@ def finish_chrom_insertions(root, part_paths, samples, label, index=None):
         sources, realign_sources, legacy = index
         found = {key: sources[key] for key in owned if key in sources}
         realign_found = {key: realign_sources[key] for key in found if key in realign_sources}
-    directory = root / FINISHED_DIRECTORY
-    directory.mkdir(parents=True, exist_ok=True)
+    missing = sorted(owned[key] for key in owned.keys() - found.keys())
+    if missing:
+        raise ValueError(f'{label}: {len(missing)} insertion(s) have no saved SNP entry in {root}: '
+                         f'{missing[:6]}')
+    info_path, part_path, contigs_path = finished_paths(root, label)
+    info_path.unlink(missing_ok=True)
     samples = list(samples)
     allowed = set(samples)
-    loci, total = [], 0
+    loci = total = 0
     items = sorted((owned[key], key) for key in found)
     batch_size = 1 if index is None else DIRECT_READ_BATCH
-    with atomic_output(directory / (label + '.part')) as handle, \
+    with atomic_output(part_path) as handle, atomic_output(contigs_path) as contigs, \
             (insertion_store.DirectReader() if index is not None else nullcontext()) as reader:
         read_many = insertion_store.read_many if reader is None else reader.read_many
         for start in range(0, len(items), batch_size):
@@ -652,11 +772,12 @@ def finish_chrom_insertions(root, part_paths, samples, label, index=None):
                 realignment = realigned[key][0] if key in realigned else None
                 total += _emit_insertion_locus(handle, samples, key, name, [source], {id(source): entry},
                                                realignment, realign_root, legacy)
-                loci.append([key, name, str(entry[0]['lengths'][name]), source['digest']])
+                contigs.write(f"{name}\t{entry[0]['lengths'][name]}\n")
+                loci += 1
             del entries, realigned
-    vcf.checkpoints.write_json(directory / (label + '.json'),
-                               dict(protocol=FINISHED_PROTOCOL, samples=samples, loci=loci))
-    print(f'[merge:snp] {label}: finished {total} insertion SNP sites from {len(loci)} insertions',
+    vcf.checkpoints.write_json(info_path, dict(protocol=FINISHED_PROTOCOL, samples=samples,
+                                               insertions=loci, sites=total))
+    print(f'[merge:snp] {label}: finished {total} insertion SNP sites from {loci} insertions',
           file=sys.stderr, flush=True)
     return total
 

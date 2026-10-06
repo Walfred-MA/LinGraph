@@ -10,6 +10,13 @@ File operations stay per bundle, not per locus: inside ``batch()`` a thread's
 small puts are buffered and appended with one open and lock per bundle;
 ``read_many`` reads many entries through one open per bundle. A lookup first
 publishes the calling thread's buffer, so a thread always finds its own puts.
+
+Each bundle has an index, ``insertions-XX.idx``: one 16-byte record per
+committed entry (the first 8 bytes of its key, its offset), appended by the
+writer under the bundle lock. A lookup reads it sequentially instead of
+walking every entry header; the entry header still carries the full key and
+checksum, which every read verifies. Bundles of older runs have no index and
+are walked as before.
 """
 from __future__ import annotations
 
@@ -28,6 +35,8 @@ _FOOTER = struct.Struct('<Q8s')
 _MAGIC = b'ISNPv1\0\0'
 _COMMIT = b'ISNPdone'
 _INDEXES = OrderedDict()
+_IDX = struct.Struct('<QQ')        # key prefix, entry offset
+_TABLES = OrderedDict()            # per process: loaded .idx tables
 _INDEX_LOCK = threading.RLock()
 _LOCAL = threading.local()          # per thread: batch depth and buffered puts
 BATCH_RECORD_LIMIT = 1024 * 1024    # larger record blobs are appended at once
@@ -38,6 +47,7 @@ def _after_fork():
     global _INDEX_LOCK, _LOCAL
     _INDEX_LOCK = threading.RLock()
     _INDEXES.clear()
+    _TABLES.clear()
     # A child must not publish its parent's buffered puts a second time.
     _LOCAL = threading.local()
 
@@ -149,16 +159,19 @@ def flush():
         handle = _open_append(path)
         with handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
-            end = _append_end(handle)
+            start = end = _append_end(handle)
             handle.seek(end)
+            written = []
             for key, metadata, records, checksum in items:
                 handle.write(_HEADER.pack(_MAGIC, bytes.fromhex(key), len(metadata),
                                           len(records), checksum))
                 handle.write(metadata)
                 handle.write(records)
                 handle.write(_FOOTER.pack(end, _COMMIT))
+                written.append((bytes.fromhex(key), end))
                 end += _HEADER.size + len(metadata) + len(records) + _FOOTER.size
             handle.flush()
+            _index_append(path, handle.fileno(), start, written)
 
 
 def _open_append(path):
@@ -210,7 +223,67 @@ def put(root, key, data, records=b''):
             handle.write(blob)
         handle.write(_FOOTER.pack(end, _COMMIT))
         handle.flush()
+        _index_append(path, handle.fileno(), end, [(bytes.fromhex(key), end)])
         return _source(path, key, (end, checksum.hex()))
+
+
+def _index_path(path):
+    return Path(path).with_suffix('.idx')
+
+
+def _prefix(key):
+    return int.from_bytes(bytes.fromhex(key)[:8], 'little')
+
+
+def _entry_end(fd, offset):
+    magic, _key, meta_size, record_size, _digest = _HEADER.unpack(os.pread(fd, _HEADER.size, offset))
+    if magic != _MAGIC:
+        raise ValueError(f'insertion index points to no entry at offset {offset}')
+    return offset + _HEADER.size + meta_size + record_size + _FOOTER.size
+
+
+def _walk(fd, start, stop):
+    """(key, offset) of the committed entries from START, headers and footers only."""
+    found, end = [], start
+    while end < stop:
+        header = os.pread(fd, _HEADER.size, end)
+        if len(header) < _HEADER.size:
+            break
+        magic, key, meta_size, record_size, _digest = _HEADER.unpack(header)
+        if magic != _MAGIC:
+            raise ValueError(f'invalid insertion bundle header at offset {end}')
+        footer_at = end + _HEADER.size + meta_size + record_size
+        if footer_at + _FOOTER.size > stop:
+            break
+        offset, committed = _FOOTER.unpack(os.pread(fd, _FOOTER.size, footer_at))
+        if offset != end or committed != _COMMIT:
+            raise ValueError(f'invalid insertion bundle footer at offset {end}')
+        found.append((key, end))
+        end = footer_at + _FOOTER.size
+    return found, end
+
+
+def _index_append(path, fd, start, written):
+    """Index this append (bundle lock held). Entries committed before START
+    but never indexed (a writer killed in between) are indexed first."""
+    with open(_index_path(path), 'a+b') as out:
+        size = out.seek(0, os.SEEK_END)
+        whole = size - size % _IDX.size
+        if whole != size:
+            out.truncate(whole)              # a killed writer's partial record
+        covered = 0
+        if whole:
+            _prefix_value, last = _IDX.unpack(os.pread(out.fileno(), _IDX.size, whole - _IDX.size))
+            try:
+                covered = _entry_end(fd, last)
+            except (ValueError, struct.error):
+                covered = start + 1
+        if covered > start:                  # does not describe this bundle: rebuild
+            out.truncate(0)
+            covered = 0
+        missing = _walk(fd, covered, start)[0] if covered < start else []
+        out.write(b''.join(_IDX.pack(int.from_bytes(key[:8], 'little'), offset)
+                           for key, offset in missing + written))
 
 
 def find(root, key):
@@ -231,12 +304,62 @@ def find_many(root, keys):
             continue
         with handle:
             fcntl.flock(handle, fcntl.LOCK_SH)
-            with _INDEX_LOCK:
-                _, entries = _index(handle)
-                for key in wanted:
-                    if key in entries:
-                        result[key] = _source(path, key, entries[key])
+            for key, offset in _locate(path, handle, wanted).items():
+                result[key] = _source(path, key, offset)
     return result
+
+
+def _locate(path, handle, wanted):
+    """{key: (offset, digest)} of WANTED's latest generations in one bundle.
+
+    Through its .idx (digest None: read_entry verifies the key and checksum);
+    a bundle of an older run without one is walked."""
+    fd = handle.fileno()
+    size = os.fstat(fd).st_size
+    wanted = set(wanted)
+    table = _index_table(path) if _index_path(path).is_file() else None
+    if table is None:
+        with _INDEX_LOCK:
+            _, entries = _index(handle)
+        return {key: entries[key] for key in wanted if key in entries}
+    import numpy as np
+    by_prefix = {}
+    for key in wanted:
+        by_prefix.setdefault(_prefix(key), []).append(key)
+    found = {}
+    if len(table):
+        want = np.fromiter(by_prefix, dtype='<u8', count=len(by_prefix))
+        for row in np.flatnonzero(np.isin(table['key'], want)):     # file order: latest wins
+            for key in by_prefix[int(table['key'][row])]:
+                found[key] = (int(table['offset'][row]), None)
+        covered = _entry_end(fd, int(table['offset'][-1]))
+    else:
+        covered = 0
+    for key, offset in _walk(fd, covered, size)[0]:     # committed, not yet indexed
+        if key.hex() in wanted:
+            found[key.hex()] = (offset, None)
+    return found
+
+
+def _index_table(path):
+    """A process's copy of PATH's .idx, extended by the records appended since."""
+    import numpy as np
+    dtype = np.dtype([('key', '<u8'), ('offset', '<u8')])
+    index = _index_path(path)
+    count = os.stat(index).st_size // _IDX.size
+    with _INDEX_LOCK:
+        identity = (os.getpid(), str(index))
+        table = _TABLES.pop(identity, np.empty(0, dtype=dtype))
+        if count < len(table):
+            table = np.empty(0, dtype=dtype)     # rebuilt by a writer
+        if count > len(table):
+            tail = np.fromfile(index, dtype=dtype, count=count - len(table),
+                               offset=len(table) * _IDX.size)
+            table = np.concatenate([table, tail])
+        _TABLES[identity] = table
+        while len(_TABLES) > 64:
+            _TABLES.popitem(last=False)
+        return table
 
 
 def sources(root):
@@ -312,7 +435,7 @@ def _read_entry(handle, path, size, source, with_records):
         raise ValueError(f'truncated insertion bundle: {path}')
     magic, key, meta_size, record_size, digest = _HEADER.unpack(header)
     if (magic != _MAGIC or key.hex() != source['key']
-            or digest.hex() != source['digest']):
+            or source['digest'] is not None and digest.hex() != source['digest']):
         raise ValueError(f'changed insertion bundle entry: {path}:{start}')
     if start + _HEADER.size + meta_size + record_size + _FOOTER.size > size:
         raise ValueError(f'truncated insertion bundle entry: {path}:{start}')

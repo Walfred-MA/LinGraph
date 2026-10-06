@@ -1,4 +1,5 @@
 """Insertion SNPs finished by SV-merge chromosome jobs concat byte-identically."""
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -108,59 +109,159 @@ def finished_count(capsys):
     return int(marker[-1].split("(")[-1].split()[0]) if marker else 0
 
 
-def test_all_chromosomes_finished_is_byte_identical(cohort, capsys):
+LABELS = ["locus_chr1", "locus_chr2"]
+
+
+def manifest_of(insertions):
+    return json.loads((insertions / "manifest.json").read_text())
+
+
+def test_all_finished_streams_parts_byte_identically(cohort, capsys):
+    """Finished parts + a manifest naming only the chromosomes reproduce the
+    per-insertion concat exactly; nothing per insertion is kept."""
     tmp, root, insertions, parts, expected = cohort
     finish(insertions, parts, "chr1")
     finish(insertions, parts, "chr2")
     assert sorted(p.name for p in (insertions / "finished").iterdir()) == [
-        "locus_chr1.json", "locus_chr1.part", "locus_chr2.json", "locus_chr2.part"]
+        f"{label}{suffix}" for label in LABELS for suffix in (".contigs", ".json", ".part")]
+    info = json.loads((insertions / "finished" / "locus_chr1.json").read_text())
+    assert set(info) == {"protocol", "samples", "insertions", "sites"} and info["insertions"] == 2
+    compact.write_finished_manifest(insertions, LABELS)
+    assert manifest_of(insertions) == {"protocol": compact.PROTOCOL, "layout": compact.MANIFEST_LAYOUT,
+                                       "chromosomes": LABELS}
     capsys.readouterr()
     assert concat(root, insertions, tmp / "new.vcf") == expected
     assert finished_count(capsys) == 4
 
 
-def test_some_chromosomes_finished_is_byte_identical(cohort, capsys):
+def test_manifest_needs_every_chromosome_finished(cohort, capsys):
     tmp, root, insertions, parts, expected = cohort
     finish(insertions, parts, "chr2")
+    with pytest.raises(ValueError, match="not finished"):
+        compact.write_finished_manifest(insertions, LABELS)
+    # The per-insertion manifest still merges everything itself.
     capsys.readouterr()
-    assert concat(root, insertions, tmp / "mixed.vcf") == expected
-    assert finished_count(capsys) == 2
+    assert concat(root, insertions, tmp / "old.vcf") == expected
+    assert finished_count(capsys) == 0
 
 
-def test_resaved_insertion_falls_back_to_concat(cohort, capsys):
+def test_rerun_chromosome_replaces_its_part(cohort, capsys):
+    """A chromosome saved again drops its old part first; the new part holds
+    the new data."""
     tmp, root, insertions, parts, expected = cohort
     finish(insertions, parts, "chr1")
     finish(insertions, parts, "chr2")
-    # Re-save one insertion with a different carrier set after its chromosome finished.
+    compact.discard_finished(insertions, "locus_chr1")
+    assert compact.finished_info(insertions, "locus_chr1") is None
+    assert not any(p.name.startswith("locus_chr1") for p in (insertions / "finished").iterdir())
+    with pytest.raises(ValueError, match="not finished"):
+        compact.write_finished_manifest(insertions, LABELS)
     compact.save_insertion(insertions, "INS_chr1_40", [TEMPLATE, "ACGTACGTACGTACGTACCT"],
                            ["", body("ACGTACGTACGTACGTACCT")],
                            [(0, "rep:ctg", "allele", ".", 1, 21, "+"), (0, "b:ctg", "allele", ".", 5, 25, "+")],
                            0, SAMPLES, owner="chr1")
     store.flush()
-    compact.finalize_insertions(insertions, insertion_ids=[name for name, _c, _s in INSERTIONS])
     fresh_dir = tmp / "fresh"
     shutil.copytree(insertions, fresh_dir)
     shutil.rmtree(fresh_dir / "finished")
+    compact.finalize_insertions(fresh_dir, insertion_ids=[name for name, _c, _s in INSERTIONS])
     fresh = concat(root, fresh_dir, tmp / "fresh.vcf")
-    assert fresh != expected  # The re-saved insertion really changed.
+    assert fresh != expected  # the re-saved insertion really changed
+    finish(insertions, parts, "chr1")
+    compact.write_finished_manifest(insertions, LABELS)
     capsys.readouterr()
-    assert concat(root, insertions, tmp / "resaved.vcf") == fresh
-    assert finished_count(capsys) == 3
+    assert concat(root, insertions, tmp / "rerun.vcf") == fresh
+    assert finished_count(capsys) == 4
 
 
-def test_different_sample_order_falls_back_to_concat(cohort, capsys):
+def test_part_in_another_sample_order_is_reordered(cohort, capsys):
     tmp, root, insertions, parts, expected = cohort
     finish(insertions, parts, "chr1", samples=["a", "b", "c"])
     finish(insertions, parts, "chr2")
+    compact.write_finished_manifest(insertions, LABELS)
     capsys.readouterr()
     assert concat(root, insertions, tmp / "order.vcf") == expected
-    assert finished_count(capsys) == 2
+    assert finished_count(capsys) == 4
+
+
+def test_name_used_by_two_chromosomes_fails_concat(cohort):
+    """One store entry per name: a name in two chromosomes lost one of them."""
+    tmp, root, insertions, parts, _expected = cohort
+    with open(parts["chr2"], "a") as handle:
+        handle.write("chr2\t99\tINS_chr1_10\tN\t<INS>\t.\tPASS\tSVTYPE=INS;SVLEN=20;END=99\tGT\t1\n")
+    finish(insertions, parts, "chr1")
+    finish(insertions, parts, "chr2")
+    compact.write_finished_manifest(insertions, LABELS)
+    with pytest.raises(ValueError, match="used by two chromosomes"):
+        concat(root, insertions, tmp / "twice.vcf")
+
+
+def test_unsaved_insertion_fails_its_chromosome(cohort):
+    _tmp, _root, insertions, parts, _expected = cohort
+    with open(parts["chr1"], "a") as handle:
+        handle.write("chr1\t99\tINS_never_saved\tN\t<INS>\t.\tPASS\tSVTYPE=INS;SVLEN=20;END=99\tGT\t1\n")
+    with pytest.raises(ValueError, match="no saved SNP entry"):
+        finish(insertions, parts, "chr1")
+
+
+def bundle_entries(path):
+    """Every committed (key, offset), all generations, by walking the bundle."""
+    with open(path, "rb") as handle:
+        return store._walk(handle.fileno(), 0, path.stat().st_size)[0]
+
+
+def index_records(path):
+    data = store._index_path(path).read_bytes()
+    return [store._IDX.unpack_from(data, offset) for offset in range(0, len(data) - len(data) % 16, 16)]
+
+
+def test_store_index_is_16_bytes_per_entry(cohort):
+    _tmp, _root, insertions, _parts, _expected = cohort
+    bundles = sorted(insertions.glob("insertions-*.bundle"))
+    assert bundles
+    for bundle in bundles:
+        entries = bundle_entries(bundle)
+        assert store._index_path(bundle).stat().st_size == 16 * len(entries)
+        assert index_records(bundle) == [(int.from_bytes(key[:8], "little"), offset)
+                                         for key, offset in entries]
+    # Lookups through the index find the same latest generations as a walk.
+    keys = [compact.chrom_key(name) for name, _c, _s in INSERTIONS]
+    indexed = store.find_many(insertions, keys)
+    for path in insertions.glob("insertions-*.idx"):
+        path.unlink()
+    store._TABLES.clear()
+    walked = store.find_many(insertions, keys)
+    assert {k: v["offset"] for k, v in indexed.items()} == {k: v["offset"] for k, v in walked.items()}
+    assert len(indexed) == len(INSERTIONS)
+
+
+def test_store_index_recovers_a_killed_writer(cohort):
+    """Entries committed without index records (a writer killed in between)
+    are still found, and the next append to that bundle indexes them."""
+    _tmp, _root, insertions, _parts, _expected = cohort
+    keys = [compact.chrom_key(name) for name, _c, _s in INSERTIONS]
+    before = {k: v["offset"] for k, v in store.find_many(insertions, keys).items()}
+    bundle = store._path(insertions, keys[0])
+    index = store._index_path(bundle)
+    data = index.read_bytes()
+    index.write_bytes(data[:-16] + b"partial")      # last record lost, a torn one left
+    store._TABLES.clear()
+    assert {k: v["offset"] for k, v in store.find_many(insertions, keys).items()} == before
+    # Append to the same bundle: the index is repaired, then extended.
+    new_key = bytes([int(keys[0][:2], 16)]) .hex() + "ab" * 31
+    assert store._path(insertions, new_key) == bundle
+    store.put(insertions, new_key, {"x": 1})
+    entries = bundle_entries(bundle)
+    assert index_records(bundle) == [(int.from_bytes(key[:8], "little"), offset) for key, offset in entries]
+    store._TABLES.clear()
+    assert store.find_many(insertions, [new_key])[new_key]["offset"] == entries[-1][1]
+    assert {k: v["offset"] for k, v in store.find_many(insertions, keys).items()} == before
 
 
 def ins_row(chrom, pos, sequence, sample):
     span = len(sequence)
     field = f"1:INS:{span}:>{span}I:{sample}:2-{2 + span}+:0:.:allele:0H0H"
-    return (f"{chrom}\t{pos}\told_indel\tN\t<INS>\t.\tPASS\tSVTYPE=INS;SVLEN={span};MAXSIZE={span};"
+    return (f"{chrom}\t{pos}\tINS_{chrom}_{pos}_1\tN\t<INS>\t.\tPASS\tSVTYPE=INS;SVLEN={span};MAXSIZE={span};"
             f"END={pos};SEQ={sequence};NSUP=1\t{vcf.SV_FORMAT}\t{field}\n")
 
 
@@ -182,26 +283,39 @@ def test_backfill_stage_finishes_old_run_byte_identically(tmp_path, capsys):
              for s in SAMPLES]
     cohort.run(tmp_path / "cohort", "all", paths=paths, processes=2, var_in_insert=0, keep_merge_tmpdir=True)
     root, = (tmp_path / "cohort" / "tmp" / "merge_only").iterdir()
-    finished = root / "insertion_snps" / "finished"
+    insertion_root = root / "insertion_snps"
+    finished = insertion_root / "finished"
     expected = (root / "snp.vcf").read_bytes()
-    assert sorted(p.suffix for p in finished.iterdir()) == [".json", ".json", ".part", ".part"]
+    # A current run: chromosome jobs finished, the manifest names only them.
+    assert manifest_of(insertion_root)["layout"] == compact.MANIFEST_LAYOUT
+    assert "sources" not in manifest_of(insertion_root)
+    assert sorted(p.suffix for p in finished.iterdir()) == [".contigs"] * 2 + [".json"] * 2 + [".part"] * 2
     assert expected.count(b"\nINS") or b"SNP_" in expected
 
-    # An old run: chromosome jobs did not finish their insertions.
+    # An old run: no finished parts, one manifest listing every insertion.
     shutil.rmtree(finished)
+    compact.finalize_insertions(insertion_root, [p for p in (root / "sv.vcf", root / "sv.vcf.small.vcf")
+                                                  if p.is_file()])
+    assert "sources" in manifest_of(insertion_root)
+    assert snp.concat(root / "snp_shards", tmp_path / "old.vcf") is None
+    assert (tmp_path / "old.vcf").read_bytes() == expected
     # One chromosome alone (a SLURM job each), then the rest.
     first = (root / "sv_shards" / "chroms.txt").read_text().split()[0]
     vcf.main(["--sv", "--stage", "finish-insertions", "--shards-dir", str(root / "sv_shards"),
               "--insertion-snps", str(root / "insertion_snps"), "--chrom", first])
     assert [p.name for p in finished.glob("*.json")] == [vcf._safe_locus_key(first) + ".json"]
+    assert "sources" in manifest_of(insertion_root)     # not every chromosome finished yet
     capsys.readouterr()
     assert vcf.main(["--sv", "--stage", "finish-insertions", "--shards-dir", str(root / "sv_shards"),
                      "--insertion-snps", str(root / "insertion_snps"), "--chrom", "no_such_chrom"]) not in (0, None)
     assert "no_such_chrom" in capsys.readouterr().err
     assert vcf.main(["--sv", "--stage", "finish-insertions", "--shards-dir", str(root / "sv_shards"),
                      "--insertion-snps", str(root / "insertion_snps"), "--processes", "2"]) in (0, None)
-    assert sorted(p.suffix for p in finished.iterdir()) == [".json", ".json", ".part", ".part"]
-    assert "reading entries at indexed offsets from manifest.json" in capsys.readouterr().err
+    assert sorted(p.suffix for p in finished.iterdir()) == [".contigs"] * 2 + [".json"] * 2 + [".part"] * 2
+    log = capsys.readouterr().err
+    assert "reading entries at indexed offsets from manifest.json" in log
+    assert "manifest.json now lists the 2 finished chromosome(s)" in log
+    assert manifest_of(insertion_root)["layout"] == compact.MANIFEST_LAYOUT
     snp.concat(root / "snp_shards", tmp_path / "backfilled.vcf")
     assert (tmp_path / "backfilled.vcf").read_bytes() == expected
     line = [l for l in capsys.readouterr().err.splitlines() if "finished by chromosome jobs" in l][-1]
@@ -227,10 +341,10 @@ def test_indexed_direct_read_matches_locked_lookup(cohort, monkeypatch, batch):
     finished = insertions / "finished"
     for chrom in ("chr1", "chr2"):
         finish(insertions, parts, chrom)
-        locked = [(finished / f"locus_{chrom}{suffix}").read_bytes() for suffix in (".part", ".json")]
+        locked = [(finished / f"locus_{chrom}{suffix}").read_bytes() for suffix in (".part", ".contigs", ".json")]
         with monkeypatch.context() as patch:  # no bundle lock on the indexed path
             patch.setattr(store.fcntl, "flock", lambda *_a: pytest.fail("bundle locked"))
             compact.finish_chrom_insertions(insertions, [parts[chrom], None], SAMPLES, f"locus_{chrom}",
                                             index=index)
-        direct = [(finished / f"locus_{chrom}{suffix}").read_bytes() for suffix in (".part", ".json")]
+        direct = [(finished / f"locus_{chrom}{suffix}").read_bytes() for suffix in (".part", ".contigs", ".json")]
         assert direct == locked and locked[0]
