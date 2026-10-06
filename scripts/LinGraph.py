@@ -118,6 +118,10 @@ Examples:
             q.add_argument("--reference-caches", metavar="DIR",
                            help="use supplied reference alignment and blocks without cache validation; default: GRAPH/references/NAME_rig")
             q.add_argument("--merge", action="store_true", help="also write cohort SNP/indel/SV VCFs when calling multiple samples (off by default)")
+            q.add_argument("--reuse-alignments", metavar="DIR",
+                           help="reuse each sample's graph alignment (hotspots, align.txt, segment summary, blocks) "
+                                "from an earlier singular output DIR made with the same graph, e.g. to call the same "
+                                "assemblies against another reference; no content validation")
             q.add_argument("--reference-only", action="store_true",
                            help="build or resume the reference cache for -r FASTA (in --reference-caches DIR, default GRAPH/references/NAME_rig), then stop; no samples are called")
         q.add_argument("-r", "--reference", help="reference NAME or FASTA; default: first saved cohort assembly")
@@ -485,6 +489,14 @@ class Runner:
         signature["inputs"] = stamps(inputs)
         write_text(marker, json.dumps(dict(signature, outputs=stamps(outputs)), indent=2) + "\n")
 
+    def adopt(self, name, command, inputs=(), outputs=(), graph_inputs=()):
+        """Record outputs placed from another run as this stage's completed result."""
+        command = list(map(str, command))
+        signature = {"command": command, "inputs": stamps((*inputs, *graph_inputs))}
+        signature["scripts"] = stamps(Path(c) for c in command if c.endswith(".py") and Path(c).is_file())
+        write_text(self.work / "checkpoints" / f"{name}.json",
+                   json.dumps(dict(signature, outputs=stamps(outputs)), indent=2) + "\n", self.args.dry_run)
+
     def script(self, name, script, arguments, **kwargs):
         return self.run(name, [sys.executable, ROOT / script, *arguments], **kwargs)
 
@@ -785,6 +797,52 @@ def singular_reference(args, runner, graph, ref, graphroot, listing, index,
         return align, blocks
 
 
+# Per-sample stages whose results depend only on the assembly and the graph,
+# not on the calling reference.
+REFERENCE_FREE_STAGES = ("hotspot_search", "query_align", "query_summary", "query_blocks")
+
+
+def reuse_stage_outputs(source, output, label, stage, runner, graph_inputs, dry_run):
+    """Link one reference-free stage's outputs from an earlier run into OUTPUT.
+
+    The earlier run's protocol marker (alignment mode, hotspot settings) must
+    equal this run's. Returns True when this stage's outputs are the earlier
+    run's files (linked now or by a previous reuse); the caller stops reusing
+    later stages of the sample once one stage is computed here instead.
+    """
+    targets = [Path(path) for path in stage.outputs]
+    try:
+        sources = [source / target.relative_to(output) for target in targets]
+    except ValueError:
+        return False
+    if not all(path.is_file() for path in sources):
+        say(f"{label}: not found in {source}; computing it")
+        return False
+    if any(target.exists() for target in targets):
+        # Already present: still the earlier run's files only if hard-linked.
+        return all(target.exists() and os.path.samefile(path, target)
+                   for path, target in zip(sources, targets))
+    if stage.readiness_marker is not None:
+        marker = source / Path(stage.readiness_marker).relative_to(output)
+        expected = stage.readiness_protocol or "complete\n"
+        if not marker.is_file() or marker.read_text() != expected:
+            say(f"{label}: {marker} does not match this run's settings; computing it")
+            return False
+    if dry_run:
+        say(f"Would link {label} outputs from {source}")
+        return True
+    for path, target in zip(sources, targets):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(path, target)
+        except OSError:
+            shutil.copy2(path, target)
+    runner.adopt(label, stage.command, inputs=stage.inputs, outputs=stage.outputs,
+                 graph_inputs=graph_inputs)
+    say(f"Linked {label} outputs from {source}")
+    return True
+
+
 def singular_mode(args, runner, graph, output, samples, ref, cohort):
     refname, reffa = ref
     package = graph if (graph / "local_graphs.tsv").is_file() else graph / "summary"
@@ -875,10 +933,16 @@ def singular_mode(args, runner, graph, output, samples, ref, cohort):
         queryhotspot, hotspots = sample_pipeline.build_hotspot_stages(options, prepared)
         options.hotspot_query = str(queryhotspot)
         paths, stages = sample_pipeline.build_stages(options, ROOT)
+        # Reuse runs as a chain: after one reference-free stage is computed
+        # here, its successors must be computed from it, not linked.
+        reusing = bool(args.reuse_alignments)
         for stage in [*hotspots, *stages]:
             if stage.output_text is not None:
                 write_text(stage.outputs[0], stage.output_text, args.dry_run)
             else:
+                if reusing and stage.name in REFERENCE_FREE_STAGES:
+                    reusing = reuse_stage_outputs(absolute(args.reuse_alignments), output, name + "-" + stage.name,
+                                                  stage, runner, graph_dependencies, args.dry_run)
                 runner.run(name + "-" + stage.name, stage.command,
                            inputs=stage.inputs, outputs=stage.outputs,
                            graph_inputs=graph_dependencies, legacy_graph_inputs=legacy_graph_dependencies)
@@ -1125,6 +1189,8 @@ def main(argv=None):
             return 0
     if args.gfa_only and args.slurm:
         return submit(args, argv)
+    if args.mode == "singular" and args.reuse_alignments and not absolute(args.reuse_alignments).is_dir():
+        p.error(f"--reuse-alignments folder not found: {args.reuse_alignments}")
     if args.mode == "singular" and args.reference_only:
         if args.input or args.input_list:
             p.error("--reference-only builds a reference cache; omit -i/-I")
