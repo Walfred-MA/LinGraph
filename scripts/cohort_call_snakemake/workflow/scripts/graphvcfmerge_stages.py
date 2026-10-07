@@ -254,6 +254,8 @@ def completion_context(command):
             following = command[index + 1] if index + 1 < len(command) else ""
             context["minsvsize"] = int(following) if re.fullmatch(r"[+-]?\d+", following) else 20
     context["emit_small"] = "--output-small" in command
+    if "--no-realignment" in command:
+        context["realignment"] = False
     _remaining, insertion_snps = take_option(command, "--insertion-snps")
     if insertion_snps:
         context["insertion_snps"] = insertion_snps

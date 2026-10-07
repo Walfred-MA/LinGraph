@@ -102,7 +102,7 @@ coordinates, so use the matching CHM13 reference.
 **Automatic blocks** are also available for cohort graph construction. Omit
 `-b` and `--bed-grouped` and LinGraph chooses windows from the construction
 inputs. Singular mode does not choose windows; it uses the ones in its graph
-cache. Add `--mc-graph` to a cohort run when you also want the pangenome GFA
+cache. Add `--make-graph` to a cohort run when you also want the pangenome GFA
 file `cohort.gfa`.
 
 ### Prepare assembly FASTAs
@@ -382,9 +382,8 @@ python3 LinGraph/scripts/LinGraph.py singular \
   -O sample_calls_hg19 -t 64 > logs/calls_hg19.log 2>&1
 ```
 
-VCF records use the prepared names, e.g. `HG19#1#chr1`. To restore plain names
-in a standard VCF, rename them, for example with `bcftools annotate
---rename-chrs`.
+VCF records use the prepared names, e.g. `HG19#1#chr1`. To restore plain
+names, see [Reference contig names](#reference-contig-names).
 
 ### Reuse reference alignments
 
@@ -469,7 +468,7 @@ graph cache and need individual VCFs. It supports thousands of haplotypes.
 
 The `graph` command builds/resumes local graphs and runs cohort variant calling
 as part of that workflow. Use `--exact` for the merged cohort output; it is the
-default and uses the indexed assemblies to realign merged SVs. Add `--mc-graph`
+default and uses the indexed assemblies to realign merged SVs. Add `--make-graph`
 to export the resulting pangenome GFA in the same run.
 
 Create `cohort.list` with the reference and prepared haplotypes:
@@ -524,7 +523,7 @@ for variant calling and graph output:
    python3 scripts/LinGraph.py graph \
      -I cohort.list -G cohort_graph -O cohort_calls_HG002_h2 \
      -b windowprofs/geneblocks.bed --bed-grouped \
-     -r HG002_h2 --exact --mc-graph -t 16
+     -r HG002_h2 --exact --make-graph -t 16
    ```
 
 4. **Create results with a different backbone later.** After the first run has
@@ -534,7 +533,7 @@ for variant calling and graph output:
    ```bash
    python3 scripts/LinGraph.py graph \
      -G cohort_graph -O cohort_calls_HG003_h1 \
-     -r HG003_h1 --exact --mc-graph -t 16
+     -r HG003_h1 --exact --make-graph -t 16
    ```
 
    LinGraph reuses the saved local graph alignments and reruns the
@@ -640,6 +639,47 @@ an insertion allele ID as `CHROM`; their default `POS` is the insertion offset
 plus one. Graph CIGARs can reference other alleles or named FASTA sequences.
 These details are resolved by LinGraph's converters.
 
+### Reference contig names
+
+LinGraph names reference contigs so that chromosomes of different references
+never share a name: `chr1` of GRCh38, CHM13, and HG19 are different sequences,
+and one graph or cohort can use several references. CHM13 keeps its NCBI RefSeq
+accessions (`NC_060925.1` ... `NC_060948.1`), GRCh38 keeps `chr1` ... `chrY`,
+and every other reference or assembly gets the `NAME#N#` prefix
+(`HG19#1#chr1`, `HG002#1#chr1`). VCF records, `##contig` lines, and coverage
+headers use these names.
+
+If you prefer the original chromosome names, rename the finished VCFs with
+`tools/vcf_chromfix.py`. It also renames the reference fields of LinGraph's
+headers and leaves nested rows pointing at their parents:
+
+```bash
+# CHM13: NC_060925.1 ... NC_060948.1 -> chr1 ... chr22, chrX, chrY
+python3 tools/vcf_chromfix.py -i cohort.sv.vcf -o cohort.sv.chr.vcf --CHM13fix
+# Other references: HG19#1#chr1 -> chr1
+python3 tools/vcf_chromfix.py -i cohort.sv.vcf -o cohort.sv.chr.vcf --noprefix
+```
+
+Rename the indel and SNP files the same way. Keep the original files as input
+to LinGraph's merge, GFA export, and converters: they match the prepared FASTA
+names. See the
+[renaming guide](tools/README.md#rename-reference-chromosomes-in-a-vcf) for
+`--fixtable` and other options.
+
+### Known incompatibility: records at POS 0
+
+Some records have `POS=0`: an insertion before the first base of its sequence,
+mostly a nested variant at the very start of its parent allele (`CHROM` = the
+parent row ID). grVCF uses the interval convention above, where a boundary can
+be zero, but standard VCF positions start at 1 (`POS=0` is reserved for
+telomeric breakends), so some standard tools do not handle these records. With
+bcftools/htslib 1.22, for example, `bcftools view` and `bcftools sort` accept
+them, but `tabix` warns `Coordinate <= 0`, region queries (`-r`) skip them, and
+`bcftools norm` reports a REF mismatch because there is no base 0. LinGraph's
+own tools read them as intended. `tools/grvcf_to_vcf.py` removes them, together
+with all nested rows, when it exports a standard VCF (see
+`position_zero_removed` below).
+
 ### Convert to standard VCF
 
 `tools/grvcf_to_vcf.py` exports a plain VCF in one streaming pass, without
@@ -698,13 +738,13 @@ merged cohort VCFs as the calling run. Keep its original assembly FASTAs,
 indexes, and saved template files available: graph export needs their sequences.
 
 To build with gene blocks, call the cohort, and export the GFA in one run, add
-`--mc-graph`:
+`--make-graph`:
 
 ```bash
 python3 scripts/LinGraph.py graph \
   -I cohort.list -G cohort_graph -O cohort_calls \
   -b windowprofs/geneblocks.bed --bed-grouped \
-  -r CHM13_h1 --alternative data/alternatives.fa --exact --mc-graph -t 16
+  -r CHM13_h1 --alternative data/alternatives.fa --exact --make-graph -t 16
 ```
 
 The default export is **rGFA**, a GFA graph with stable sequence coordinates.

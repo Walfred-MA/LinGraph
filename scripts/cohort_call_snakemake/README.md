@@ -257,7 +257,7 @@ exporter uses these placements for graph links without relabeling novel bases
 as reference bases. HG38_h1 contributes only chr1–22/X/Y; chrM and non-primary
 scaffolds are excluded from backbone and alternative use.
 
-`LinGraph.py --MC-graph` uses the selected haplotype FASTA when `-r` is supplied.
+`LinGraph.py --make-graph` uses the selected haplotype FASTA when `-r` is supplied.
 Otherwise its GFA reference defaults to
 `GRAPH/inputs/reference_alternatives_novels.fa`. The local summary catalog is
 lookup-only and is never exported wholesale. See `../merged_vcf_to_gfa.md` for

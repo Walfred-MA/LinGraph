@@ -25,7 +25,7 @@ can live in another input file, regardless of input order.
 
 Use `--insertion-only [SIZE]` to retain the previous insertion-only behavior.
 A bare `--insertion-only` uses 50 bp; `--insertion-only 20` uses 20 bp. This flag
-is also available in `LinGraph.py ... --MC-graph`. The older `--size-cutoff`
+is also available in `LinGraph.py ... --make-graph`. The older `--size-cutoff`
 option remains available as a general minimum variant size. Use
 `--insertion-only` with the legacy `--gfa-mode query` for mixed variant inputs.
 
@@ -211,7 +211,7 @@ parent orientation. `OUTPUT.anchors.bed.local-paths.tsv` audits local name to
 included-root interval/strand translations. Local flanks may extend past a
 trimmed catalog record into its full included root.
 
-`LinGraph.py --MC-graph` passes the selected/default backbone, lifted template
+`LinGraph.py --make-graph` passes the selected/default backbone, lifted template
 catalog, query assembly list, and `--processes` in graph and singular modes.
 With `-G graph/summary`, the default catalog is located in the parent graph
 directory. Template selection/lift checkpoints record backbone identity; the

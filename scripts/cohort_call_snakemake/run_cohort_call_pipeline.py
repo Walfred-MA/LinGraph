@@ -311,8 +311,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     mode_group = cohort_merge.add_modes(parser)
-    parser.add_argument('--mc-graph', '--MC-graph', dest='mc_graph', action='store_true',
+    parser.add_argument('--make-graph', dest='mc_graph', action='store_true',
                         help='enable subsequent GFA export (merge mode defaults to --all)')
+    # Former names, still accepted.
+    parser.add_argument('--mc-graph', '--MC-graph', dest='mc_graph', action='store_true',
+                        help=argparse.SUPPRESS)
     stages = parser.add_mutually_exclusive_group()
     stages.add_argument('--merge-only', action='store_true', help='merge existing sample VCFs without upstream calling')
     stages.add_argument('--recall-only', action='store_true', help='recall VCFs and merge from existing saved inputs; do not schedule upstream jobs')
@@ -524,6 +527,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if args.sv_only_size is not None:
         args.merge_mode = 'svonly'
     args.exact = cohort_merge.resolve_exact(args)
+    try:
+        args.merge_realignment = cohort_merge.resolve_realignment(args)
+    except ValueError as error:
+        parser.error(str(error))
     args.merge_mode = cohort_merge.resolve_mode(args)
     if args.minsvsize < 1:
         parser.error("--minsvsize must be positive")
@@ -854,6 +861,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Realign against the assemblies; "auto" uses inputs/query_paths.normalized.txt.
         "exact": (None if args.exact is None else
                   "auto" if args.exact == "auto" else absolute(args.exact)),
+        # --no-merge-realignment only: default runs keep their merge folder.
+        # Not "realignment", the graph-CIGAR/VCF setting of the run config.
+        **({} if args.merge_realignment else {"merge_realignment": False}),
     }
     merge_signature = hashlib.sha256(json.dumps([merge_settings, args.merge_mode == "all", "worker-snp-v3"], sort_keys=True).encode()).hexdigest()[:16]
     merge_tmpdir = Path(absolute(
@@ -963,6 +973,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "var_in_insert": args.var_in_insert,
         "emit_small": args.merge_mode in ('all', 'svindel'),
         "kmermatch": str(kmermatch),
+        **({} if args.merge_realignment else {"realignment": False}),
     }
     if args.merge_mode == "all":
         merge_settings["insertion_snps"] = str(merge_tmpdir / "insertion_snps")

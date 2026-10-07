@@ -27,7 +27,7 @@ python3 scripts/LinGraph.py prepare --help
 | Singular VCF selection | `--all`, `--svonly`, `--svindel`, `--snp`, `--svcutoff` |
 | Cohort merge | `--exact` (default for cohort graph runs) |
 | Partial runs | `--recall-only`, `--merge-only`, `--gfa-only`, `--vcf-list` |
-| GFA export | `--mc-graph`, `--insertion-only [SIZE]`, `--gfa-mode`, `--max-node-length`, anchor and size filters |
+| GFA export | `--make-graph`, `--insertion-only [SIZE]`, `--gfa-mode`, `--max-node-length`, anchor and size filters |
 | Workflow inspection | `--dry-run`, `--dag-dry-run`, `--snakemake-args`, standalone `--unlock` |
 | SLURM | `--slurm`, `--slurm-jobs`, `--slurm-args`, account, partition, time, and memory options |
 | Calling and merging | `--samples`, worker counts, per-stage memory, realignment, provenance tags, template fallback, nested insertion and merge thresholds |
@@ -64,9 +64,9 @@ When construction runs, changes between static and dynamic blocks invalidate
 the affected partition results, while repeated runs with the same policy
 reuse completed partitions.
 
-In graph mode, `--mc-graph` controls export of `cohort.gfa`. Without it, normal calling and
+In graph mode, `--make-graph` controls export of `cohort.gfa`. Without it, normal calling and
 merging produce VCFs. The local graphs needed for calling remain under `-G`.
-`--gfa-only` explicitly exports existing merged VCFs and implies `--mc-graph`.
+`--gfa-only` explicitly exports existing merged VCFs and implies `--make-graph`.
 After `cohort.gfa`, `gfa_gaf_index.py` writes `gaf/index/` once (only the segment
 lengths, P walks and names, links and resolved variant index the walks read) and
 `gaf/shards/` once: the merged VCFs are cut into chunks near chromosome changes (at
@@ -161,14 +161,14 @@ Optional construction settings:
 ```bash
 python3 scripts/LinGraph.py graph -I prepared_assemblies/query_paths.prepared.txt \
   -G cohort_graph -O cohort_calls -r CHM13_h1 \
-  -b grouped_blocks.bed --bed-grouped --find-novel-loci --MC-graph
+  -b grouped_blocks.bed --bed-grouped --find-novel-loci --make-graph
 ```
 
 `-L partitions.list` restricts calling to those partitions. Omit it to call
 all active graph partitions. Construction still completes the graph workflow.
 Use `--exact` for the cohort merge (the default). It writes
 `cohort.sv.vcf`, `cohort.indel.vcf`, and `cohort.snp.vcf`, and realigns merged
-SVs against the indexed assemblies. Add `--mc-graph` to also export
+SVs against the indexed assemblies. Add `--make-graph` to also export
 `cohort.gfa`; it does not change the merge mode. The alternative merge modes
 (`--all`, `--svonly`, `--svindel`, and `--snp`) are available for specialized
 cohort output, but are generally used to select contents for singular VCF
@@ -186,7 +186,7 @@ backbone with `-r` and use a separate output directory for each version:
 
 ```bash
 python3 scripts/LinGraph.py graph -G cohort_graph \
-  -O calls_HG002_h2 -r HG002_h2 --exact --mc-graph -t 16
+  -O calls_HG002_h2 -r HG002_h2 --exact --make-graph -t 16
 ```
 
 This reuses local graph alignments under `cohort_graph/Graphs/`. It regenerates
@@ -233,7 +233,7 @@ Repeating the command resumes completed samples using checkpoints under
 configs are not modified, and `--merge-only` and `--recall-only` are mutually
 exclusive. Run only one workflow against an output directory at a time.
 
-Add `--mc-graph` to a merge-only or recall-only run to export its merged result.
+Add `--make-graph` to a merge-only or recall-only run to export its merged result.
 To export an existing merged VCF by itself:
 
 ```bash
@@ -343,7 +343,7 @@ the result is `OUTPUT/samples/NAME/NAME.vcf`. With multiple samples, add `--merg
 to also merge the independent calls. Explicit variant-selection options
 (`--all`, `--svonly`, `--svindel`, or `--snp`) also enable merging with multiple
 inputs. Without those options, only separate calls are produced. Singular mode does not
-export GFA, regardless of the number of samples; `--mc-graph`/`--MC-graph`,
+export GFA, regardless of the number of samples; `--make-graph`,
 `--gfa-only`, and GFA export settings are available only in graph mode.
 Explicit `--merge-only` runs still merge existing VCFs.
 The coverage report audits the selected reference assembly's FAI contigs.
@@ -383,7 +383,7 @@ the supplied reference when the package's omitted reference rows are ambiguous.
 Omit `-L` to process all partitions; a supplied list may contain partition
 names or paths, one per row.
 
-For default-reference `--MC-graph`, retain the original graph's
+For default-reference `--make-graph`, retain the original graph's
 `inputs/reference_alternatives_novels.fa`. Passing `-G graph/summary` finds it
 in `graph/`. An explicit `-r` uses the selected assembly instead. Supply original
 source assemblies for template lifting; templates with unavailable sources are
@@ -413,9 +413,9 @@ OUTPUT/
   cohort.snp.vcf                             # --exact (default), --all, or --snp
   cohort.indel.vcf                           # --exact (default), --all, or --svindel
   cohort.sv.vcf                              # --exact (default), --all, --svonly, or --svindel
-  cohort.gfa                                  # --MC-graph
-  gaf/batch_NNN/SAMPLE.gaf                    # --MC-graph, 16 sample VCFs per batch
-  gaf/added_links.gfa                         # --MC-graph; final graph = cohort.gfa + these links
+  cohort.gfa                                  # --make-graph
+  gaf/batch_NNN/SAMPLE.gaf                    # --make-graph, 16 sample VCFs per batch
+  gaf/added_links.gfa                         # --make-graph; final graph = cohort.gfa + these links
   lingraph/run.json
   lingraph/logs/
   lingraph/checkpoints/

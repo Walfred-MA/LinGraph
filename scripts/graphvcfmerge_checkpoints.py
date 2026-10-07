@@ -24,6 +24,9 @@ def settings(context):
         # A rebuilt or replaced KmerMatch scores differently: its merged
         # chromosomes are not reused.
         value["kmermatch"] = kmermatch_stamp(context["kmermatch"])
+    if context.get("realignment") is False:
+        # --no-realignment (absent by default, so older markers stay valid).
+        value["realignment"] = False
     return value
 
 

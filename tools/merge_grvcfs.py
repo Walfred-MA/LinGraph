@@ -38,8 +38,10 @@ import json
 from pathlib import Path
 import re
 import shlex
+import os
 import subprocess
 import sys
+import time
 
 # Pipeline scripts: ROOT/scripts (repository layout) or ROOT (flat copy).
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +83,9 @@ def parse_args(argv=None):
                         help='realign against the assemblies listed here (exact version)')
     parser.add_argument('--reference-fasta', action='append', default=[], metavar='FASTA',
                         help='--exact: indexed reference FASTA; repeat for local reference templates')
+    parser.add_argument('--no-realignment', action='store_true',
+                        help='--exact: do not realign shifted members onto their row\'s breakpoint; '
+                             'each keeps its own row')
     kinds = parser.add_mutually_exclusive_group()
     kinds.add_argument('--svonly', dest='mode', action='store_const', const='svonly',
                        help='only cohort.sv.vcf (SVs at or above --svcutoff)')
@@ -127,6 +132,8 @@ def parse_args(argv=None):
         parser.error('--exact writes all three files; drop --svonly/--svindel/--snp')
     if args.reference_fasta and not args.exact:
         parser.error('--reference-fasta is only used with --exact')
+    if args.no_realignment and not args.exact:
+        parser.error('--no-realignment applies to --exact only')
     if args.slurm_jobs < 1:
         parser.error('--slurm-jobs must be positive')
     if not args.slurm and (args.slurm_account or args.slurm_partition or args.slurm_memory or args.slurm_args):
@@ -154,6 +161,22 @@ def run_stage(args):
         'publish': lambda: cohort_vcf_merge.stage_publish(plan),
     }[args.stage]()
     return 0
+
+
+def wait_visible(path, seconds=120):
+    """Wait for a file a just-finished Slurm job wrote on another node (as
+    Snakemake's --latency-wait); shared filesystems can show it late."""
+    path = Path(path)
+    deadline = time.monotonic() + seconds
+    while not path.is_file():
+        if time.monotonic() >= deadline:
+            raise FileNotFoundError(f'{path} did not appear within {seconds} s')
+        time.sleep(2)
+        try:
+            os.listdir(path.parent)
+        except OSError:
+            pass
+    return path
 
 
 class Stages:
@@ -322,7 +345,8 @@ def main(argv=None):
         var_in_insert=args.var_in_insert,
         ignore_full_locus_dup_insertions=not args.keep_full_locus_dup_insertions,
         exact=str(Path(args.exact).resolve()) if args.exact else None,
-        reference_fastas=[str(Path(path).resolve()) for path in args.reference_fasta])
+        reference_fastas=[str(Path(path).resolve()) for path in args.reference_fasta],
+        realignment=not args.no_realignment)
     plan_path = Path(plan['root']) / 'plan.json'
     plan_path.write_text(json.dumps(plan, indent=1) + '\n')
     stages = Stages(args, plan, plan_path)
@@ -332,8 +356,12 @@ def main(argv=None):
         # Needs only the scan's raw SNP manifest; insertion SNPs come at concat.
         stages.once('snp-prepare')
         manifest = Path(plan['root']) / 'snp_shards' / 'manifest.json'
+        if args.slurm:
+            wait_visible(manifest)
         names = {key: str(value.get('chrom', key)) if isinstance(value, dict) else str(value)
                  for key, value in json.loads(manifest.read_text())['chroms'].items()}
+    if mode != 'snp' and args.slurm:
+        wait_visible(Path(plan['root']) / 'sv_shards' / 'manifest.pkl')
     if mode == 'all':
         sv_chroms = cohort_vcf_merge.sv_chroms(plan)
         # --exact: a SNP chromosome applies the realignment records its SV

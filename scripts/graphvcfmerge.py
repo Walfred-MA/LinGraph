@@ -8671,8 +8671,8 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
                   f"{sample_names[context['file_sample_indexes'][file_index][0]]}\t"
                   f"{sum(1 for record in records if record[4])}",
                   file=sys.stderr)
-    if os.environ.get("GRAPHVCFMERGE_EXACT_REALIGN", "1") == "0":
-        # Comparison mode: no realignment, every shifted member keeps its own row.
+    if not _FAST_CONTEXT.get("realignment", True):
+        # --no-realignment: every shifted member keeps its own row.
         for key, records in interval_records.items():
             for ref, slot, _rep_ref, _protected, shifted, _size in records:
                 if shifted:
@@ -9895,9 +9895,13 @@ def _fast_stage_chrom(
     legacy_fast: bool = True,
     kmermatch: str = DEFAULT_KMERMATCH,
     insertion_snps: Optional[str] = None,
+    realignment: bool = True,
 ) -> None:
     """Stage 2 for split SLURM runs: process the named chromosome(s)
-    end to end from the saved shards, writing per-chrom parts."""
+    end to end from the saved shards, writing per-chrom parts.
+
+    ``realignment`` False (--no-realignment; also GRAPHVCFMERGE_EXACT_REALIGN=0)
+    keeps an --exact scan's shifted members on their own rows."""
     core_path = os.path.join(shards_dir, "manifest_core.pkl")
     if os.path.isfile(core_path):
         # Slim manifest: chrom jobs need inputs/samples only; the big
@@ -9941,6 +9945,9 @@ def _fast_stage_chrom(
         "legacy_fast": bool(legacy_fast),
         "kmermatch": kmermatch,
     }
+    if not realignment or os.environ.get("GRAPHVCFMERGE_EXACT_REALIGN", "1") == "0":
+        # Recorded in the chromosome checkpoints: never reuses realigned ones.
+        context["realignment"] = False
     _init_fast_worker(context)
     workers = max(1, int(processes))
     pool = None
@@ -10979,6 +10986,7 @@ def merge_locus_vcfs(args) -> None:
                 legacy_fast=args.fast,
                 kmermatch=args.kmermatch,
                 insertion_snps=args.insertion_snps,
+                realignment=not args.no_realignment,
             )
         else:
             if not args.output:
@@ -11174,6 +11182,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--reference", action="append", default=None, metavar="FASTA",
         help="indexed reference FASTA for --exact; repeat for the local "
              "reference templates",
+    )
+    parser.add_argument(
+        "--no-realignment", action="store_true",
+        help="chrom stage of an --exact scan: do not realign shifted members "
+             "onto their row's breakpoint; each keeps its own row",
     )
     parser.add_argument("--kmermatch", default=DEFAULT_KMERMATCH,
                         help="KmerMatch executable for longest-first INS partitioning [beside this script]")

@@ -215,7 +215,7 @@ python3 LinGraph/scripts/LinGraph.py graph \
   -I cohort.list -G trio_graph -O trio_calls \
   -b LinGraph/windowprofs/geneblocks.bed --bed-grouped \
   -r CHM13_h1 --alternative LinGraph/data/alternatives.fa \
-  --exact --mc-graph -t 32 \
+  --exact --make-graph -t 32 \
   --slurm --slurm-jobs 50 --slurm-account YOUR_ACCOUNT --slurm-partition YOUR_PARTITION \
   > logs/graph_trio.log 2>&1
 ```
@@ -226,7 +226,7 @@ Without SLURM, drop the last line and set `-t` to the local CPU count.
 - `--alternative LinGraph/data/alternatives.fa`: the recommended alternative
   sequences for CHM13, imported into the graph.
 - `--exact`: merges the cohort calls and realigns merged SVs to the assemblies.
-- `--mc-graph`: exports `trio_calls/cohort.gfa`.
+- `--make-graph`: exports `trio_calls/cohort.gfa`.
 
 `trio_graph/` holds the graph cache (resume by repeating the command);
 `trio_calls/` holds per-haplotype VCFs in `samples/`, the merged

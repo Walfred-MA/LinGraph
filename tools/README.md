@@ -71,12 +71,13 @@ their other bases become nested, `_F` and `_S` rows. A
 `##pseudoLinearMapping` lines, which merged headers drop. The converter below
 needs it to give split samples their coverage.
 
-## Split merged grVCFs, or convert exact to CIGAR
+## Split merged grVCFs, or convert between exact and CIGAR
 
 `tools/convert_merged_grvcf.py split` turns merged grVCFs of either version
 back into one grVCF per sample; `to-cigar` turns an exact merge into a CIGAR
-merge (split, then merge again without realignment). Give all three merged
-files of the cohort and the merge's reference FASTA:
+merge (split, then merge again without realignment); `to-exact` turns a CIGAR
+merge into an exact merge (split, then merge again with `--exact`). Give all
+three merged files of the cohort and the merge's reference FASTA:
 
 ```bash
 python tools/convert_merged_grvcf.py split \
@@ -85,7 +86,21 @@ python tools/convert_merged_grvcf.py split \
 python tools/convert_merged_grvcf.py to-cigar \
   -v merged/cohort.sv.vcf merged/cohort.indel.vcf merged/cohort.snp.vcf \
   -r reference.fa -O merged_cigar -t 16
+python tools/convert_merged_grvcf.py to-exact \
+  -v merged_cigar/cohort.sv.vcf merged_cigar/cohort.indel.vcf merged_cigar/cohort.snp.vcf \
+  -r reference.fa -q query_paths.txt \
+  --reference-fasta reference.fa --reference-fasta local_reference_templates.fa \
+  -O merged_exact -t 16
 ```
+
+`to-exact` needs the samples' assemblies (`-q`, `NAME FASTA [FAI]` per line)
+and the exact merge's reference FASTAs (`--reference-fasta`, default `-r`;
+add the local reference templates when the cohort used them).
+`--no-realignment` merges exactly without realigning shifted members; other
+`merge_grvcfs.py` options (`--slurm`, ...) are passed through. Realignment
+can write some rows differently from a direct exact merge of the original
+grVCFs (for example which base an insertion row's representative carries);
+the samples' alleles are the same.
 
 To add samples to a cohort: split it (or convert it to CIGAR first), then
 merge the split files and the new samples' grVCFs with `merge_grvcfs.py`.
@@ -188,3 +203,17 @@ the threshold, `both` has an inserted and a deleted part at or above it, and
 `|SVLEN|` for DEL and `END - POS` otherwise; inserted size is `SVLEN` for INS
 and the length of a plain `INFO/SEQ` (or `SVINSSEQ`) otherwise. Records
 without `SVLEN` use explicit REF/ALT lengths. Nested grVCF rows are skipped.
+
+## Merge two haplotype VCFs for benchmarking
+
+`tools/BCFtoolMergeTwoHaplotypes.sh` combines one sample's two haplotype VCFs
+into a site-only VCF for truvari: each is sorted and stripped of genotypes,
+then their union is written with exact duplicates removed. Run it in the
+output folder; it writes `HG002_h1.sites.vcf.gz`, `HG002_h2.sites.vcf.gz`
+and `HG002.LinGraph.vcf.gz` (with indexes). Needs bcftools and tabix:
+
+```bash
+bash tools/BCFtoolMergeTwoHaplotypes.sh HG002_h1.vcf HG002_h2.vcf
+```
+
+See [the HG002 demo](../demo/HG002/README.md) for the full benchmark.

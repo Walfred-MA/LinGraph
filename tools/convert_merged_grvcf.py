@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Convert merged grVCFs: split them into individual grVCFs, or exact -> CIGAR.
+"""Convert merged grVCFs: split them into individual grVCFs, exact -> CIGAR,
+or CIGAR -> exact.
 
   split     merged grVCFs (exact or CIGAR version) -> one grVCF per sample
   to-cigar  merged exact grVCFs -> merged CIGAR grVCFs (split, then merge
             again without realignment with tools/merge_grvcfs.py)
+  to-exact  merged CIGAR grVCFs -> merged exact grVCFs (split, then merge
+            again with --exact, which needs the assemblies; --no-realignment
+            as in merge_grvcfs.py). Realignment can write some rows
+            differently than a direct exact merge of the original grVCFs.
 
 Give the merged files of one cohort together (cohort.sv.vcf, cohort.indel.vcf
 and cohort.snp.vcf): a sample's insertion is rebuilt from its row, the nested
@@ -30,6 +35,9 @@ Examples:
       -r chm13.fa -o individual
   python tools/convert_merged_grvcf.py to-cigar -v merged/cohort.{sv,indel,snp}.vcf \\
       -r chm13.fa -O merged_cigar -t 16
+  python tools/convert_merged_grvcf.py to-exact -v merged_cigar/cohort.{sv,indel,snp}.vcf \\
+      -r chm13.fa -q query_paths.txt --reference-fasta chm13.fa \\
+      --reference-fasta local_reference_templates.fa -O merged_exact -t 16
 """
 import argparse
 import bisect
@@ -602,6 +610,31 @@ def to_cigar(vcfs, reference_path, output, *, threads=1, input_version=None,
     versions, _contigs, _definitions, _samples = read_header(vcfs)
     if merged_version(versions, input_version) == 'cigar':
         warn('the merged files are already the CIGAR version; merging them again anyway')
+    remerge(vcfs, reference_path, output, threads=threads, input_version=input_version,
+            sample_headers=sample_headers, keep_individual=keep_individual,
+            merge_options=merge_options)
+
+
+def to_exact(vcfs, reference_path, output, query_paths, *, reference_fastas=(),
+             realignment=True, threads=1, input_version=None, sample_headers=None,
+             keep_individual=False, merge_options=()):
+    """CIGAR -> exact: the split samples merged again with --exact against
+    their assemblies (QUERY_PATHS) and REFERENCE_FASTAS (default: the
+    reference; add the local reference templates if the merge had them)."""
+    versions, _contigs, _definitions, _samples = read_header(vcfs)
+    if merged_version(versions, input_version) == 'exact':
+        warn('the merged files are already the exact version; merging them again anyway')
+    exact = ['--exact', str(query_paths)]
+    for path in reference_fastas or [reference_path]:
+        exact += ['--reference-fasta', str(path)]
+    remerge(vcfs, reference_path, output, threads=threads, input_version=input_version,
+            sample_headers=sample_headers, keep_individual=keep_individual,
+            merge_options=[*exact, *([] if realignment else ['--no-realignment']), *merge_options])
+
+
+def remerge(vcfs, reference_path, output, *, threads=1, input_version=None,
+            sample_headers=None, keep_individual=False, merge_options=()):
+    """Split the merged files, then merge the samples again (merge_grvcfs.py)."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     individual = output / 'individual' if keep_individual else Path(
@@ -622,7 +655,8 @@ def main(argv=None):
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     actions = parser.add_subparsers(dest='action', required=True)
     for name, text in (('split', 'merged grVCFs -> one grVCF per sample'),
-                       ('to-cigar', 'merged exact grVCFs -> merged CIGAR grVCFs')):
+                       ('to-cigar', 'merged exact grVCFs -> merged CIGAR grVCFs'),
+                       ('to-exact', 'merged CIGAR grVCFs -> merged exact grVCFs')):
         action = actions.add_parser(name, help=text, description=text)
         action.add_argument('-v', '--vcf', nargs='+', required=True, metavar='VCF',
                             help='merged grVCFs of one cohort (sv, indel and snp)')
@@ -642,17 +676,33 @@ def main(argv=None):
             action.add_argument('-t', '--threads', type=int, default=1)
             action.add_argument('--keep-individual', action='store_true',
                                 help='keep the split grVCFs in OUTPUT/individual')
+        if name == 'to-exact':
+            action.add_argument('-q', '--query-paths', required=True, metavar='QUERY_PATHS',
+                                help='the samples\' assemblies, NAME FASTA [FAI] per line (indexed)')
+            action.add_argument('--reference-fasta', action='append', default=[], metavar='FASTA',
+                                help='indexed reference FASTA for the exact merge; repeat for the '
+                                     'local reference templates (default: -r)')
+            action.add_argument('--no-realignment', action='store_true',
+                                help='do not realign shifted members onto their row\'s breakpoint; '
+                                     'each keeps its own row')
     args, merge_options = parser.parse_known_args(argv)
     if args.action == 'split':
         if merge_options:
             parser.error(f'unrecognized arguments: {" ".join(merge_options)}')
         split(args.vcf, args.reference, args.output, sample_names=args.samples,
               input_version=args.input_version, sample_headers=args.sample_headers)
-    else:
+    elif args.action == 'to-cigar':
         sys.path.insert(0, str(TOOLS))
         to_cigar(args.vcf, args.reference, args.output, threads=args.threads,
                  input_version=args.input_version, sample_headers=args.sample_headers,
                  keep_individual=args.keep_individual, merge_options=merge_options)
+    else:
+        sys.path.insert(0, str(TOOLS))
+        to_exact(args.vcf, args.reference, args.output, args.query_paths,
+                 reference_fastas=args.reference_fasta, realignment=not args.no_realignment,
+                 threads=args.threads, input_version=args.input_version,
+                 sample_headers=args.sample_headers, keep_individual=args.keep_individual,
+                 merge_options=merge_options)
     return 0
 
 

@@ -170,6 +170,29 @@ def test_exact_pieces_join_back_into_one_call(tmp_path):
     assert calls(tmp_path / 'split' / 's6.vcf') == [['c', '2003', 'SVLEN=-52']]  # its SNP joined
 
 
+def test_no_realignment_keeps_shifted_members_on_their_own_rows(tmp_path):
+    inputs = tmp_path / 'inputs'
+    inputs.mkdir()
+    deletion_cohort(inputs)
+    (inputs / 'queries.txt').write_text(''.join(
+        f'{path.stem}\t{path}\n' for path in sorted(inputs.glob('s*.fa'))))
+    run(TOOLS / 'merge_grvcfs.py', '-i', *sorted(inputs.glob('s*.vcf')), '-O', tmp_path / 'merged',
+        '--exact', inputs / 'queries.txt', '--reference-fasta', inputs / 'c.fa', '--no-realignment')
+    merged = [tmp_path / 'merged' / f'cohort.{kind}.vcf' for kind in ('sv', 'indel', 'snp')]
+    assert '_F1\t' not in merged[0].read_text() + merged[1].read_text()
+    # No member is moved onto another's breakpoint: one row per deletion,
+    # e.g. s3's 70 bp deletion 5 bp left of s2's.
+    assert [call[:2] for call in calls(merged[0])] == [
+        ['c', '995'], ['c', '1000'], ['c', '1000'], ['c', '1002'], ['c', '2000'], ['c', '2003']]
+    run(TOOLS / 'convert_merged_grvcf.py', 'split', '-v', *merged, '-r', inputs / 'c.fa',
+        '-o', tmp_path / 'split')
+    assert calls(tmp_path / 'split' / 's3.vcf') == [['c', '995', 'SVLEN=-70']]
+    assert all(lossless(vcf, inputs, tmp_path) for vcf in sorted((tmp_path / 'split').glob('s*.vcf')))
+    result = subprocess.run([sys.executable, TOOLS / 'merge_grvcfs.py', '-i', *sorted(inputs.glob('s*.vcf')),
+                             '-O', tmp_path / 'cigar', '--no-realignment'], capture_output=True, text=True)
+    assert result.returncode and '--no-realignment applies to --exact only' in result.stderr
+
+
 def test_to_cigar_matches_a_direct_merge_up_to_placement(tmp_path):
     inputs = tmp_path / 'inputs'
     inputs.mkdir()
@@ -190,6 +213,26 @@ def test_to_cigar_matches_a_direct_merge_up_to_placement(tmp_path):
     run(TOOLS / 'convert_merged_grvcf.py', 'split', '-v', *converted, '-r', inputs / 'c.fa',
         '-o', tmp_path / 'split')
     assert all(lossless(vcf, inputs, tmp_path) for vcf in sorted((tmp_path / 'split').glob('s*.vcf')))
+
+
+@pytest.mark.parametrize('realignment', [True, False], ids=['realign', 'no-realign'])
+def test_to_exact_matches_a_direct_exact_merge(cohort, tmp_path, realignment):
+    flags = [] if realignment else ['--no-realignment']
+    direct = tmp_path / 'direct'
+    run(TOOLS / 'merge_grvcfs.py', '-i', *sorted(cohort.glob('s*.vcf')), '-O', direct,
+        '--exact', cohort / 'queries.txt', '--reference-fasta', cohort / 'c.fa', *flags)
+    cigar = merge(cohort, tmp_path / 'cigar')
+    run(TOOLS / 'convert_merged_grvcf.py', 'to-exact', '-v', *cigar, '-r', cohort / 'c.fa',
+        '-q', cohort / 'queries.txt', '-O', tmp_path / 'converted', *flags)
+    converted = [tmp_path / 'converted' / path.name for path in cigar]
+    assert '##graphvcfmergeVersion=exact' in converted[0].read_text()
+    for mine, theirs in zip(converted, [direct / path.name for path in cigar]):
+        rows = lambda path: [line.split('\t')[:2] for line in path.read_text().splitlines()  # noqa: E731
+                             if not line.startswith('#')]
+        assert rows(mine) == rows(theirs)
+    run(TOOLS / 'convert_merged_grvcf.py', 'split', '-v', *converted, '-r', cohort / 'c.fa',
+        '-o', tmp_path / 'split')
+    assert all(lossless(vcf, cohort, tmp_path) for vcf in sorted((tmp_path / 'split').glob('s*.vcf')))
 
 
 def test_split_without_sidecar_warns_and_needs_a_version(tmp_path):

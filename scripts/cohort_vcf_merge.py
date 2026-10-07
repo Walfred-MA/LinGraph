@@ -31,6 +31,12 @@ def add_modes(parser):
         ('svindel', 'merge SVs and split by size into cohort.sv.vcf and cohort.indel.vcf'),
     ):
         group.add_argument('--' + name, dest='merge_mode', action='store_const', const=name, help=help_text)
+    # Not --no-realignment: the cohort-call pipeline and LinGraph already use
+    # that for graph-CIGAR/VCF realignment.
+    parser.add_argument(
+        '--no-merge-realignment', action='store_true',
+        help='with --exact: do not realign shifted members onto their row\'s '
+             'breakpoint; each keeps its own row')
     return group
 
 
@@ -45,12 +51,22 @@ def resolve_exact(args):
     return getattr(args, 'exact', None) or 'auto'
 
 
+def resolve_realignment(args):
+    """False for --no-merge-realignment, which only applies to --exact."""
+    if not getattr(args, 'no_merge_realignment', False):
+        return True
+    if resolve_exact(args) is None:
+        raise ValueError('--no-merge-realignment applies to --exact only')
+    return False
+
+
 def mode_arguments(args):
     """Command-line form of the resolved mode, for forwarding to a backend."""
     exact = resolve_exact(args)
     if exact is None:
         return ['--' + resolve_mode(args)]
-    return ['--exact'] + ([] if exact == 'auto' else [str(exact)])
+    return (['--exact'] + ([] if exact == 'auto' else [str(exact)])
+            + ([] if resolve_realignment(args) else ['--no-merge-realignment']))
 
 
 def file_stamp(path):
@@ -362,10 +378,13 @@ def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
 def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=20,
         merge_distance=500, size_similarity=.7, sequence_similarity=.7, var_in_insert=100,
         kmermatch=sv.DEFAULT_KMERMATCH, dry_run=False, keep_merge_tmpdir=False,
-        ignore_full_locus_dup_insertions=True, exact=None, reference_fastas=()):
+        ignore_full_locus_dup_insertions=True, exact=None, reference_fastas=(),
+        realignment=True):
     paths = list(paths) if paths is not None else input_paths(output, listing)
     if exact and mode != 'all':
         raise ValueError('--exact merges like --all')
+    if not realignment and not exact:
+        raise ValueError('--no-realignment applies to --exact only')
     if not paths or processes < 1 or cutoff < 1:
         raise ValueError('merge requires input VCFs and positive process count/cutoff')
     print(f'[cohort-merge] mode={mode}; {len(paths)} input VCFs; {processes} workers', flush=True)
@@ -378,7 +397,7 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
                       size_similarity=size_similarity, sequence_similarity=sequence_similarity,
                       var_in_insert=var_in_insert, kmermatch=kmermatch,
                       ignore_full_locus_dup_insertions=ignore_full_locus_dup_insertions,
-                      exact=exact, reference_fastas=reference_fastas)
+                      exact=exact, reference_fastas=reference_fastas, realignment=realignment)
     stage_sv_scan(plan, processes)
     stage_sv_chrom(plan, sv_chroms(plan), processes)
     stage_sv_concat(plan, processes)
@@ -398,7 +417,8 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
 
 def merge_plan(output, mode, paths, *, cutoff=20, merge_distance=500, size_similarity=.7,
                sequence_similarity=.7, var_in_insert=100, kmermatch=sv.DEFAULT_KMERMATCH,
-               ignore_full_locus_dup_insertions=True, exact=None, reference_fastas=()):
+               ignore_full_locus_dup_insertions=True, exact=None, reference_fastas=(),
+               realignment=True):
     """Inputs, settings and work folder (OUTPUT/tmp/merge_only/IDENTITY) of a merge."""
     paths = [str(path) for path in paths]
     exact_query_paths, reference_fastas = (
@@ -408,6 +428,9 @@ def merge_plan(output, mode, paths, *, cutoff=20, merge_distance=500, size_simil
     settings = dict(minsvsize=cutoff, merge_distance=merge_distance, size_similarity=size_similarity,
                     sequence_similarity=sequence_similarity, var_in_insert=var_in_insert,
                     emit_small=mode in ('all', 'svindel'))
+    if exact and not realignment:
+        # Only when off: default --exact merges keep their work folder.
+        settings['realignment'] = False
     identity_settings = dict(
         settings,
         ignore_full_locus_dup_insertions=bool(
@@ -566,7 +589,8 @@ def main(argv=None):
             keep_merge_tmpdir=args.keep_merge_tmpdir,
             ignore_full_locus_dup_insertions=(
                 args.ignore_full_locus_dup_insertions
-            ), exact=resolve_exact(args), reference_fastas=args.reference_fasta)
+            ), exact=resolve_exact(args), reference_fastas=args.reference_fasta,
+            realignment=resolve_realignment(args))
     return 0
 
 

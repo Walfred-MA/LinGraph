@@ -173,6 +173,10 @@ MERGE_MODE = MERGE_RUN.get("merge_mode", "svonly")
 MERGE_EXACT = MERGE_RUN.get("exact")
 if MERGE_EXACT and MERGE_MODE != "all":
     raise ValueError("merge config: exact requires merge_mode all")
+# --no-merge-realignment: --exact without moving shifted members onto their row.
+MERGE_REALIGNMENT = as_bool(MERGE_RUN.get("merge_realignment", True))
+if not MERGE_REALIGNMENT and not MERGE_EXACT:
+    raise ValueError("merge config: merge_realignment false requires exact")
 MERGE_EMIT_SMALL = MERGE_MODE in ("all", "svindel")
 MERGE_SMALL_OPTION = "--output-small" if MERGE_EMIT_SMALL else ""
 MERGE_DISTANCE = int(MERGE_RUN.get("merge_distance", 500))
@@ -314,6 +318,8 @@ def merge_chrom_runner():
         command.append("--output-small")
     if MERGE_MODE == "all":
         command.extend(["--insertion-snps", str(MERGE_TMPDIR / "insertion_snps")])
+    if not MERGE_REALIGNMENT:
+        command.append("--no-realignment")
     return shlex.join(command)
 
 

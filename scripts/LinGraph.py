@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 import run_sample_pipeline as sample_pipeline
 import cohort_vcf_merge as cohort_merge
@@ -65,7 +66,7 @@ Common run options (place after graph or singular):
   --dry-run              Show commands without running or writing files
 
 Graph-only options:
-  --mc-graph             Also export cohort.gfa and per-sample GAFs
+  --make-graph           Also export cohort.gfa and per-sample GAFs
   --gfa-only             Export existing merged VCFs
   --static-block         Keep initial templates; skip additional novel loci
   --recall-only          Recall and merge from saved calling alignments
@@ -100,7 +101,7 @@ Examples:
             description=("Build/resume the pangenome graph from a cohort run; call variants across its assemblies." if mode == "graph"
                          else "Independent calling: write a VCF for each input sample/haplotype using an existing graph."),
             epilog=("Examples:\n  python LinGraph.py graph -I cohort.list -G cohort_graph -O calls --exact\n"
-                    "  python LinGraph.py graph -I cohort.list -r CHM13_h1 -G cohort_graph -O calls --exact --MC-graph"
+                    "  python LinGraph.py graph -I cohort.list -r CHM13_h1 -G cohort_graph -O calls --exact --make-graph"
                     if mode == "graph" else
                     "Examples:\n  python LinGraph.py singular -i query.fa --sample HG002_h1 -G graph -O calls\n"
                     "  python LinGraph.py singular -I samples.list -G graph -r reference.fa -O calls --merge")
@@ -137,7 +138,11 @@ Examples:
                        default=max(4 if mode == "graph" else 1, min(16, os.cpu_count() or 1)),
                        help="local CPU budget / calling worker CPUs with SLURM; graph requires >=4 (default: %(default)s)")
         if mode == "graph":
-            q.add_argument("--MC-graph", "--mc-graph", dest="mc_graph", action="store_true", help="convert merged VCF to cohort.gfa")
+            q.add_argument("--make-graph", dest="mc_graph", action="store_true",
+                           help="convert merged VCF to cohort.gfa")
+            # Former names, still accepted.
+            q.add_argument("--MC-graph", "--mc-graph", dest="mc_graph", action="store_true",
+                           help=argparse.SUPPRESS)
         alignment = q.add_mutually_exclusive_group()
         if mode == "graph":
             alignment.add_argument("--fast", "--fast-mode", dest="alignment_mode", action="store_const", const="fast",
@@ -161,7 +166,7 @@ Examples:
                     action.help = argparse.SUPPRESS
         stages = q.add_mutually_exclusive_group()
         stages.add_argument("--merge-only", action="store_true", help="merge existing per-sample VCFs" +
-                            ("; add --mc-graph to also export GFA" if mode == "graph" else ""))
+                            ("; add --make-graph to also export GFA" if mode == "graph" else ""))
         if mode == "graph":
             stages.add_argument("--gfa-only", action="store_true", help="export existing merged VCFs to GFA, without calling or merging")
         q.add_argument("--vcf-list", help="input VCF list for --merge-only")
@@ -176,7 +181,7 @@ Examples:
         q.add_argument("--svcutoff", type=int, default=20, help="SV size boundary; --svindel writes smaller SVs to .indel.vcf (default: 20)")
         if mode == "graph":
             q.add_argument("--insertion-only", nargs="?", const=50, type=int, metavar="SIZE",
-                           help="export only insertions in --MC-graph, minimum size [50]")
+                           help="export only insertions in --make-graph, minimum size [50]")
         q.add_argument("-slurm", "--slurm", action="store_true",
                        help="submit graph workflow stages as SLURM jobs; singular/partial runs use one allocation")
         q.add_argument("--slurm-args", default="", metavar="TEXT", help="quoted sbatch options, passed to each submitted job")
@@ -217,7 +222,7 @@ Examples:
             cli_options.add_options(q, 'sample', 'sample calling settings', show_advanced)
             cli_options.add_options(q, 'merge', 'merge settings', show_advanced)
         if mode == "graph":
-            cli_options.add_options(q, 'gfa', 'GFA export settings (require --mc-graph)', show_advanced)
+            cli_options.add_options(q, 'gfa', 'GFA export settings (require --make-graph)', show_advanced)
     return p
 
 
@@ -408,6 +413,25 @@ def write_text(path, content, dry=False):
     temporary.replace(path)
 
 
+LATENCY_WAIT = 120  # seconds, as the workflows' Snakemake --latency-wait
+
+
+def wait_for_files(paths, seconds=LATENCY_WAIT):
+    """The paths still missing after waiting up to ``seconds``: files a SLURM
+    job wrote on another node can take a while to appear on this one."""
+    deadline = time.monotonic() + seconds
+    missing = [Path(path) for path in paths if not Path(path).is_file()]
+    while missing and time.monotonic() < deadline:
+        time.sleep(2)
+        for folder in {path.parent for path in missing}:
+            try:
+                os.listdir(folder)  # refreshes a shared filesystem's cached listing
+            except OSError:
+                pass
+        missing = [path for path in missing if not path.is_file()]
+    return missing
+
+
 def stamps(paths):
     result = []
     for path in paths:
@@ -492,7 +516,7 @@ class Runner:
                     raise
             if code:
                 raise RuntimeError(f"{name} failed (exit {code}). See {logs / (name + '.log')}; repeat the command to resume.")
-        missing = [str(x) for x in outputs if not Path(x).is_file()]
+        missing = [str(x) for x in wait_for_files(outputs, LATENCY_WAIT if self.args.slurm else 0)]
         if missing:
             raise RuntimeError(f"{name} finished without expected output(s): {', '.join(missing)}")
         # Capture post-run inputs: faidx and graph caches may be created by a stage.
@@ -1063,7 +1087,7 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
                  else output / 'samples' / samples[0][0] / 'local_reference_templates.fa')
     for fasta in (fixed, templates):
         if not args.dry_run and not fasta.is_file():
-            raise ValueError(f"MC-graph requires the backbone/catalog and lifted calling templates: {fasta}")
+            raise ValueError(f"--make-graph requires the backbone/catalog and lifted calling templates: {fasta}")
     catalog = graph_root / "summary" / "alternatives.fasta"
     if not catalog.is_file() and (graph / "alternatives.fasta").is_file():
         catalog = graph / "alternatives.fasta"
@@ -1108,6 +1132,7 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
             if value:
                 wrapper += [option, value]
         wrapper += ['--sbatch-arg=' + value for value in shlex.split(args.slurm_args)]
+        # Stage name kept from the former --MC-graph: it names checkpoints/MC-graph.json.
         runner.run('MC-graph', [*wrapper, '--', sys.executable, ROOT / 'merged_vcf_to_gfa.py', *command],
                    inputs=inputs, outputs=[output / 'cohort.gfa'])
     else:
@@ -1266,6 +1291,8 @@ def gaf_array(args, runner, folder, jobs, label, cpus, memory):
     if args.dry_run:
         return
     failed = []
+    # Tasks that just finished on other nodes: give their files time to appear.
+    wait_for_files([path for *_rest, outputs in pending for path in (outputs[0].parent / "DONE", *outputs)])
     for _number, name, command, inputs, outputs in pending:
         if (outputs[0].parent / "DONE").is_file() and all(path.is_file() for path in outputs):
             runner.adopt(name, command, inputs=inputs, outputs=outputs)
@@ -1409,7 +1436,7 @@ def main(argv=None):
     if args.alignment_mode == 'rigorous' and getattr(args, 'skip_blastn', False):
         p.error("--rigorous requires both aligners and cannot be combined with --skip-blastn")
     if (cli_options.values(args, 'gfa') or args.insertion_only is not None) and not args.mc_graph:
-        p.error("GFA export settings require --mc-graph")
+        p.error("GFA export settings require --make-graph")
     cli_options.merge_settings(args)
     if args.threads < 1:
         p.error("--threads must be positive")
@@ -1438,7 +1465,9 @@ def main(argv=None):
         cohort_merge.run(output, cohort_merge.resolve_mode(args),
                          listing=absolute(args.vcf_list) if args.vcf_list else None,
                          cutoff=args.svcutoff, dry_run=args.dry_run,
-                         exact=cohort_merge.resolve_exact(args), **cli_options.merge_settings(args))
+                         exact=cohort_merge.resolve_exact(args),
+                         realignment=cohort_merge.resolve_realignment(args),
+                         **cli_options.merge_settings(args))
         if not args.mc_graph:
             return 0
     if args.gfa_only and args.slurm:
