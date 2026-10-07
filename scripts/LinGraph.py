@@ -61,10 +61,11 @@ Common run options (place after graph or singular):
   --merge-only           Merge existing per-sample VCFs
   --slurm                Submit work through SLURM
   --slurm-args TEXT      Quoted sbatch options
+  --slurm-memory MEM     Memory of run-once SLURM jobs, which also get -t CPUs
   --dry-run              Show commands without running or writing files
 
 Graph-only options:
-  --mc-graph             Also export cohort.gfa
+  --mc-graph             Also export cohort.gfa and per-sample GAFs
   --gfa-only             Export existing merged VCFs
   --static-block         Keep initial templates; skip additional novel loci
   --recall-only          Recall and merge from saved calling alignments
@@ -89,7 +90,10 @@ Examples:
     prepare = modes.add_parser('prepare', add_help=False, help='explicitly prepare assemblies; use prepare --help for all options')
     prepare.add_argument('arguments', nargs=argparse.REMAINDER)
     for mode in ("graph", "singular"):
+        # Short help hides options inside mutually exclusive groups, which makes
+        # Python < 3.12 argparse fail an assertion while wrapping the usage line.
         q = modes.add_parser(mode, formatter_class=argparse.RawDescriptionHelpFormatter,
+            usage=None if show_advanced else f"%(prog)s -G DIR -O DIR [options]",
             help=("build/resume a pangenome graph from a cohort run"
                   if mode == "graph" else
                   "independent VCF calling per sample/haplotype against an existing graph"),
@@ -190,7 +194,10 @@ Examples:
             a.add_argument("--snakemake", default="snakemake", help="Snakemake executable (requires 6.15.1)")
         a.add_argument("--slurm-account", help="SLURM account, if required by your cluster")
         a.add_argument("--slurm-partition", help="SLURM partition, otherwise cluster default")
-        a.add_argument("--slurm-memory", help="override memory per SLURM job; default: stage-specific, or 64G for one allocation")
+        a.add_argument("--slurm-memory", help="memory of every run-once SLURM job (with -t CPUs), e.g. merge scans, "
+                                              "publish, GFA export, GAF index and one-allocation runs; per-sample, "
+                                              "per-batch and per-chromosome jobs keep their own sizes "
+                                              "(default: each stage's own, 64G for one allocation)")
         a.add_argument("--slurm-time", default="200:00:00", help="allocation time limit (default: %(default)s)")
         if mode == "graph":
             a.add_argument("-b", "--bed", help="optional graph construction BED")
@@ -492,6 +499,18 @@ class Runner:
         signature["inputs"] = stamps(inputs)
         write_text(marker, json.dumps(dict(signature, outputs=stamps(outputs)), indent=2) + "\n")
 
+    def current(self, name, command, inputs=(), outputs=()):
+        """Whether run() would reuse this stage's recorded outputs."""
+        command = list(map(str, command))
+        signature = {"command": command, "inputs": stamps(inputs)}
+        signature["scripts"] = stamps(Path(c) for c in command if c.endswith(".py") and Path(c).is_file())
+        try:
+            previous = json.loads((self.work / "checkpoints" / f"{name}.json").read_text())
+        except (FileNotFoundError, ValueError):
+            return False
+        return (bool(outputs) and all(Path(x).is_file() for x in outputs)
+                and previous == dict(signature, outputs=stamps(outputs)))
+
     def adopt(self, name, command, inputs=(), outputs=(), graph_inputs=()):
         """Record outputs placed from another run as this stage's completed result."""
         command = list(map(str, command))
@@ -593,7 +612,7 @@ def graph_mode(args, runner, graph, output, samples, ref):
               "--sample-threads", min(16, args.threads), "--match-threads", min(4, args.threads),
               "--io-jobs", min(16, args.threads), "--format-processes", min(16, args.threads),
               "--svcutoff", args.svcutoff, *cohort_merge.mode_arguments(args)]
-    common += workflow_slurm_options(args)
+    common += workflow_slurm_options(args, "call")
     common += cli_options.forward(args, 'call')
     if args.dag_dry_run:
         common.append('--dry-run')
@@ -614,7 +633,7 @@ def graph_mode(args, runner, graph, output, samples, ref):
         command = ["-r", name, "-q", normalized, "-G", graph, "-j", args.threads,
                    "--snakemake", args.snakemake,
                    "--rigorous" if args.alignment_mode == "rigorous" else "--fast",
-                   *workflow_slurm_options(args)]
+                   *workflow_slurm_options(args, "build")]
         command += cli_options.forward(args, 'build')
         if args.static_block:
             command.append("--static-block")
@@ -1094,6 +1113,167 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     else:
         runner.script("MC-graph", "merged_vcf_to_gfa.py", command,
                       inputs=inputs, outputs=[output / "cohort.gfa"])
+    sample_gafs(args, runner, output, query_list, vcf_inputs)
+
+
+GAF_BATCH = 16  # sample VCFs per gfa_sample_gaf.py job (one worker each)
+GAF_SHARD_RECORDS = 20_000_000  # records (29 bytes each) buffered by a shard chunk job
+GAF_CHUNK_BYTES = 32 << 30      # largest merged-VCF chunk per shard job (split near chromosomes)
+
+
+def sample_gafs(args, runner, output, query_list, vcf_inputs):
+    """Per-sample GAFs on cohort.gfa, in batches; links the batches add are combined."""
+    try:
+        sample_vcfs = cohort_merge.input_paths(output, absolute(args.vcf_list) if args.vcf_list else None)
+    except FileNotFoundError:
+        if not args.dry_run:
+            raise
+        say(f"GAF: per-sample VCFs not found yet in {output}; batches are planned after calling")
+        return
+    gfa = output / "cohort.gfa"
+    sidecars = [Path(str(gfa) + suffix) for suffix in (".variants.tsv", ".anchors.bed.local-paths.tsv")]
+    index = output / "gaf" / "index"
+
+    def command_for(job, cpus, arguments, memory='64G'):
+        if not args.slurm:
+            return [sys.executable, *arguments]
+        wrapper = [sys.executable, ROOT / 'graph_build_snakemake/workflow/scripts/pipeline_inputs.py',
+                   'run-slurm', '--cpus', cpus, '--memory', args.slurm_memory or memory,
+                   '--job-name', job, '--log-dir', runner.work / 'slurm_logs', '--time', args.slurm_time]
+        for option, value in (('--account', args.slurm_account), ('--partition', args.slurm_partition)):
+            if value:
+                wrapper += [option, value]
+        wrapper += ['--sbatch-arg=' + value for value in shlex.split(args.slurm_args)]
+        return [*wrapper, '--', sys.executable, *arguments]
+
+    # The graph tables the walks read, built once and memory-mapped by every batch.
+    runner.run("GAF-index", command_for('LinGraph-GAF-index', args.threads, [ROOT / "gfa_gaf_index.py", "-g", gfa, "-o", index]),
+               inputs=[gfa, sidecars[0]], outputs=[index / "index.json"])
+    # The merged VCFs are streamed once into per-sample shards for all batches:
+    # chunks near chromosome changes (one job each), then contigs numbered over them.
+    shards = output / "gaf" / "shards"
+    shard_command = [ROOT / "gfa_sample_gaf.py", "-g", gfa, "--index", index, "-v", *vcf_inputs,
+                     "-s", *sample_vcfs, "-o", shards]
+    shard_inputs = [gfa, *sidecars, index / "index.json", ROOT / "gfa_gaf_index.py", *vcf_inputs, *sample_vcfs]
+    runner.run("GAF-shard-plan", command_for('LinGraph-GAF-shard-plan', args.threads, [
+        *shard_command, "--plan-shards", "--shard-chunk-bytes", GAF_CHUNK_BYTES, "-t", args.threads], '16G'),
+        inputs=shard_inputs, outputs=[shards / "plan.json"])
+    if not (shards / "plan.json").is_file():
+        say("GAF: shard chunks and batches are planned after the shard plan exists")
+        return
+    count = len(json.loads((shards / "plan.json").read_text())["chunks"])
+    chunks = [(f"GAF-shard-{number + 1:05d}",
+               [sys.executable, *shard_command, "--write-shards", "--chunk", number,
+                "--shard-records", GAF_SHARD_RECORDS],
+               [*shard_inputs, shards / "plan.json"], [shards / f"chunk_{number:05d}" / "meta.json"])
+              for number in range(count)]
+    if args.slurm:
+        gaf_array(args, runner, shards, chunks, "shard", 1, '16G')
+    else:
+        for name, command, inputs, outputs in chunks:
+            runner.run(name, command, inputs=inputs, outputs=outputs)
+    runner.run("GAF-shard-finish", command_for('LinGraph-GAF-shard-finish', args.threads, [
+        *shard_command, "--finish-shards"], '16G'),
+        inputs=[*shard_inputs, shards / "plan.json", *(outputs[0] for *_rest, outputs in chunks)],
+        outputs=[shards / "shards.json"])
+    batches = [sample_vcfs[start:start + GAF_BATCH] for start in range(0, len(sample_vcfs), GAF_BATCH)]
+    jobs = []
+    for number, batch in enumerate(batches, 1):
+        folder = output / "gaf" / f"batch_{number:03d}"
+        command = [sys.executable, ROOT / "gfa_sample_gaf.py", "-g", gfa, "--index", index, "--shards", shards,
+                   "-v", *vcf_inputs, "-s", *batch,
+                   "-q", query_list, "-o", folder, "-t", min(args.threads, len(batch)),
+                   "--add-links", folder / "added_links.gfa"]
+        jobs.append((f"sample-GAF-{number:03d}", command,
+                     [gfa, *sidecars, index / "index.json", shards / "shards.json", ROOT / "gfa_gaf_index.py",
+                      *vcf_inputs, *batch, query_list],
+                     [folder / "gaf_stats.tsv", folder / "added_links.gfa"]))
+    if args.slurm:
+        gaf_array(args, runner, output / "gaf", jobs, "batch", args.threads, '64G')
+    else:
+        for name, command, inputs, outputs in jobs:
+            runner.run(name, command, inputs=inputs, outputs=outputs)
+    if not args.dry_run:
+        # The union in gfa_sample_gaf.py's order (encoded link key), so one
+        # batch gives the same file as an unbatched run.
+        links = set()
+        for _name, _command, _inputs, outputs in jobs:
+            with open(outputs[1]) as handle:
+                links.update(handle)
+
+        def key(line):
+            _l, a, oa, b, ob = line.split('\t')[:5]
+            return ((int(a) * 2 + (oa == '-')) << 32) | (int(b) * 2 + (ob == '-'))
+        write_text(output / "gaf" / "added_links.gfa", "".join(sorted(links, key=key)))
+
+
+def array_spec(numbers):
+    """1,2,3,7 -> '1-3,7' for sbatch --array."""
+    ranges = []
+    for number in sorted(numbers):
+        if ranges and number == ranges[-1][1] + 1:
+            ranges[-1][1] = number
+        else:
+            ranges.append([number, number])
+    return ",".join(f"{a}-{b}" if a != b else f"{a}" for a, b in ranges)
+
+
+def gaf_array(args, runner, folder, jobs, label, cpus, memory):
+    """Jobs not yet current as one SLURM job array (task ID = the number ending
+    the job name; each runs OUTPUT_FOLDER/run.sh of its first output), at most
+    --slurm-jobs running; each completed task is recorded even if others fail."""
+    pending = []
+    for name, command, inputs, outputs in jobs:
+        if runner.current(name, command, inputs, outputs):
+            say(f"Reuse {name}")
+        else:
+            pending.append((int(name.rsplit('-', 1)[1]), name, command, inputs, outputs))
+    if not pending:
+        return
+    for _number, _name, command, _inputs, outputs in pending:
+        batch = outputs[0].parent
+        done = batch / "DONE"
+        if not args.dry_run:
+            batch.mkdir(parents=True, exist_ok=True)
+            for stale in (*outputs, done):
+                stale.unlink(missing_ok=True)
+        write_text(batch / "run.sh", "#!/bin/bash\nset -euo pipefail\n" + shlex.join(map(str, command))
+                   + "\ntouch " + shlex.quote(str(done)) + "\n", args.dry_run)
+    # Line N of the task list is the folder of task N.
+    tasks = folder / f"{label}_tasks.txt"
+    lines = [""] * max(number for number, *_rest in pending)
+    for number, _name, _command, _inputs, outputs in pending:
+        lines[number - 1] = str(outputs[0].parent)
+    write_text(tasks, "\n".join(lines) + "\n", args.dry_run)
+    script = folder / f"run_{label}.sh"
+    write_text(script, "#!/bin/bash\nset -euo pipefail\nexec bash \"$(sed -n \"${SLURM_ARRAY_TASK_ID}p\" "
+               + shlex.quote(str(tasks)) + ')/run.sh"\n', args.dry_run)
+    spec = array_spec(number for number, *_rest in pending) + f"%{getattr(args, 'slurm_jobs', None) or 20}"
+    wrapper = [sys.executable, ROOT / 'graph_build_snakemake/workflow/scripts/pipeline_inputs.py',
+               'run-slurm', '--cpus', cpus, '--memory', memory,
+               '--job-name', f'LinGraph-GAF-{label}', '--log-dir', runner.work / 'slurm_logs',
+               '--time', args.slurm_time]
+    for option, value in (('--account', args.slurm_account), ('--partition', args.slurm_partition)):
+        if value:
+            wrapper += [option, value]
+    wrapper += ['--sbatch-arg=' + value for value in shlex.split(args.slurm_args)]
+    wrapper += ['--sbatch-arg=--array=' + spec, '--', 'bash', script]
+    try:
+        runner.run(f'GAF-{label}-array', wrapper, force=True)
+        problem = None
+    except RuntimeError as error:
+        problem = error
+    if args.dry_run:
+        return
+    failed = []
+    for _number, name, command, inputs, outputs in pending:
+        if (outputs[0].parent / "DONE").is_file() and all(path.is_file() for path in outputs):
+            runner.adopt(name, command, inputs=inputs, outputs=outputs)
+        else:
+            failed.append(name)
+    if failed or problem:
+        raise RuntimeError(f"GAF {label} jobs failed: {', '.join(failed) or 'none recorded'}; see "
+                           f"{runner.work / 'slurm_logs'}; repeat the command to rerun only these") from problem
 
 
 RECALL_SETTINGS = {'format_processes', 'edge_blackregion', 'max_extension', 'realignment',
@@ -1106,12 +1286,21 @@ def recall_settings(args):
             if key in RECALL_SETTINGS}
 
 
-def workflow_slurm_options(args):
+def workflow_slurm_options(args, workflow):
+    """Slurm options for a workflow launcher. Run-once stages get -t CPUs and
+    --slurm-memory; per-sample, per-batch and per-chromosome jobs keep their own sizes."""
     if not args.slurm:
         return []
     options = ["--slurm", "--slurm-jobs", str(args.slurm_jobs or 20),
                "--slurm-time", args.slurm_time]
-    extra = (["--mem=" + args.slurm_memory] if args.slurm_memory else []) + shlex.split(args.slurm_args)
+    if workflow == "call":
+        options += ["--once-cpus", str(args.threads)]
+        options += ["--once-memory", args.slurm_memory] if args.slurm_memory else []
+    else:
+        # Novel-locus discovery is the graph build's run-once Slurm stage.
+        options += ["--novel-slurm-cpus", str(args.threads)]
+        options += ["--novel-slurm-memory", args.slurm_memory] if args.slurm_memory else []
+    extra = shlex.split(args.slurm_args)
     for flag, value in (("--slurm-account", args.slurm_account),
                         ("--slurm-partition", args.slurm_partition),
                         ("--slurm-args", shlex.join(extra))):
@@ -1356,7 +1545,8 @@ def main(argv=None):
         for path in cohort_merge.output_paths(output, cohort_merge.resolve_mode(args)):
             say(f"Merged VCF: {path}")
     if args.mc_graph:
-        say(f"GFA: {output / 'cohort.gfa'}")
+        say(f"GFA: {output / 'cohort.gfa'} (final graph: plus {output / 'gaf/added_links.gfa'})")
+        say(f"GAF: {output}/gaf/batch_NNN/SAMPLE.gaf")
     if args.mode == "singular" and not args.reference_only:
         say(f"Coverage: {output}/samples/NAME/NAME.coverage.summary.tsv (plus missing-region BEDs)")
     return 0

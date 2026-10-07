@@ -201,15 +201,20 @@ MERGE_LOCUS_PROCESSES = int(RUN.get(
 ))
 MERGE_THREADS = max(MERGE_PROCESSES, MERGE_LOCUS_PROCESSES)
 MERGE_MEMORY_OVERRIDE = str(RUN.get("merge_memory", "")).strip()
-MERGE_SCAN_MEMORY = (
-    MERGE_MEMORY_OVERRIDE or f"{2 * MERGE_SCAN_PROCESSES}G"
-)
+# Default memory of the run-once merge jobs (scans, concats, publish): 64G
+# below 100 merged sample VCFs, 128G from 100 on.
+MERGE_ONCE_MEMORY = "64G" if len(SAMPLES) < 100 else "128G"
+MERGE_SCAN_MEMORY = MERGE_MEMORY_OVERRIDE or MERGE_ONCE_MEMORY
+# Per-chromosome SV merge jobs: 64G from 100 merged sample VCFs on (chr1 gets
+# twice that through its resource multiplier), else 2G per CPU.
 MERGE_CHROM_MEMORY = (
-    MERGE_MEMORY_OVERRIDE or f"{2 * MERGE_PROCESSES}G"
+    MERGE_MEMORY_OVERRIDE
+    or ("64G" if len(SAMPLES) >= 100 else f"{2 * MERGE_PROCESSES}G")
 )
 # One job each: SV concat (writes the insertion SNP manifest), small-variant
 # concat and publish. 2G was too small even for a trio.
-MERGE_CONCAT_MEMORY = MERGE_MEMORY_OVERRIDE or "64G"
+MERGE_CONCAT_MEMORY = MERGE_MEMORY_OVERRIDE or MERGE_ONCE_MEMORY
+MERGE_PUBLISH_MEMORY = MERGE_MEMORY_OVERRIDE or MERGE_ONCE_MEMORY
 LOCAL_TEMPLATE_FALLBACK = as_bool(
     LOCAL_TEMPLATE_RUN.get(
         "local_template_fallback", RUN.get("local_template_fallback", True)
@@ -224,6 +229,24 @@ SLURM_TIME = str(RUN.get("slurm_time", "200:00:00")).strip()
 SLURM_PARTITION = str(RUN.get("slurm_partition", "")).strip()
 SLURM_ARGS_TEXT = str(RUN.get("slurm_args", "")).strip()
 SLURM_ARGS = shlex.split(SLURM_ARGS_TEXT) if SLURM_ARGS_TEXT else []
+# Run-once Slurm stages (not per sample, batch or chromosome) request LinGraph's
+# -t CPUs (also their worker count) and --slurm-memory, when given.
+ONCE_CPUS = int(RUN.get("once_cpus") or 0)
+ONCE_MEMORY = str(RUN.get("once_memory") or "").strip()
+
+
+def once_cpus(default):
+    return ONCE_CPUS if SLURM_ENABLED and ONCE_CPUS else default
+
+
+def once_memory(default):
+    return ONCE_MEMORY if SLURM_ENABLED and ONCE_MEMORY else default
+
+
+EXTRACT_JOBS = once_cpus(IO_JOBS)
+LIFT_THREADS = once_cpus(SAMPLE_THREADS)
+SCAN_CPUS = once_cpus(MERGE_SCAN_PROCESSES)
+CONCAT_CPUS = once_cpus(min(8, MERGE_PROCESSES))
 PYTHON = sys.executable
 WAIT_NONEMPTY = shlex.join([
     PYTHON, str(SLURM_HELPER), "wait-nonempty",
@@ -478,14 +501,14 @@ rule extract_and_concatenate_samples:
         slurm_jobs=1 if SLURM_ENABLED else 0
     params:
         slurm=slurm_prefix(
-            "extract-samples", IO_JOBS, RUN["extraction_memory"]
+            "extract-samples", EXTRACT_JOBS, once_memory(RUN["extraction_memory"])
         ),
     shell:
         """
         {params.slurm} {PYTHON:q} {HELPER:q} extract-all \
           --run-config {RUN_CONFIG_PATH:q} \
           --marker {output.marker:q} \
-          --jobs {IO_JOBS}
+          --jobs {EXTRACT_JOBS}
         {WAIT_NONEMPTY} {output.marker:q}
         """
 
@@ -512,7 +535,7 @@ rule discover_local_reference_templates:
     params:
         disabled="" if LOCAL_TEMPLATE_FALLBACK else "--disabled",
         slurm=slurm_prefix(
-            "local-templates", 1, RUN["extraction_memory"]
+            "local-templates", once_cpus(1), once_memory(RUN["extraction_memory"])
         ),
     shell:
         """
@@ -545,13 +568,13 @@ rule local_reference_templates:
         io_jobs=1,
         slurm_jobs=1 if SLURM_ENABLED else 0
     params:
-        slurm=slurm_prefix("lift-local-templates", SAMPLE_THREADS, RUN["extraction_memory"])
+        slurm=slurm_prefix("lift-local-templates", LIFT_THREADS, once_memory(RUN["extraction_memory"]))
     shell:
         """
         {params.slurm} {PYTHON:q} {input.script:q} \
           --input {input.raw:q} --assemblies {input.query:q} \
           --reference-fasta {input.reference:q} --reference-haplotype {REFERENCE:q} \
-          --threads {SAMPLE_THREADS} --output {output.fasta:q}
+          --threads {LIFT_THREADS} --output {output.fasta:q}
         {WAIT_NONEMPTY} {output.fasta:q} {output.fai:q}
         """
 
@@ -828,8 +851,7 @@ if MERGE_MODE != "snp":
             slurm_jobs=1 if SLURM_ENABLED else 0
         params:
             slurm=slurm_prefix(
-                "merge-cohort-scan", MERGE_SCAN_PROCESSES,
-                MERGE_SCAN_MEMORY,
+                "merge-cohort-scan", SCAN_CPUS, once_memory(MERGE_SCAN_MEMORY),
             ),
             snps=shlex.join(["--snp-shards-dir", str(SMALL_MERGE_TMPDIR)]) if MERGE_MODE == "all" else "",
             exact=shlex.join([
@@ -842,7 +864,7 @@ if MERGE_MODE != "snp":
             {params.slurm} {PYTHON:q} {input.script:q} \
               -I {input.vcf_list:q} --stage scan \
               --shards-dir {MERGE_TMPDIR:q} --sv --candidate-min-size 0 \
-              --processes {MERGE_SCAN_PROCESSES} \
+              --processes {SCAN_CPUS} \
               {MERGE_LOCUS_DUP_OPTION} {params.snps} {params.exact}
             test -e {output.chroms:q}
             """
@@ -882,9 +904,9 @@ if MERGE_MODE != "snp":
             slurm_jobs=1 if SLURM_ENABLED else 0
         params:
             slurm=slurm_prefix(
-                "merge-cohort-concat", min(8, MERGE_PROCESSES), MERGE_CONCAT_MEMORY
+                "merge-cohort-concat", CONCAT_CPUS, once_memory(MERGE_CONCAT_MEMORY)
             ),
-            workers=lambda wc, threads: min(8, MERGE_PROCESSES) if SLURM_ENABLED else threads,
+            workers=lambda wc, threads: CONCAT_CPUS if SLURM_ENABLED else threads,
             snps=shlex.join(["--insertion-snps", str(MERGE_TMPDIR / "insertion_snps")]) if MERGE_MODE == "all" else "",
         shell:
             """
@@ -909,14 +931,14 @@ if SMALL_VCFS:
         resources:
             slurm_jobs=1 if SLURM_ENABLED else 0
         params:
-            slurm=slurm_prefix("merge-small-scan", MERGE_SCAN_PROCESSES, MERGE_SCAN_MEMORY),
+            slurm=slurm_prefix("merge-small-scan", SCAN_CPUS, once_memory(MERGE_SCAN_MEMORY)),
             stage=shlex.join(["--stage", "prepare", "--raw-manifest", str(SMALL_MERGE_TMPDIR / "raw.manifest.json")]) if MERGE_MODE == "all" else "--stage scan",
         shell:
             """
             {params.slurm} {PYTHON:q} {input.script:q} -I {input.vcf_list:q} \
               {params.stage} --shards-dir {SMALL_MERGE_TMPDIR:q} \
               --manifest-output {output.manifest:q} \
-              --svcutoff {MERGE_MINSVSIZE} --processes {MERGE_SCAN_PROCESSES} --snp-only
+              --svcutoff {MERGE_MINSVSIZE} --processes {SCAN_CPUS} --snp-only
             """
 
 
@@ -967,7 +989,7 @@ if SMALL_VCFS:
             slurm_jobs=1 if SLURM_ENABLED else 0
         params:
             prefix=str(COHORT_SNP_VCF).removesuffix(".snp.vcf"),
-            slurm=slurm_prefix("merge-small-concat", 1, MERGE_CONCAT_MEMORY),
+            slurm=slurm_prefix("merge-small-concat", once_cpus(1), once_memory(MERGE_CONCAT_MEMORY)),
             snps=shlex.join(["--insertion-snps", str(MERGE_TMPDIR / "insertion_snps")]) if MERGE_MODE == "all" else "",
         shell:
             """
@@ -982,6 +1004,7 @@ rule cohort_vcf_publish:
         indel=SV_SMALL_VCFS,
         snp=[str(COHORT_SNP_VCF)] if MERGE_MODE in ("all", "snp") else [],
         stage_config=MERGE_CONFIG_PATH,
+        vcf_list=ancient(str(MERGE_VCF_LIST)),
         script=ancient(str(SCRIPT_DIR / "cohort_vcf_merge.py")),
     output:
         FINAL_VCFS,
@@ -995,7 +1018,7 @@ rule cohort_vcf_publish:
             (["--indel-input", SV_SMALL_VCFS[0]] if MERGE_EMIT_SMALL else []) +
             (["--snp-input", str(COHORT_SNP_VCF)] if MERGE_MODE in ("all", "snp") else [])
         ),
-        slurm=slurm_prefix("merge-cohort-publish", 1, MERGE_CONCAT_MEMORY),
+        slurm=slurm_prefix("merge-cohort-publish", once_cpus(1), once_memory(MERGE_PUBLISH_MEMORY)),
         cleanup=shlex.join(
             [item for path in (
                 ([MERGE_TMPDIR] if MERGE_MODE != "snp" else []) +
@@ -1006,7 +1029,7 @@ rule cohort_vcf_publish:
     shell:
         """
         {params.slurm} {PYTHON:q} {input.script:q} publish --{MERGE_MODE} \
-          -O {params.destination:q} {params.sources} {params.cleanup}
+          -O {params.destination:q} -I {input.vcf_list:q} {params.sources} {params.cleanup}
         """
 
 

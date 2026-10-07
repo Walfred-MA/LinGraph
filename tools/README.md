@@ -34,6 +34,77 @@ without modifying assemblies or indexes and stop with a preparation command
 when the checks fail. See [assembly preparation](assembly_preparation.md)
 for batch preparation, masking options, and dependencies.
 
+## Merge individual grVCFs
+
+`tools/merge_grvcfs.py` runs only LinGraph's merge step on per-sample grVCFs
+and writes `cohort.sv.vcf`, `cohort.indel.vcf`, `cohort.snp.vcf` and
+`cohort.samples.headers.gz` to the output folder:
+
+```bash
+python tools/merge_grvcfs.py -I vcfs.list -O merged -t 16
+```
+
+The merge runs as stages, each its own process: SV scan, SV merge per
+chromosome, SV concat, SNP prepare, SNP merge per chromosome, SNP concat and
+publish. Without `--slurm` they run locally one after another (chromosomes one
+at a time, `-t` workers). With `--slurm` each stage is a Slurm job: run-once
+stages get `-t` CPUs and `--slurm-memory` (default 64G below 100 input grVCFs,
+128G from 100 on), and chromosome stages run as up to `--slurm-jobs` (default
+20) jobs at once, sized like the pipeline (SV: min(16, `-t`) CPUs and 2G per CPU,
+or 64G from 100 input grVCFs on, chr1 doubled; SNP: 32 CPUs, 64G). Finished stages and chromosomes are recorded,
+so repeating a failed command reruns only what did not finish. Both modes write
+the same files as the single-process merge.
+
+```bash
+python tools/merge_grvcfs.py -I vcfs.list -O merged -t 32 --slurm --slurm-jobs 20 \
+    --slurm-account ACCOUNT --slurm-partition PARTITION
+```
+
+By default it writes the CIGAR version: each sample keeps its own breakpoint
+(`TEMPLATEOFFSET`), size and alignment to its row's representative. With
+`--exact query_paths.txt --reference-fasta reference.fa` members are realigned
+against their assemblies and moved onto the representative's breakpoint;
+their other bases become nested, `_F` and `_S` rows. A
+`##graphvcfmergeVersion=cigar|exact` header line records which one a file is.
+
+`cohort.samples.headers.gz` keeps every sample's `##referenceCoverage` and
+`##pseudoLinearMapping` lines, which merged headers drop. The converter below
+needs it to give split samples their coverage.
+
+## Split merged grVCFs, or convert exact to CIGAR
+
+`tools/convert_merged_grvcf.py split` turns merged grVCFs of either version
+back into one grVCF per sample; `to-cigar` turns an exact merge into a CIGAR
+merge (split, then merge again without realignment). Give all three merged
+files of the cohort and the merge's reference FASTA:
+
+```bash
+python tools/convert_merged_grvcf.py split \
+  -v merged/cohort.sv.vcf merged/cohort.indel.vcf merged/cohort.snp.vcf \
+  -r reference.fa -o individual
+python tools/convert_merged_grvcf.py to-cigar \
+  -v merged/cohort.sv.vcf merged/cohort.indel.vcf merged/cohort.snp.vcf \
+  -r reference.fa -O merged_cigar -t 16
+```
+
+To add samples to a cohort: split it (or convert it to CIGAR first), then
+merge the split files and the new samples' grVCFs with `merge_grvcfs.py`.
+
+- Each call is rebuilt from its row, the nested rows the sample carries and
+  its insertion SNPs. From an exact merge, a row, its `_F` pieces and the
+  sample's SNPs between them become one call again; `_S` rows stay separate.
+- Rebuilt samples reconstruct their assemblies exactly
+  (`scripts/tools/check_vcf_lossless.py`). Split rows keep their merged row
+  IDs, so merging them again keeps the row names.
+- An exact merge keeps no sample breakpoint inside repeated bases. A rebuilt
+  insertion takes the equivalent placement that best matches its row's
+  representative; a deletion may come back at another equivalent position.
+- Files written before the version line existed need `--input-version`.
+- Without `cohort.samples.headers.gz` (pass another path with
+  `--sample-headers`) the tool warns: the split files then have no coverage,
+  so re-merged samples are `.` instead of `0` outside their own calls, and an
+  `--exact` merge cannot place them.
+
 ## Convert grVCF to standard VCF
 
 `tools/grvcf_to_vcf.py` exports a plain VCF in one streaming pass, without
@@ -48,7 +119,8 @@ python3 tools/grvcf_to_vcf.py \
 Repeat for the indel and SNP files. Plain and gzip-compressed inputs are
 accepted. The converter:
 
-- Removes nested records on `INS_`, `DEL_`, `SUB_`, or `DUP_` parents, and
+- Removes nested records on `I_`, `D_`, `SUB_`, or `DUP_` parents (`INS_`/`DEL_`
+  in older runs), and
   records at `POS=0`, which lack a VCF anchor base.
 - Converts `<INS>` with plain `INFO/SEQ` into explicit bases (`ALT=REF+SEQ`).
   Other symbolic alleles, including insertions with graph-encoded sequence,
@@ -95,7 +167,8 @@ Names that the chosen mode does not match stay unchanged. The tool:
   `##pseudoLinearMapping` Reference path. In these headers, it renames only
   names declared by `##contig`, so sample source paths (`Query`,
   `SourceContig`, and alt-layer `Reference`) stay unchanged.
-- Leaves nested rows (CHROM = parent ID `INS_`/`DEL_`/`SUB_`/`DUP_`) and
+- Leaves nested rows (CHROM = parent ID `I_`/`D_`/`SUB_`/`DUP_`, or
+  `INS_`/`DEL_` in older runs) and
   record IDs unchanged, so nested rows still point to their parents.
 - Drops a `##contig` line whose renamed ID repeats an earlier one, with a
   warning.

@@ -107,8 +107,8 @@ SNP_FORMAT_LEGACY_BASE = ":".join(SNP_EVENT_FIELDS[:-2])
 DEFAULT_BLOCK_GAP = 1_000_000
 DEFAULT_FORMAT_PROCESSES = 16
 HIDDEN_LINE_SEPARATORS = "\r\n\u2028\u2029"
-
-
+# Short row-ID prefixes: I_ insertions, D_ deletions, S_ SNPs (older runs: INS_/DEL_/SNP_).
+VARIANT_ID_PREFIX = {"INS": "I", "DEL": "D"}
 
 
 def mp_context():
@@ -6147,7 +6147,7 @@ def sv_cluster_to_row(
     # can fetch the full insertion sequence without needing CIGAR reconstruction.
     # Format: "<vcf_escaped_contig>|<g0>-<g1><strand>" — pipe avoids VCF metacharacters.
     queryseq_coord = f"{vcf_escape(rep.qry_contig)}|{format_query_range(rep)}" if rep.qry_contig else ""
-    row_id = f"{svtype}_{chrom}_{row_pos}_{cluster_id}"
+    row_id = f"{VARIANT_ID_PREFIX.get(svtype, svtype)}_{chrom}_{row_pos}_{cluster_id}"
     cigar_overrides: Dict[int, str] = {}
     if representative_target is not None:
         cigar_overrides = recursive_insertion_cigar_overrides(
@@ -6241,7 +6241,7 @@ def snp_cluster_to_row(key: tuple, members: List[SNPUnit], sample_names: Sequenc
                 sample, chrom, pos0, pos0 + 1, coverage_map, filtered_map,
             )
             sample_fields.append(format_missing_sample(symbol, SNP_FORMAT))
-    row_id = f"SNP_{chrom}_{pos0 + 1}_{alt}" + ("_ALT" if path == "alt" else "")
+    row_id = f"S_{chrom}_{pos0 + 1}_{alt}" + ("_ALT" if path == "alt" else "")
     row = [chrom, str(pos0 + 1), row_id, ref, alt, ".", "PASS", info, SNP_FORMAT] + sample_fields
     return "\t".join(row)
 

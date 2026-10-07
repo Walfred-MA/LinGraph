@@ -306,6 +306,48 @@ Columns 10/11 assume the walked sequence equals the query; no CIGAR is written.
 variants, and `variant_offsets.npy` holds each merged-VCF record's byte offset
 (uint64, cumulative across files). Requires numpy.
 
+For many samples, build the graph tables once and memory-map them in every job:
+
+```bash
+python gfa_gaf_index.py -g cohort.gfa -o gaf_index
+python gfa_sample_gaf.py -g cohort.gfa --index gaf_index -v ... -s ... -o gaf
+```
+
+To stream the merged VCFs once for all samples, write shards first and give each
+batch `--shards` (it then reads only its samples' shards; `variant_offsets.npy`
+stays in the shard folder). Output matches one run over all samples; batches that
+each stream the VCFs number contigs per batch, which can reorder `unplaced.tsv` rows.
+
+```bash
+python gfa_sample_gaf.py -g cohort.gfa --index gaf_index -v ... -s ALL... -o shards --write-shards
+python gfa_sample_gaf.py -g cohort.gfa --index gaf_index --shards shards -v ... -s BATCH... -o gaf_1
+```
+
+The shard pass can also run chromosome by chromosome: `--plan-shards` cuts the
+merged VCFs near CHROM changes (located by bisection; the sorted merge writes one
+block per CHROM, nested INS_/DEL_/SUB_/DUP_ rows as one tail block), bundles small
+pieces, splits pieces above `--shard-chunk-bytes`, and counts each chunk's lines
+with `-t` processes, so every chunk knows its first VCF record and byte offset.
+Each `--write-shards --chunk K` then runs on its own (in any order), and
+`--finish-shards` numbers contigs over the chunks in order. Shards and GAFs are the
+same as one pass.
+
+```bash
+python gfa_sample_gaf.py ... -o shards --plan-shards --shard-chunk-bytes 34359738368 -t 16
+python gfa_sample_gaf.py ... -o shards --write-shards --chunk K     # each K in plan.json
+python gfa_sample_gaf.py ... -o shards --finish-shards
+```
+
+The index keeps only what the walks read: segment lengths, P-line steps (with
+each step's uint32 base offset within its path, so workers cache nothing per path) and
+names (with a sorted name-hash table for lookups), canonical link keys, and the
+variant index columns with paths resolved to numbers. Sequences, other tags and
+variant IDs are dropped. Walks keep each GAF record as uint32 (path, start, end)
+step ranges within a P line (reversed when start > end), so a worker's memory
+follows the sample's variants, not the graph's node count; the path column is
+streamed. Output is the same as without `--index`; a job refuses
+an index built from a GFA or sidecar with another size or mtime.
+
 ## Sequence checks and large files
 
 The converter reads the VCF body sequentially and retains coordinate/run

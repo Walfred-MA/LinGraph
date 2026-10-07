@@ -31,9 +31,9 @@ from graph_cigar_payloads import query_only_graph_cigar
 
 DNA = re.compile(r'[ACGTNacgtn]+')
 OP = re.compile(r'(\d+)([=MXIDHS])([A-Za-z]*)')
-# CHROM of a nested row: its parent row's ID (graphvcfmerge INS_/DEL_/SUB_
-# rows) or a shared full-locus-dup template path (DUP_).
-NESTED_CHROM = re.compile(r'(?:INS|DEL|SUB|DUP)_')
+# CHROM of a nested row: its parent row's ID (graphvcfmerge I_/D_/SUB_ rows,
+# INS_/DEL_ in older runs) or a shared full-locus-dup template path (DUP_).
+NESTED_CHROM = re.compile(r'(?:INS|DEL|SUB|DUP|I|D)_')
 
 
 def unescape(text):

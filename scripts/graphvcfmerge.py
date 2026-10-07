@@ -3103,6 +3103,98 @@ def _safe_variant_token(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", text or "locus")
 
 
+# Short row-ID prefixes (as in graphreftovcf.py); IDs of older runs use INS_/DEL_.
+VARIANT_ID_PREFIX = {"INS": "I", "DEL": "D"}
+
+
+def _variant_id_prefix(svtype: str) -> str:
+    return VARIANT_ID_PREFIX.get(svtype, svtype)
+
+
+def _unique_variant_id(used: Dict[str, int], base_id: str) -> str:
+    """BASE_ID, else BASE_ID_<n> with the first n no other row of this
+    chromosome uses (BASE_ID_2 may itself be another row's own ID)."""
+    row_id, number = base_id, 1
+    while row_id in used:
+        number += 1
+        row_id = f"{base_id}_{number}"
+    used[row_id] = 1
+    return row_id
+
+
+def _chrom_variant_id(svtype: str, token: str, chrom: str) -> str:
+    """Top-level row ID: an input ID without this chromosome's name gets it,
+    so rows of different chromosomes never share an ID."""
+    row_id = _prefixed_variant_id(svtype, token)
+    prefix = _variant_id_prefix(svtype) + "_"
+    chrom_token = _safe_variant_token(chrom) + "_"
+    if not row_id[len(prefix):].startswith(chrom_token):
+        row_id = prefix + chrom_token + row_id[len(prefix):]
+    return row_id
+
+
+def _id_letters(number: int) -> str:
+    """1 -> a, 26 -> z, 27 -> aa: bijective base 26."""
+    letters = ""
+    while number:
+        number, rest = divmod(number - 1, 26)
+        letters = chr(97 + rest) + letters
+    return letters
+
+
+def _nested_variant_id(used: Dict[str, int], svtype: str, path_id: str,
+                       pos: int, size: int) -> str:
+    """Nested row ID <I|D>_<parent>_<pos>_<size>. Position and size fix a
+    deletion; an insertion of other bases at the same position and size
+    gets a, b, ..., z, aa, ... appended (I_<parent>_1_100a)."""
+    base = f"{_variant_id_prefix(svtype)}_{path_id}_{pos}_{size}"
+    row_id, number = base, 0
+    while row_id in used:
+        number += 1
+        row_id = base + _id_letters(number)
+    used[row_id] = 1
+    return row_id
+
+
+MERGE_VERSION_KEY = "##graphvcfmergeVersion="
+
+
+def merge_version_line(exact: bool) -> str:
+    """Which merged layout a file holds. cigar: each sample keeps its own
+    breakpoint (TEMPLATEOFFSET), size and alignment to the representative.
+    exact: samples sit on the representative's breakpoint; their other bases
+    are nested, _F and _S rows (tools/convert_merged_grvcf.py)."""
+    return MERGE_VERSION_KEY + ("exact" if exact else "cigar")
+
+
+def _check_unique_row_ids(paths: Sequence[str]) -> None:
+    """Every row of a chromosome's parts (top-level, nested, _S/_F) has its own ID."""
+    seen = set()
+    for path in paths:
+        if not path or not os.path.isfile(path):
+            continue
+        with open(path, "rb") as handle:
+            for raw in handle:
+                fields = raw.split(b"\t", 3)
+                if len(fields) < 3:
+                    continue
+                if fields[2] in seen:
+                    raise ValueError(
+                        f"duplicate merged row ID {fields[2].decode(errors='replace')!r} in {path}")
+                seen.add(fields[2])
+
+
+def _prefixed_variant_id(svtype: str, token: str) -> str:
+    """TOKEN as a row ID of SVTYPE: I_/D_ kept, an older INS_/DEL_ shortened."""
+    prefix = _variant_id_prefix(svtype)
+    upper = token.upper()
+    if upper.startswith(prefix + "_"):
+        return token
+    if upper.startswith(svtype + "_"):
+        return prefix + token[len(svtype):]
+    return f"{prefix}_{token}"
+
+
 def _scored_alignment_middle(body: str, core):
     """Trim to the boundaries selected by the standard alignment score."""
     operations = core.parse_pairwise_ops(body)
@@ -4711,6 +4803,12 @@ def _nearest_online_subclusters(
     return [group["members"] for group in groups]
 
 
+def _representative_size(svtype: str, size: int) -> int:
+    """Representative choice: the largest insertion, but the smallest
+    deletion (its size counted negative); ties go to the leftmost."""
+    return -int(size) if svtype == "DEL" else int(size)
+
+
 def _current_representative_index(
     group: Sequence[int], members: list, row_ids: Dict[int, str],
 ) -> int:
@@ -4814,7 +4912,7 @@ def _fast_refine_one_cluster(
 
     size_similarity = float(context["size_similarity"])
     selection = sorted(range(len(members)), key=lambda i: (
-        members[i][2], -members[i][0], "", -members[i][4],
+        _representative_size(svtype, members[i][2]), -members[i][0], "", -members[i][4],
     ), reverse=True)
     # A template only ever absorbs members inside its size-ratio window, so
     # each scan bisects the size-sorted view.  The final canonical member sort
@@ -5247,7 +5345,7 @@ def _fast_refine_giant(
                 row_ids[member_id] = token
                 seq_locators[member_id] = (out_path, offset, length)
     selection = sorted(range(len(members)), key=lambda i: (
-        members[i][2], -members[i][0],
+        _representative_size(svtype, members[i][2]), -members[i][0],
         row_ids.get(members[i][4], ""), -members[i][4],
     ), reverse=True)
     by_size = sorted(range(len(members)), key=lambda i: members[i][2])
@@ -6587,7 +6685,7 @@ def _exact_round_apply(svtype, pick, chosen, candidates, decisions):
     return kept, separated, pieces, flank
 
 
-def _exact_round_flank(flank, path_id, child_number, sample_count, path_samples,
+def _exact_round_flank(flank, path_id, used_children, sample_count, path_samples,
                        minsvsize, emit_small, main_rows, small_rows, candidates,
                        promoted):
     """Emit moved members' flank gaps as the samples' own nested rows."""
@@ -6597,14 +6695,13 @@ def _exact_round_flank(flank, path_id, child_number, sample_count, path_samples,
             if candidate[0] == kind:
                 candidates.append(candidate)
                 indexes.append(len(candidates) - 1)
-        child_number = _exact_round_separate(
-            indexes, kind, path_id, child_number, sample_count, path_samples,
+        _exact_round_separate(
+            indexes, kind, path_id, used_children, sample_count, path_samples,
             minsvsize, emit_small, main_rows, small_rows, candidates, promoted,
         )
-    return child_number
 
 
-def _exact_round_separate(indexes, svtype, path_id, child_number, sample_count,
+def _exact_round_separate(indexes, svtype, path_id, used_children, sample_count,
                           path_samples, minsvsize, emit_small, main_rows,
                           small_rows, candidates, promoted):
     """Emit members that cannot move losslessly as their own nested rows;
@@ -6617,11 +6714,10 @@ def _exact_round_separate(indexes, svtype, path_id, child_number, sample_count,
         ).append(index)
     for members in identical.values():
         index = members[0]
-        child_number += 1
         event = candidates[index]
         single = {
             "svtype": svtype,
-            "child_id": f"{svtype}_{path_id}_{event[1] + 1}_{child_number}",
+            "child_id": _nested_variant_id(used_children, svtype, path_id, event[1] + 1, event[3]),
             "child_pos": event[1] + 1, "rep_event": event, "pick": index,
             "chosen": [(index, None)] + [
                 (other, f"{event[3]}=" if svtype == "INS" else None)
@@ -6635,7 +6731,6 @@ def _exact_round_separate(indexes, svtype, path_id, child_number, sample_count,
         )
         if svtype == "INS" and single["row_ref"] is not None:
             promoted[single["child_id"]] = event[3]
-    return child_number
 
 
 def _fast_round_call(
@@ -6673,17 +6768,15 @@ def _fast_round_call(
     small_rows: List[str] = []
     promoted: Dict[str, int] = {path_id: path_length}
     groups_out: list = []
-    child_number = 0
+    used_children: Dict[str, int] = {}     # this path's nested row IDs
     ins_groups: list = []
     deferred: list = []     # --exact: groups formed, emitted after planning
 
     def emit_formed(svtype, pick, chosen, separated, pieces, flank):
         """Emit one formed group, then its separated members and flank gaps."""
-        nonlocal child_number
         rep_event = candidates[pick]
-        child_number += 1
         child_pos = rep_event[1] + 1
-        child_id = f"{svtype}_{path_id}_{child_pos}_{child_number}"
+        child_id = _nested_variant_id(used_children, svtype, path_id, child_pos, rep_event[3])
         chosen = sorted(chosen, key=lambda pair: (
             candidates[pair[0]][1], candidates[pair[0]][2],
             candidates[pair[0]][3], pair[0],
@@ -6739,13 +6832,13 @@ def _fast_round_call(
                 ],
                 "",
             ))
-        child_number = _exact_round_separate(
-            separated, svtype, path_id, child_number, sample_count,
+        _exact_round_separate(
+            separated, svtype, path_id, used_children, sample_count,
             path_samples, minsvsize, emit_small, main_rows,
             small_rows, candidates, promoted,
         )
-        child_number = _exact_round_flank(
-            flank, path_id, child_number, sample_count, path_samples,
+        _exact_round_flank(
+            flank, path_id, used_children, sample_count, path_samples,
             minsvsize, emit_small, main_rows, small_rows, candidates,
             promoted,
         )
@@ -6805,7 +6898,7 @@ def _fast_round_call(
                     emit_formed(svtype, pick, chosen, [], {}, [])
                 continue
             selection = sorted(local, key=lambda i: (
-                candidates[i][3], -candidates[i][1], -i,
+                _representative_size(svtype, candidates[i][3]), -candidates[i][1], -i,
             ), reverse=True)
             absorbed = set()
             for pick in selection:
@@ -8712,10 +8805,8 @@ def _fast_emit_dup_templates(
                     _observation_event_values(copy, _sample_alignment_cigar(body), pos),
                 )
             end_pos = max(pos, site_end)
-            base_id = f"INS_{_safe_variant_token(site_chrom)}_{pos}_{template_id}"
-            used_variant_ids[base_id] += 1
-            row_id = (base_id if used_variant_ids[base_id] == 1
-                      else f"{base_id}_{used_variant_ids[base_id]}")
+            row_id = _unique_variant_id(
+                used_variant_ids, f"I_{_safe_variant_token(site_chrom)}_{pos}_{template_id}")
             info = format_info_field({
                 "SVTYPE": "INS", "END": str(end_pos),
                 "NSUP": str(len(events_by_sample)),
@@ -8876,20 +8967,13 @@ def _fast_emit_refined(
         for emit_index, svtype, rep, members, _cost in raw_groups:
             token = _safe_variant_token(rep_observations[rep[3]].row_id)
             if token and token != "locus":
-                base_id = (
-                    token if token.upper().startswith(svtype + "_")
-                    else f"{svtype}_{token}"
-                )
+                base_id = _chrom_variant_id(svtype, token, chrom)
             else:
                 base_id = (
-                    f"{svtype}_{_safe_variant_token(chrom)}_"
+                    f"{_variant_id_prefix(svtype)}_{_safe_variant_token(chrom)}_"
                     f"{rep[0]}_{emit_index + 1}"
                 )
-            used_variant_ids[base_id] += 1
-            row_id = (
-                base_id if used_variant_ids[base_id] == 1
-                else f"{base_id}_{used_variant_ids[base_id]}"
-            )
+            row_id = _unique_variant_id(used_variant_ids, base_id)
             u_entries, u_positions, u_prefix = windows[svtype]
             uncertain_samples = _fast_uncertain_samples(
                 members, u_entries, u_positions, u_prefix,
@@ -9114,6 +9198,7 @@ def _fast_resume_nested(
     # Publish a locus only after top-level and all nested rows completed.
     # The work files live in the per-locus temporary directory, so an error or
     # killed process leaves no partial final part for concat to accept.
+    _check_unique_row_ids([part_work_path, small_work_path])
     os.replace(part_work_path, part_path)
     if small_path is not None and small_work_path is not None:
         os.replace(small_work_path, small_path)
@@ -10088,6 +10173,13 @@ def _fast_stage_concat(
         manifest = pickle.load(handle)
     parts_dir = os.path.join(shards_dir, "parts")
     chroms = sorted(manifest["chrom_sections"])
+    # Row IDs carry their chromosome's token: two chromosomes must not share one.
+    tokens: Dict[str, str] = {}
+    for chrom in chroms:
+        other = tokens.setdefault(_safe_variant_token(chrom), chrom)
+        if other != chrom:
+            raise ValueError(f"chromosomes {other!r} and {chrom!r} give the same row-ID "
+                             f"token {_safe_variant_token(chrom)!r}")
     missing = [
         chrom for chrom in chroms
         if not os.path.isfile(
@@ -10130,6 +10222,7 @@ def _fast_stage_concat(
         f"##contig=<ID={name},length={length}>"
         for name, length in sorted(promoted_lengths.items())
     )
+    header_extra.append(merge_version_line(bool(manifest.get("exact_queries"))))
     coverage_header: List[str] = []
     for chrom in chroms:
         union = _merge_intervals([
@@ -10612,6 +10705,7 @@ def merge_sample_vcfs_fast(
                 f"##contig=<ID={name},length={length}>"
                 for name, length in sorted(promoted_lengths.items())
             )
+            header_extra.append(merge_version_line(False))
             coverage_header: List[str] = []
             for chrom in chroms:
                 union = _merge_intervals([

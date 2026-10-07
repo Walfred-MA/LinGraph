@@ -290,7 +290,7 @@ def test_backfill_stage_finishes_old_run_byte_identically(tmp_path, capsys):
     assert manifest_of(insertion_root)["layout"] == compact.MANIFEST_LAYOUT
     assert "sources" not in manifest_of(insertion_root)
     assert sorted(p.suffix for p in finished.iterdir()) == [".contigs"] * 2 + [".json"] * 2 + [".part"] * 2
-    assert expected.count(b"\nINS") or b"SNP_" in expected
+    assert b"\tS_I_chr1_" in expected     # insertion SNPs: S_<insertion>_<pos>_<alt>
 
     # An old run: no finished parts, one manifest listing every insertion.
     shutil.rmtree(finished)

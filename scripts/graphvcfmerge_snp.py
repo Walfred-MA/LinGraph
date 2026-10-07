@@ -282,6 +282,12 @@ def _chrom_task(task):
 
 def concat(shards_dir, snp_output, indel_output=None, *, insertion_snps=None):
     manifest = load_manifest(shards_dir)
+    # SNP IDs carry their chromosome's token: two chromosomes must not share one.
+    tokens = {}
+    for chrom in manifest['chroms'].values():
+        other = tokens.setdefault(vcf._safe_variant_token(chrom), chrom)
+        if other != chrom:
+            raise ValueError(f'chromosomes {other!r} and {chrom!r} give the same SNP-ID token')
     from graphvcfmerge_snp_compact import concat_insertions, append_insertions
     metadata, insertions = concat_insertions(manifest, insertion_snps)
     targets = [(snp_output, 'snp')] + ([(indel_output, 'indel')] if indel_output else [])

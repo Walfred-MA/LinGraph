@@ -42,7 +42,7 @@ HEADER_FIELDS = (
     ("##pseudoLinearMapping=<", re.compile(r'(,Reference=")([^"]*)(?=:\d+-\d+[+-]")')),
 )
 # CHROM of a nested grVCF row is its parent row's ID, not a contig.
-NESTED_CHROM = re.compile(r'(?:INS|DEL|SUB|DUP)_')
+NESTED_CHROM = re.compile(r'(?:INS|DEL|SUB|DUP|I|D)_')
 
 
 def open_text(path: str, mode: str) -> TextIO:

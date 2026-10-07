@@ -53,12 +53,14 @@ KINDS = {'insertion': 0, 'snp': 1, 'substitution': 2, 'deletion': 3}
 KIND_NAMES = {value: key for key, value in KINDS.items()}
 # CHROM of rows nested in a merged row (graphvcfmerge row IDs) or on a shared
 # full-locus-dup template (gfa_interval_metadata.TEMPLATE_PATH).
-NESTED_CHROM = re.compile(r'(?:INS|DEL|SUB|DUP)_')
+NESTED_CHROM = re.compile(r'(?:INS|DEL|SUB|DUP|I|D)_')
 SHARD_DTYPE = np.dtype([('contig', '<u4'), ('qs', '<i8'), ('qe', '<i8'),
                         ('var', '<u8'), ('strand', 'u1')])
 _META = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 _INTERVAL = re.compile(r'(.+):(\d+)-(\d+)([+-])')
 
+# Walk parts are array('I') read back as uint32.
+assert array('I').itemsize == 4
 # Graph state is loaded once in the parent and shared with fork workers.
 G = {}
 
@@ -176,8 +178,12 @@ def load_local_paths(path):
 
 # ----------------------------------------------------- merged VCF shards ----
 
-def build_shards(vcfs, samples, shard_dir, shard_records):
-    """Stream merged VCFs once into per-sample (contig, query, variant) shards."""
+def build_shards(vcfs, samples, shard_dir, shard_records, segments=None):
+    """Stream merged VCFs once into per-sample (contig, query, variant) shards.
+
+    ``segments``: (VCF number, start byte, end byte, first data line, byte base)
+    line ranges of one planned chunk (plan_shards); by default every VCF whole,
+    numbered as one stream. Contigs are numbered in order of first appearance."""
     contigs = {}
     buffers = {sample: [array('I'), array('q'), array('q'), array('Q'), array('B')]
                for sample in samples}
@@ -204,11 +210,22 @@ def build_shards(vcfs, samples, shard_dir, shard_records):
     exported = G['var_parent']
     base = 0
     variant = 0
-    for vcf in vcfs:
+    for file_index, start_byte, end_byte, first, byte_base in (
+            segments or [(index, 0, None, None, None) for index in range(len(vcfs))]):
+        vcf = vcfs[file_index]
         columns = {}
-        position = 0
+        if first is not None:
+            variant, base = first, byte_base
+            header, _end = _vcf_header(vcf)
+            columns = {index: name for index, name in enumerate(header or [])
+                       if index >= 9 and name in buffers}
+        position = start_byte
         with _open(vcf, 'rb') as handle:
+            if start_byte:
+                handle.seek(start_byte)
             for raw in handle:
+                if end_byte is not None and position >= end_byte:
+                    break
                 start = position
                 position += len(raw)
                 if raw.startswith(b'#'):
@@ -273,21 +290,187 @@ def build_shards(vcfs, samples, shard_dir, shard_records):
                         buffered += 1
                 if buffered >= shard_records:
                     flush()
-        base += position
+        if first is None:
+            base += position
     flush()
     return shard_paths, [name for name, _index in sorted(contigs.items(), key=lambda item: item[1])], \
         np.frombuffer(offsets, dtype=np.uint64)
 
 
+# ------------------------------------------------- chunked shard passes ----
+# The merged VCFs are sorted into one contiguous block per CHROM (the nested
+# INS_/DEL_/SUB_/DUP_ rows after the chromosomes). A chunk is any contiguous
+# range of lines; plan_shards cuts near chromosome changes, gives every chunk
+# its first data-line number and byte base, and finish_shards numbers contigs
+# in first-appearance order over the chunks, so the shards equal one pass.
+
+CHUNK_SEARCH = 64 << 20   # chromosome changes are located to within this many bytes
+CHUNK_BUNDLE = 1 << 30    # adjacent pieces are bundled up to this size
+
+
+def _vcf_header(vcf):
+    """The #CHROM columns (or None) and the byte offset after the leading '#' lines."""
+    header, position = None, 0
+    with _open(vcf, 'rb') as handle:
+        for raw in handle:
+            if not raw.startswith(b'#'):
+                break
+            position += len(raw)
+            if raw.startswith(b'#CHROM'):
+                header = raw.decode().rstrip('\r\n').split('\t')
+                break
+    return header, position
+
+
+def _line_start(handle, position):
+    """First line start at or after a byte position."""
+    if position <= 0:
+        return 0
+    handle.seek(position - 1)
+    handle.readline()
+    return handle.tell()
+
+
+def _chrom_class(handle, start, size):
+    """CHROM of the first data line at or after a line start (nested names as one)."""
+    if start >= size:
+        return None
+    handle.seek(start)
+    for raw in handle:
+        if not raw.startswith(b'#') and not raw.isspace():
+            chrom = raw.split(b'\t', 1)[0]
+            return b'\0nested' if NESTED_CHROM.match(chrom.decode(errors='replace')) else chrom
+    return None
+
+
+def _chrom_cuts(handle, low, high, size, cuts):
+    """Line starts near CHROM changes in [low, high] (blocks are contiguous)."""
+    if _chrom_class(handle, low, size) == _chrom_class(handle, high, size):
+        return
+    if high - low <= CHUNK_SEARCH:
+        cuts.add(high)
+        return
+    middle = _line_start(handle, (low + high) // 2)
+    if middle >= high:
+        middle = _line_start(handle, low + 1)  # the midpoint fell in the last line
+        if middle >= high:
+            cuts.add(high)                      # low is the only line before high
+            return
+    _chrom_cuts(handle, low, middle, size, cuts)
+    _chrom_cuts(handle, middle, high, size, cuts)
+
+
+def _count_lines(task):
+    """Data lines and end byte of a range, counted as build_shards numbers them."""
+    vcf, start, end = task
+    count, position = 0, start
+    with _open(vcf, 'rb') as handle:
+        if start:
+            handle.seek(start)
+        for raw in handle:
+            if end is not None and position >= end:
+                break
+            position += len(raw)
+            if not raw.startswith(b'#') and not raw.isspace():
+                count += 1
+    return count, position
+
+
+def plan_shards(vcfs, max_bytes, processes):
+    """Chunks: [(VCF number, start, end, first data line, byte base)] in file order."""
+    ranges = []
+    for file_index, vcf in enumerate(vcfs):
+        _header, start = _vcf_header(vcf)
+        if str(vcf).endswith('.gz'):
+            ranges.append((file_index, 0, None))  # no byte seeks into gzip: one chunk
+            continue
+        size = os.path.getsize(vcf)
+        cuts = {start, size}
+        with open(vcf, 'rb') as handle:
+            _chrom_cuts(handle, start, size, size, cuts)
+            bounds = sorted(cut for cut in cuts if start <= cut <= size)
+            pieces = []
+            for low, high in zip(bounds, bounds[1:]):
+                if pieces and high - pieces[-1][0] <= CHUNK_BUNDLE:
+                    pieces[-1][1] = high          # bundle small neighbours
+                else:
+                    pieces.append([low, high])
+            for low, high in pieces:
+                count = max(1, -(-(high - low) // max_bytes)) if max_bytes else 1
+                edges = sorted({low, high, *(_line_start(handle, low + (high - low) * k // count)
+                                             for k in range(1, count))})
+                ranges += [(file_index, a, b) for a, b in zip(edges, edges[1:]) if a < b]
+    tasks = [(vcfs[file_index], low, high) for file_index, low, high in ranges]
+    if processes > 1 and len(tasks) > 1:
+        with mp.get_context('fork').Pool(min(processes, len(tasks))) as pool:
+            counted = pool.map(_count_lines, tasks)
+    else:
+        counted = [_count_lines(task) for task in tasks]
+    # Byte base of each VCF: the lengths of the files before it (a gzip
+    # file's decompressed length, from its one counted chunk).
+    lengths = {index: os.path.getsize(vcf) for index, vcf in enumerate(vcfs)
+               if not str(vcf).endswith('.gz')}
+    lengths.update({file_index: end for (file_index, _low, high), (_count, end)
+                    in zip(ranges, counted) if high is None})
+    bases = np.concatenate([[0], np.cumsum([lengths[index] for index in range(len(vcfs))])]).tolist()
+    chunks, variant = [], 0
+    for (file_index, low, high), (count, _end) in zip(ranges, counted):
+        chunks.append([(file_index, low, high, variant, int(bases[file_index]))])
+        variant += count
+    return chunks
+
+
+def finish_shards(folder):
+    """Global contig numbers per chunk (first appearance over the chunks in
+    order), variant_offsets.npy, and shards.json last."""
+    folder = Path(folder)
+    plan = json.loads((folder / 'plan.json').read_text())
+    contigs, order, offsets = {}, [], []
+    for number in range(len(plan['chunks'])):
+        chunk = folder / f'chunk_{number:05d}'
+        meta = json.loads((chunk / 'meta.json').read_text())
+        remap = np.array([contigs.setdefault(name, len(contigs)) for name in meta['contigs']],
+                         dtype=np.uint32)
+        np.save(chunk / 'remap.npy', remap)
+        offsets.append(np.load(chunk / 'offsets.npy'))
+        order.append(chunk.name)
+    np.save(folder / 'variant_offsets.npy',
+            np.concatenate(offsets) if offsets else np.zeros(0, dtype=np.uint64))
+    manifest = dict(gfa=plan['gfa'], vcfs=plan['vcfs'], samples=plan['samples'], chunks=order,
+                    contigs=sorted(contigs, key=contigs.get))
+    temporary = folder / 'shards.json.tmp'
+    temporary.write_text(json.dumps(manifest) + '\n')
+    temporary.replace(folder / 'shards.json')
+
+
+def _read_shard(shard):
+    """One sample's records: a shard file, or its (chunk shard, remap) files in chunk order."""
+    if isinstance(shard, str):
+        return np.fromfile(shard, dtype=SHARD_DTYPE)
+    parts = []
+    for path, remap in shard:
+        records = np.fromfile(path, dtype=SHARD_DTYPE)
+        if len(records):
+            records['contig'] = np.load(remap)[records['contig']]
+            parts.append(records)
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=SHARD_DTYPE)
+
+
 # ------------------------------------------------------------- walking ----
 
 class Walk:
-    """One GAF record under construction: encoded steps plus edge trims."""
+    """One GAF record under construction: step ranges plus edge trims.
+
+    ``parts`` holds (path, start, end) per piece as uint32: half-open step
+    numbers within that P path, read backwards (each step reversed) when
+    start > end. Only the record's ends keep a trim: a join inside a node
+    either continues that node or breaks the record."""
 
     def __init__(self, qstart):
         self.qstart = qstart
         self.qend = qstart
-        self.steps = []
+        self.parts = array('I')
+        self.last = None       # last encoded step; None while empty
         self.start_offset = 0
         self.end_trim = 0
         self.variants = 0
@@ -295,45 +478,51 @@ class Walk:
         self.pending = []      # links added by the extend() in progress
 
     def append(self, piece, stats):
-        """Add (steps, start_offset, end_trim); False if it cannot continue."""
-        steps, offset, trim = piece
-        if not steps:
+        """Add (path, start, end, start_offset, end_trim); False if it cannot continue."""
+        path, start, end, offset, trim = piece
+        if start == end:
             return True
-        if not self.steps:
-            self.steps = list(steps)
+        first, last = _piece_ends(piece)
+        if self.last is None:
+            self.parts.extend((path, start, end))
+            self.last = last
             self.start_offset, self.end_trim = offset, trim
             return True
-        last, first = self.steps[-1], steps[0]
-        length = int(G['segment_length'][last >> 1])
-        if last == first and length - self.end_trim == offset:
-            # Continue inside the same node (adjacent pseudo-linear pieces).
-            self.steps.extend(steps[1:])
+        length = int(G['segment_length'][self.last >> 1])
+        if self.last == first and length - self.end_trim == offset:
+            # Continue inside the same node (adjacent pseudo-linear pieces):
+            # the piece without its first step.
+            start += 1 if start < end else -1
+            if start != end:
+                self.parts.extend((path, start, end))
+                self.last = last
             self.end_trim = trim
             return True
         if self.end_trim or offset:
             stats['break_mid_node'] += 1
             return False
-        if not _has_edge(last, first):
+        if not _has_edge(self.last, first):
             added = G.get('added_links')
             if added is None:
                 stats['break_missing_link'] += 1
                 return False
-            if _edge_key(last, first) not in added:
-                added.add(_edge_key(last, first))
-                self.pending.append(_edge_key(last, first))
+            if _edge_key(self.last, first) not in added:
+                added.add(_edge_key(self.last, first))
+                self.pending.append(_edge_key(self.last, first))
                 stats['link_added'] += 1
-        self.steps.extend(steps)
+        self.parts.extend((path, start, end))
+        self.last = last
         self.end_trim = trim
         return True
 
     def extend(self, pieces, stats):
         """Append all pieces or none (rolls back on a failed join)."""
-        state = len(self.steps), self.start_offset, self.end_trim
+        state = len(self.parts), self.last, self.start_offset, self.end_trim
         self.pending = []
         for piece in pieces:
             if not self.append(piece, stats):
-                del self.steps[state[0]:]
-                _count, self.start_offset, self.end_trim = state
+                del self.parts[state[0]:]
+                _count, self.last, self.start_offset, self.end_trim = state
                 # Links added for this failed join are not used by any walk.
                 for key in self.pending:
                     G['added_links'].discard(key)
@@ -353,18 +542,82 @@ def _path_cumulative(path, cache):
     return cumulative
 
 
+def _step(path, index):
+    """Encoded step at a path-local step number."""
+    return int(G['steps'][int(G['offsets'][path]) + index])
+
+
+def _piece_ends(piece):
+    """First and last encoded steps of a piece, in walking order."""
+    path, start, end = piece[0], piece[1], piece[2]
+    if start < end:
+        return _step(path, start), _step(path, end - 1)
+    return _step(path, start - 1) ^ 1, _step(path, end) ^ 1
+
+
+def _range_bases(path, start, end):
+    """Bases of the whole nodes of a step range (either direction)."""
+    low, high = (start, end) if start < end else (end, start)
+    base = int(G['offsets'][path])
+    if 'step_offset' in G:
+        count = int(G['offsets'][path + 1]) - base
+        at_high = int(G['step_offset'][base + high]) if high < count else int(G['path_length'][path])
+        at_low = int(G['step_offset'][base + low]) if low < count else int(G['path_length'][path])
+        return at_high - at_low
+    return int(G['segment_length'][G['steps'][base + low:base + high] >> 1].sum())
+
+
+PATH_CHUNK = 1 << 16   # steps formatted per write of a GAF path
+
+
+def _write_path(out, parts):
+    """The GAF path column of a record, streamed range by range."""
+    steps = G['steps']
+    for path, start, end in parts.tolist():
+        base = int(G['offsets'][path])
+        if start < end:
+            for low in range(start, end, PATH_CHUNK):
+                chunk = steps[base + low:base + min(end, low + PATH_CHUNK)].tolist()
+                out.write(''.join(('<' if step & 1 else '>') + str(step >> 1) for step in chunk))
+        else:
+            for high in range(start, end, -PATH_CHUNK):
+                chunk = steps[base + max(end, high - PATH_CHUNK):base + high][::-1].tolist()
+                out.write(''.join(('>' if step & 1 else '<') + str(step >> 1) for step in chunk))
+
+
+def _path_length(path, cache):
+    if 'step_offset' in G:
+        return int(G['path_length'][path])
+    return int(_path_cumulative(path, cache)[-1])
+
+
+def _indexed_span(path, low, high):
+    """span() from the index's per-step offsets: nothing is cached per path."""
+    base, stop = int(G['offsets'][path]), int(G['offsets'][path + 1])
+    total = int(G['path_length'][path])
+    if low < 0 or high > total:
+        raise ValueError(f'{G["path_names"][path]}: interval {low}-{high} outside 0-{total}')
+    starts = G['step_offset'][base:stop]
+    # The step starts are the running lengths without the path's end, which
+    # neither search can reach (low < high <= total).
+    first = int(np.searchsorted(starts, np.uint32(low), side='right')) - 1
+    last = int(np.searchsorted(starts, np.uint32(high), side='left')) - 1
+    end = int(starts[last + 1]) if base + last + 1 < stop else total
+    return path, first, last + 1, int(low - int(starts[first])), int(end - high)
+
+
 def span(path, low, high, cache):
     """Forward piece covering [low, high) of a P path."""
     if high <= low:
         return None
+    if 'step_offset' in G:
+        return _indexed_span(path, low, high)
     cumulative = _path_cumulative(path, cache)
     if low < 0 or high > cumulative[-1]:
         raise ValueError(f'{G["path_names"][path]}: interval {low}-{high} outside 0-{cumulative[-1]}')
     first = int(np.searchsorted(cumulative, low, side='right')) - 1
     last = int(np.searchsorted(cumulative, high, side='left')) - 1
-    base = G['offsets'][path]
-    steps = G['steps'][base + first:base + last + 1].tolist()
-    return steps, int(low - cumulative[first]), int(cumulative[last + 1] - high)
+    return path, first, last + 1, int(low - cumulative[first]), int(cumulative[last + 1] - high)
 
 
 def _edge_owned(sample, nested, low, high, descending, length, path):
@@ -392,8 +645,8 @@ def _edge_owned(sample, nested, low, high, descending, length, path):
 
 
 def reverse_pieces(pieces):
-    return [([step ^ 1 for step in reversed(steps)], trim, offset)
-            for steps, offset, trim in reversed(pieces)]
+    return [(path, end, start, trim, offset)
+            for path, start, end, offset, trim in reversed(pieces)]
 
 
 class Sample:
@@ -492,7 +745,7 @@ class Sample:
         # Nested rows follow the query along the parent path: backwards when
         # this allele is carried on the query's reverse strand.
         descending = bool(self.strand[position])
-        length = (int(_path_cumulative(path, self.cache)[-1])
+        length = (_path_length(path, self.cache)
                   if path >= 0 and G['var_kind'][variant] != KINDS['deletion'] else None)
         nested = _edge_owned(self, [candidate for candidate in self.between(
             int(self.contig[position]), low, high) if candidate != position],
@@ -515,8 +768,7 @@ class Sample:
                 pieces.extend(self.allele(candidate, int(self.var[candidate]), stats))
                 stats['variants_spliced'] += 1
             return reverse_pieces(pieces) if G['var_reverse'][variant] else pieces
-        cumulative = _path_cumulative(path, self.cache)
-        pieces = self.splice(path, 0, int(cumulative[-1]), nested, stats, descending)
+        pieces = self.splice(path, 0, _path_length(path, self.cache), nested, stats, descending)
         return reverse_pieces(pieces) if G['var_reverse'][variant] else pieces
 
 
@@ -633,15 +885,15 @@ def _runs(intervals, stats):
 
 
 def _walked_length(pieces):
-    return sum(int(G['segment_length'][np.asarray(steps) >> 1].sum()) - offset - trim
-               for steps, offset, trim in pieces)
+    return sum(_range_bases(path, start, end) - offset - trim
+               for path, start, end, offset, trim in pieces)
 
 
 def write_sample_gaf(task):
     sample_name, vcf, shard, contig_names, lengths, output, add_links, only = task
     # Links this sample's walks need that the GFA lacks (--add-links).
     G['added_links'] = set() if add_links else None
-    records = np.fromfile(shard, dtype=SHARD_DTYPE)
+    records = _read_shard(shard)
     sample = Sample(records)
     contig_ids = {name: index for index, name in enumerate(contig_names)}
     _vcf_sample, intervals = read_pseudolinear(vcf, only)
@@ -666,18 +918,18 @@ def write_sample_gaf(task):
 
         def close():
             nonlocal walk, written
-            if walk is not None and walk.steps and walk.qend > walk.qstart:
-                node_lengths = G['segment_length'][np.asarray(walk.steps) >> 1]
-                path_length = int(node_lengths.sum())
+            if walk is not None and walk.parts and walk.qend > walk.qstart:
+                parts = np.frombuffer(walk.parts, dtype=np.uint32).reshape(-1, 3)
+                path_length = sum(_range_bases(path, start, end) for path, start, end in parts.tolist())
                 path_start = walk.start_offset
                 path_end = path_length - walk.end_trim
                 query_span = walk.qend - walk.qstart
                 block = max(query_span, path_end - path_start)
                 matches = min(query_span, path_end - path_start)
-                path = ''.join(('<' if step & 1 else '>') + str(step >> 1) for step in walk.steps)
                 length = lengths.get(current_contig, walk.qend)
-                out.write(f'{current_contig}\t{length}\t{walk.qstart}\t{walk.qend}\t+\t'
-                          f'{path}\t{path_length}\t{path_start}\t{path_end}\t{matches}\t'
+                out.write(f'{current_contig}\t{length}\t{walk.qstart}\t{walk.qend}\t+\t')
+                _write_path(out, parts)
+                out.write(f'\t{path_length}\t{path_start}\t{path_end}\t{matches}\t'
                           f'{block}\t255\tnv:i:{walk.variants}\n')
                 written += 1
             walk = None
@@ -875,10 +1127,85 @@ def build_parser():
     parser.add_argument('--shard-records', type=int, default=100_000,
                         help='buffered records before flushing shards (default: 100000)')
     parser.add_argument('--tmpdir', help='shard folder parent (default: output folder)')
+    parser.add_argument('--index', metavar='DIR',
+                        help='memory-map this gfa_gaf_index.py folder instead of parsing the GFA '
+                             'and its variant index (same output, built once per GFA)')
+    parser.add_argument('--plan-shards', action='store_true',
+                        help='split the merged VCFs into chunks near chromosome changes '
+                             '(at most --shard-chunk-bytes each), count their lines with -t '
+                             'processes, write plan.json in the output folder and stop')
+    parser.add_argument('--shard-chunk-bytes', type=int, default=0,
+                        help='--plan-shards: largest chunk in bytes (0: one chunk per chromosome '
+                             'block, bundled up to 1 GiB)')
+    parser.add_argument('--write-shards', action='store_true',
+                        help='stream the merged VCFs into per-sample shards in the output folder and '
+                             'stop: chunk --chunk of its plan.json, or (no --chunk) all in one pass '
+                             'with shards.json and variant_offsets.npy; batches read them with --shards')
+    parser.add_argument('--chunk', type=int, metavar='K', help='--write-shards: chunk K of plan.json')
+    parser.add_argument('--finish-shards', action='store_true',
+                        help='after every planned chunk: number contigs over the chunks, write '
+                             'variant_offsets.npy and shards.json, and stop')
+    parser.add_argument('--shards', metavar='DIR',
+                        help='per-sample shards from --write-shards, instead of streaming the '
+                             'merged VCFs again (same output; DIR holds variant_offsets.npy)')
     parser.add_argument('--add-links', metavar='FILE',
                         help='keep joins the GFA does not link (adjacent in a sample) and write '
                              'those links to FILE as L lines; the final graph is the GFA plus FILE')
     return parser
+
+
+def _stamp(path):
+    stat = os.stat(path)
+    return [str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns]
+
+
+def _write_json(path, value):
+    temporary = Path(str(path) + '.tmp')
+    temporary.write_text(json.dumps(value) + '\n')
+    temporary.replace(path)
+
+
+def _same_inputs(record, folder, gfa, vcfs):
+    if [row[1:] for row in record['vcfs']] != [_stamp(path)[1:] for path in vcfs] \
+            or record['gfa'][1:] != _stamp(gfa)[1:]:
+        raise SystemExit(f'{folder} was written from other merged VCFs or GFA; rewrite the shards')
+
+
+def _read_plan(folder, gfa, vcfs, samples):
+    plan = json.loads((Path(folder) / 'plan.json').read_text())
+    _same_inputs(plan, folder, gfa, vcfs)
+    if plan['samples'] != list(samples):
+        raise SystemExit(f'{folder}/plan.json was planned for other samples')
+    return plan
+
+
+def read_shards(folder, gfa, vcfs, samples):
+    """Per sample, its (chunk shard, remap) files in chunk order, and the contig names."""
+    folder = Path(folder)
+    try:
+        manifest = json.loads((folder / 'shards.json').read_text())
+    except FileNotFoundError:
+        raise SystemExit(f'{folder}: no complete shards (shards.json); run --write-shards')
+    _same_inputs(manifest, folder, gfa, vcfs)
+    index = {name: number for number, name in enumerate(manifest['samples'])}
+    missing = [name for name in samples if name not in index]
+    if missing:
+        raise SystemExit(f'{folder} has no shard for: {", ".join(missing[:5])}')
+    return ({name: [(str(folder / chunk / f'{index[name]}.shard'), str(folder / chunk / 'remap.npy'))
+                    for chunk in manifest['chunks']] for name in samples},
+            manifest['contigs'])
+
+
+def _write_gafs(args, samples, shards, contig_names, lengths, output):
+    tasks = [(name, vcf, shards[name] if isinstance(shards[name], list) else str(shards[name]),
+              contig_names, lengths.get(name, {}),
+              str(output / f'{name}.gaf'), bool(args.add_links), only)
+             for name, (vcf, only) in samples.items()]
+    if args.processes > 1 and len(tasks) > 1:
+        context = mp.get_context('fork')
+        with context.Pool(min(args.processes, len(tasks))) as pool:
+            return list(pool.imap_unordered(write_sample_gaf, tasks))
+    return [write_sample_gaf(task) for task in tasks]
 
 
 def main(argv=None):
@@ -887,11 +1214,21 @@ def main(argv=None):
     sample_vcfs = [path for group in args.sample_vcf for path in group]
     if args.processes < 1 or args.shard_records < 1:
         raise SystemExit('--processes and --shard-records must be positive')
+    modes = sum(map(bool, (args.plan_shards, args.write_shards, args.finish_shards, args.shards)))
+    if modes > 1 or ((args.plan_shards or args.write_shards or args.finish_shards) and args.add_links):
+        raise SystemExit('use one of --plan-shards, --write-shards, --finish-shards and --shards; '
+                         'shard steps take no --add-links')
+    if args.chunk is not None and not args.write_shards:
+        raise SystemExit('--chunk requires --write-shards')
     output = Path(args.output_folder)
     output.mkdir(parents=True, exist_ok=True)
 
-    load_gfa(args.gfa)
-    load_variant_index(args.variant_index or args.gfa + '.variants.tsv')
+    if args.index:
+        import gfa_gaf_index
+        G.update(gfa_gaf_index.load(args.index, args.gfa, args.variant_index or args.gfa + '.variants.tsv'))
+    else:
+        load_gfa(args.gfa)
+        load_variant_index(args.variant_index or args.gfa + '.variants.tsv')
     load_local_paths(args.local_paths or args.gfa + '.anchors.bed.local-paths.tsv')
 
     samples = {}        # name -> (file, Sample filter or None)
@@ -920,21 +1257,51 @@ def main(argv=None):
             samples[value] = (vcf, only)
     lengths = _fai_lengths(args.query_fasta_list, samples)
 
-    with tempfile.TemporaryDirectory(prefix='gaf-shards-', dir=args.tmpdir or output) as directory:
-        _log(f'streaming {len(vcfs)} merged VCF(s) into shards for {len(samples)} sample(s)')
-        shards, contig_names, offsets = build_shards(
-            vcfs, list(samples), Path(directory), args.shard_records)
-        np.save(output / 'variant_offsets.npy', offsets)
-        _log(f'{len(offsets)} VCF records indexed; shards in {directory}')
-        tasks = [(name, vcf, str(shards[name]), contig_names, lengths.get(name, {}),
-                  str(output / f'{name}.gaf'), bool(args.add_links), only)
-                 for name, (vcf, only) in samples.items()]
-        if args.processes > 1 and len(tasks) > 1:
-            context = mp.get_context('fork')
-            with context.Pool(min(args.processes, len(tasks))) as pool:
-                results = list(pool.imap_unordered(write_sample_gaf, tasks))
-        else:
-            results = [write_sample_gaf(task) for task in tasks]
+    if args.plan_shards:
+        chunks = plan_shards(vcfs, args.shard_chunk_bytes, args.processes)
+        _write_json(output / 'plan.json', dict(
+            gfa=_stamp(args.gfa), vcfs=[_stamp(path) for path in vcfs], samples=list(samples),
+            chunks=chunks))
+        _log(f'{len(chunks)} shard chunk(s) planned in {output / "plan.json"}')
+        return 0
+    if args.write_shards:
+        if args.chunk is None:
+            # One pass over every VCF as a single chunk.
+            _write_json(output / 'plan.json', dict(
+                gfa=_stamp(args.gfa), vcfs=[_stamp(path) for path in vcfs], samples=list(samples),
+                chunks=[[(index, 0, None, None, None) for index in range(len(vcfs))]]))
+        plan = _read_plan(output, args.gfa, vcfs, samples)
+        numbers = range(len(plan['chunks'])) if args.chunk is None else [args.chunk]
+        for number in numbers:
+            chunk = output / f'chunk_{number:05d}'
+            chunk.mkdir(exist_ok=True)
+            (chunk / 'meta.json').unlink(missing_ok=True)
+            _log(f'chunk {number}: streaming into shards for {len(samples)} sample(s)')
+            _paths, contig_names, offsets = build_shards(
+                vcfs, plan['samples'], chunk, args.shard_records,
+                [tuple(segment) for segment in plan['chunks'][number]])
+            np.save(chunk / 'offsets.npy', offsets)
+            _write_json(chunk / 'meta.json', dict(contigs=contig_names, records=len(offsets)))
+            _log(f'chunk {number}: {len(offsets)} VCF records')
+        if args.chunk is None:
+            finish_shards(output)
+        return 0
+    if args.finish_shards:
+        _read_plan(output, args.gfa, vcfs, samples)
+        finish_shards(output)
+        return 0
+    if args.shards:
+        shards, contig_names = read_shards(args.shards, args.gfa, vcfs, samples)
+        _log(f'reading shards for {len(samples)} sample(s) from {args.shards}')
+        results = _write_gafs(args, samples, shards, contig_names, lengths, output)
+    else:
+        with tempfile.TemporaryDirectory(prefix='gaf-shards-', dir=args.tmpdir or output) as directory:
+            _log(f'streaming {len(vcfs)} merged VCF(s) into shards for {len(samples)} sample(s)')
+            shards, contig_names, offsets = build_shards(
+                vcfs, list(samples), Path(directory), args.shard_records)
+            np.save(output / 'variant_offsets.npy', offsets)
+            _log(f'{len(offsets)} VCF records indexed; shards in {directory}')
+            results = _write_gafs(args, samples, shards, contig_names, lengths, output)
     if args.add_links:
         links = sorted({key for _name, _stats, added in results for key in added})
         with open(args.add_links + '.tmp', 'w') as out:

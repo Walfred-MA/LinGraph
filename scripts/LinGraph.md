@@ -67,6 +67,20 @@ reuse completed partitions.
 In graph mode, `--mc-graph` controls export of `cohort.gfa`. Without it, normal calling and
 merging produce VCFs. The local graphs needed for calling remain under `-G`.
 `--gfa-only` explicitly exports existing merged VCFs and implies `--mc-graph`.
+After `cohort.gfa`, `gfa_gaf_index.py` writes `gaf/index/` once (only the segment
+lengths, P walks and names, links and resolved variant index the walks read) and
+`gaf/shards/` once: the merged VCFs are cut into chunks near chromosome changes (at
+most 32 GiB each, nested rows as one block), each chunk streamed into per-sample
+shards by its own job (a second job array with `--slurm`, 1 CPU and 16G each), and
+contigs numbered over the chunks so the shards equal one pass (about 29 bytes per
+carried variant per sample; kept for resuming), then
+`gfa_sample_gaf.py --index` memory-maps it and writes one GAF per sample VCF in batches
+of 16 (`gaf/batch_NNN/`). With `--slurm`, the batches not yet complete are one
+job array (task ID = batch number, at most `--slurm-jobs` running, `-t` CPUs and
+64G per task); each task writes `batch_NNN/DONE` on
+success, finished batches are recorded even when others fail, and repeating the
+command resubmits only the failed ones. Links the sample walks need but the GFA lacks
+are combined in `gaf/added_links.gfa`; the final graph is `cohort.gfa` plus it.
 GFA tuning options require export to be enabled.
 
 Alignment intermediates (`*.align.txt` and `*_align.txt`) now omit `I`/`X`
@@ -400,6 +414,8 @@ OUTPUT/
   cohort.indel.vcf                           # --exact (default), --all, or --svindel
   cohort.sv.vcf                              # --exact (default), --all, --svonly, or --svindel
   cohort.gfa                                  # --MC-graph
+  gaf/batch_NNN/SAMPLE.gaf                    # --MC-graph, 16 sample VCFs per batch
+  gaf/added_links.gfa                         # --MC-graph; final graph = cohort.gfa + these links
   lingraph/run.json
   lingraph/logs/
   lingraph/checkpoints/
@@ -468,8 +484,19 @@ under `OUTPUT/slurm_logs`; construction logs are under the graph directory.
 each submitted job. It is parsed as arguments, not evaluated by a shell.
 Explicit sbatch resource options override stage defaults. You can also use
 `--slurm-account`, `--slurm-partition`, `--slurm-time`, and `--slurm-memory`.
-Per-stage controls such as `--graphcigar-memory`, `--vcf-memory`, and
-`--merge-memory` appear in `--help-all`. Optional GFA export gets its own SLURM job.
+
+Jobs that run once per run, whatever the cohort size, request `-t` CPUs (and use
+that many workers) and `--slurm-memory` when it is given: cohort extraction, local
+template discovery and lifting, the SV and small-variant merge scans and concats,
+publish, novel-locus discovery, GFA export, the GAF index, shard plan and shard
+finish, and the one allocation of singular and partial runs. Without
+`--slurm-memory` each keeps its own default (merge scans, concats and publish
+64G below 100 sample VCFs, 128G from 100 on; extraction and local templates `--extraction-memory` 64G, novel-locus
+discovery 128G, GFA export and GAF index 64G, GAF shard plan and finish 16G).
+`--slurm-memory` takes precedence over those stage options for these jobs.
+Per-sample, per-batch, per-chromosome and per-chunk jobs keep their own sizes and
+controls (`--graphcigar-memory`, `--vcf-memory`, `--merge-memory` for the chromosome
+stage, ...; see `--help-all`).
 
 Singular and partial runs (`--merge-only`, `--recall-only`, `--gfa-only`) use one
 allocation and also accept `--slurm-args`. `--slurm-jobs` applies to full graph

@@ -6,7 +6,7 @@
 #   deleted bp:  DEL -> |SVLEN|; others -> END - POS
 #   inserted bp: INS -> SVLEN; others -> length of plain INFO/SEQ or SVINSSEQ
 #   no SVLEN:    explicit REF/ALT -> deleted len(REF)-1, inserted len(ALT)-1
-# Nested grVCF rows (CHROM = parent ID INS_/DEL_/SUB_/DUP_...) are skipped.
+# Nested grVCF rows (CHROM = parent ID I_/D_/SUB_/DUP_..., INS_/DEL_ in older runs) are skipped.
 #
 # Usage: bash tools/count_sv.sh [-m MIN] file.vcf[.gz] ...
 set -euo pipefail
@@ -22,7 +22,7 @@ printf 'file\tINS_only\tDEL_only\tboth\ttotal\n'
 for f in "$@"; do
     if [[ "$f" == *.gz ]]; then gzip -cd -- "$f"; else cat -- "$f"; fi |
     awk -F'\t' -v OFS='\t' -v min="$MIN" -v name="$f" '
-        /^#/ || $1 ~ /^(INS|DEL|SUB|DUP)_/ {next}
+        /^#/ || $1 ~ /^(INS|DEL|SUB|DUP|I|D)_/ {next}
         {
             delete v
             n = split($8, a, ";")

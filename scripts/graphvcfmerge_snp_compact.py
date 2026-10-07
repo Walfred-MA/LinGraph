@@ -946,9 +946,9 @@ def write_locus(handle, chrom, ordered, query_list, allele_list, label_groups, c
                     sample_states = states.get(sample, ())
                     fields.append(missing_field if '.' in sample_states else reference_field
                                   if '0' in sample_states or covered(sample, pos) else missing_field)
-            digest = hashlib.sha256(json.dumps([chrom, [pos, ref, alt]]).encode()).hexdigest()[:20]
             filt = 'PASS' if 'PASS' in filters else ';'.join(sorted(filters - {'.', ''})) or '.'
-            handle.write('\t'.join([chrom, str(pos), f'SNP_{chrom_token}_{pos}_{digest}',
+            # REF is fixed by the position: (position, ALT) names the site.
+            handle.write('\t'.join([chrom, str(pos), f'S_{chrom_token}_{pos}_{alt}',
                                     ref, alt, '.', filt, f'NSUP={len(observations)}', vcf.SNP_FORMAT, *fields]) + '\n')
             count += 1
         left = right

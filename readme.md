@@ -581,8 +581,13 @@ non-reference sequence. It uses the familiar VCF columns (`CHROM`, `POS`, `ID`,
 graph-aware annotations. LinGraph currently writes these files with a `.vcf`
 extension, including individual and merged outputs.
 
-A merged row describes one **representative allele**. Each haplotype's FORMAT
-fields retain its supporting observations and how they relate to that allele.
+A merged row describes one **representative allele**: the largest insertion of
+its group, but the smallest deletion. Row IDs are unique: `I_`/`D_`/`S_` for
+insertions, deletions and SNPs. A nested row's CHROM is its parent's ID and its
+ID is `<I|D>_<parent>_<pos>_<size>`; insertions of different bases at one
+position and size get `a`, `b`, ... appended. SNPs are `S_<chrom>_<pos>_<alt>`.
+Each haplotype's FORMAT fields retain its supporting observations and how they
+relate to that allele.
 This preserves variation both on the chosen reference and within alternative,
 novel, or inserted sequence, including variants nested inside other alleles.
 
@@ -646,7 +651,8 @@ python3 tools/grvcf_to_vcf.py \
 Repeat for the indel and SNP files. Plain and gzip-compressed inputs are
 accepted. The converter:
 
-- Removes nested records on `INS_`, `DEL_`, `SUB_`, or `DUP_` parents, and
+- Removes nested records on `I_`, `D_`, `SUB_`, or `DUP_` parents (`INS_`/`DEL_`
+  in older runs), and
   records at `POS=0`, which lack a VCF anchor base.
 - Converts `<INS>` with plain `INFO/SEQ` into explicit bases (`ALT=REF+SEQ`).
   Other symbolic alleles, including insertions with graph-encoded sequence,

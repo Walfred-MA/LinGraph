@@ -455,6 +455,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slurm-time", default="200:00:00")
     parser.add_argument("--slurm-partition", default="")
     parser.add_argument("--slurm-args", default="")
+    parser.add_argument(
+        "--once-cpus", type=int, default=0, metavar="INT",
+        help="Slurm CPUs (and workers) for run-once stages: extraction, local templates, "
+             "merge scans, merge concats and publish (0: each stage's own)")
+    parser.add_argument(
+        "--once-memory", default="", metavar="MEMORY",
+        help="Slurm memory for those run-once stages (empty: each stage's own; "
+             "takes precedence over their stage memory options)")
     parser.add_argument("--match-memory", default="32G")
     parser.add_argument("--extraction-memory", default="64G")
     parser.add_argument("--genomelift-memory", default="32G")
@@ -464,9 +472,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--merge-memory", default="", metavar="MEMORY",
         help=(
-            "base memory for merge-stage Slurm jobs; by default scan and "
-            "chromosome stages request 2G per allocated CPU (chr1 applies its "
-            "resource multiplier) and the concat and publish jobs 64G"
+            "base memory for merge-stage Slurm jobs; by default chromosome "
+            "stages request 2G per allocated CPU below 100 samples and 64G "
+            "from 100 on (chr1 applies its resource multiplier), the scans, "
+            "concats and publish 64G below 100 samples and 128G from 100 on"
         ),
     )
     parser.add_argument(
@@ -922,6 +931,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "gapfill_memory": args.gapfill_memory,
         "vcf_memory": args.vcf_memory,
         "merge_memory": args.merge_memory,
+        "once_cpus": args.once_cpus,
+        "once_memory": args.once_memory,
     }
     config_path = output / "inputs" / "cohort_call.run.json"
     write_json_if_changed(config_path, run_config)
