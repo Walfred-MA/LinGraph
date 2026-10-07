@@ -573,6 +573,9 @@ Recall requires the saved alignments and calling inputs. See
 
 ## grVCF format and standard VCF conversion
 
+See the [Graph Recursive VCF (grVCF) guide](docs/LinGraph_Graph_Recursive_VCF.pdf)
+for the CIGAR and recursive representations, nested variants, and validation.
+
 ### What grVCF stores
 
 grVCF preserves information needed to describe variation within repetitive and
