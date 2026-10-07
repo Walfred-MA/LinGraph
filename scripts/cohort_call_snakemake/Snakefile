@@ -1008,7 +1008,8 @@ rule cohort_vcf_publish:
         script=ancient(str(SCRIPT_DIR / "cohort_vcf_merge.py")),
     output:
         FINAL_VCFS,
-    threads: 1
+    # One process per published category file (sv, indel, snp).
+    threads: 1 if SLURM_ENABLED else 3
     resources:
         slurm_jobs=1 if SLURM_ENABLED else 0
     params:
@@ -1018,7 +1019,7 @@ rule cohort_vcf_publish:
             (["--indel-input", SV_SMALL_VCFS[0]] if MERGE_EMIT_SMALL else []) +
             (["--snp-input", str(COHORT_SNP_VCF)] if MERGE_MODE in ("all", "snp") else [])
         ),
-        slurm=slurm_prefix("merge-cohort-publish", once_cpus(1), once_memory(MERGE_PUBLISH_MEMORY)),
+        slurm=slurm_prefix("merge-cohort-publish", once_cpus(3), once_memory(MERGE_PUBLISH_MEMORY)),
         cleanup=shlex.join(
             [item for path in (
                 ([MERGE_TMPDIR] if MERGE_MODE != "snp" else []) +

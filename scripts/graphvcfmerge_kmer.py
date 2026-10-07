@@ -27,6 +27,9 @@ DEFAULT_KMERMATCH = str(Path(__file__).resolve().with_name("KmerMatch"))
 SHORT_SEQUENCE_LIMIT = 50
 KMER_SIMILARITY = 0.5
 BATCH_BASES = 64 * 1024 * 1024
+# KmerMatch batches are not split below this size: a process spawn costs more
+# than scoring a few thousand pairs, and the batch layout never changes scores.
+KMER_BATCH_BASES = 4 * 1024 * 1024
 KMERMATCH_TASK_SECONDS = 2 * 60 * 60
 
 
@@ -422,13 +425,13 @@ def _batches(indexes, locators, workers):
         yield batch
 
 
-def _pair_batches(pairs, locators, workers):
+def _pair_batches(pairs, locators, workers, minimum=1):
     """Bound explicit pair tasks by sequence bytes and pair count."""
     total = sum(
         locators[query][1] + locators[reference][1]
         for query, reference in pairs
     )
-    budget = min(BATCH_BASES, max(1, total // (max(1, workers) * 4)))
+    budget = min(BATCH_BASES, max(minimum, total // (max(1, workers) * 4)))
     batch, bases = [], 0
     for query, reference in pairs:
         pair_bases = locators[query][1] + locators[reference][1]
@@ -473,27 +476,41 @@ def _serial_map(function, tasks):
     return [function(task) for task in tasks]
 
 
-def _closest_group_members(query, groups, members, locators, store, root,
-                           executable, size_threshold, sequence_threshold,
-                           map_batches, workers):
-    """Choose one member per group, applying the size gate before scoring."""
+def _group_candidates(query, groups, members, locators, size_threshold):
+    """Non-empty size-compatible members of the given groups, with slots."""
     import graphvcfmerge as merger
-    if not locators[query][1]:
-        return {}
-    candidates = {
+    return {
         candidate: slot for slot, indexes in groups for candidate in indexes
         if locators[candidate][1] and merger._size_similarity(
             members[query][2], members[candidate][2],
         ) >= size_threshold
     }
+
+
+def _closest_group_members(query, groups, members, locators, store, root,
+                           executable, size_threshold, sequence_threshold,
+                           map_batches, workers, pair_scores=None,
+                           prefetch=None):
+    """Choose one member per group, applying the size gate before scoring.
+
+    ``pair_scores`` holds KmerMatch scores already computed, by query and
+    then candidate (the paired score is not symmetric). If this query still
+    needs KmerMatch, ``prefetch()`` names more (query, candidate) pairs to
+    score in the same calls; their scores are added to ``pair_scores``.
+    """
+    if not locators[query][1]:
+        return {}
+    candidates = _group_candidates(
+        query, groups, members, locators, size_threshold,
+    )
+    known = {} if pair_scores is None else pair_scores.get(query, {})
     direct_pairs, kmer_pairs = [], []
     for candidate in candidates:
-        destination = (
-            direct_pairs
-            if max(locators[query][1], locators[candidate][1])
-            <= SHORT_SEQUENCE_LIMIT else kmer_pairs
-        )
-        destination.append((query, candidate))
+        if (max(locators[query][1], locators[candidate][1])
+                <= SHORT_SEQUENCE_LIMIT):
+            direct_pairs.append((query, candidate))
+        elif candidate not in known:
+            kmer_pairs.append((query, candidate))
     best = {}
 
     def record_best(scores, cutoff):
@@ -514,8 +531,31 @@ def _closest_group_members(query, groups, members, locators, store, root,
     )
     for scores in map_batches(_direct_pair_task, direct_tasks):
         record_best(scores, sequence_threshold)
+    record_best(
+        [(query, candidate, known[candidate])
+         for candidate in candidates if candidate in known],
+        KMER_SIMILARITY,
+    )
 
-    pending = iter(_pair_batches(kmer_pairs, locators, workers))
+    if kmer_pairs and prefetch is not None:
+        requested = set(kmer_pairs)
+        kmer_pairs.extend(
+            pair for pair in prefetch() if pair not in requested
+        )
+    expected = set(kmer_pairs)
+
+    def record_kmer(results):
+        for result_query, candidate, score in results:
+            if (result_query, candidate) not in expected:
+                raise ValueError("Unexpected group-bridge score pair")
+            if result_query == query:
+                record_best([(result_query, candidate, score)], KMER_SIMILARITY)
+            else:
+                pair_scores.setdefault(result_query, {})[candidate] = score
+
+    pending = iter(_pair_batches(
+        kmer_pairs, locators, workers, KMER_BATCH_BASES,
+    ))
     while True:
         tasks, directories = [], []
         try:
@@ -529,7 +569,7 @@ def _closest_group_members(query, groups, members, locators, store, root,
             if not tasks:
                 break
             for scores in map_batches(_paired_score_task, tasks):
-                record_best(scores, KMER_SIMILARITY)
+                record_kmer(scores)
         finally:
             for directory in directories:
                 shutil.rmtree(directory)
@@ -585,6 +625,8 @@ def _bridge_later_groups(partitions, members, locators, store, root, executable,
     owners = list(range(len(partitions)))
     groups = [list(indexes) for _pick, indexes, _bodies in partitions]
     active = set(range(len(partitions)))
+    # KmerMatch scores fetched ahead for later queries; dropped once used.
+    pair_scores = {}
     pass_id = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
     initial_groups = len(active)
     bridges = [
@@ -604,7 +646,37 @@ def _bridge_later_groups(partitions, members, locators, store, root, executable,
             slot = owners[slot]
         return slot
 
-    for original_slot, query in bridges:
+    def upcoming(position):
+        """KmerMatch pairs the next queries need if no group merges first.
+
+        Scores depend only on the pair, so batching them ahead with the
+        current query saves process launches without changing any choice.
+        """
+        pairs, bases = [], 0
+        ordered = sorted(active)
+        # Bounded look-ahead: each scanned query costs a pass over the groups.
+        for slot, later in bridges[position + 1:position + 1 + 64 * max(1, workers)]:
+            if (bases >= KMER_BATCH_BASES * max(1, workers)
+                    or len(pairs) >= 1024 * max(1, workers)):
+                break
+            if not locators[later][1]:
+                continue
+            first = owner(slot)
+            known = pair_scores.get(later, {})
+            for candidate in _group_candidates(
+                later, [(other, groups[other]) for other in ordered if other > first],
+                members, locators, size_threshold,
+            ):
+                if candidate in known or (
+                    max(locators[later][1], locators[candidate][1])
+                    <= SHORT_SEQUENCE_LIMIT
+                ):
+                    continue
+                pairs.append((later, candidate))
+                bases += locators[later][1] + locators[candidate][1]
+        return pairs
+
+    for position, (original_slot, query) in enumerate(bridges):
         if len(active) <= 1:
             break
         first = owner(original_slot)
@@ -614,8 +686,10 @@ def _bridge_later_groups(partitions, members, locators, store, root, executable,
             query,
             [(slot, groups[slot]) for slot in sorted(active) if slot > first],
             members, locators, store, root, executable, size_threshold,
-            sequence_threshold, map_batches, workers,
+            sequence_threshold, map_batches, workers, pair_scores,
+            functools.partial(upcoming, position),
         )
+        pair_scores.pop(query, None)
         candidates = {candidate: slot for slot, candidate in best.items()}
         selected = [(query, candidate) for candidate in best.values()]
         accepted = set()
@@ -810,7 +884,9 @@ def refine_loaded(members, sequences, row_ids, context, pooled_map=None, workers
             for result in map_batches(_direct_pair_task, direct_tasks):
                 scores.extend(result)
 
-            kmer_batches = iter(_pair_batches(kmer_pairs, locators, workers))
+            kmer_batches = iter(_pair_batches(
+                kmer_pairs, locators, workers, KMER_BATCH_BASES,
+            ))
             while True:
                 tasks, task_roots = [], []
                 for _ in range(max(1, workers) * 2):
@@ -991,7 +1067,9 @@ def refine_kmer_first(members, sequences, row_ids, context,
                     query for query, _reference, score in scores
                     if score >= sequence_threshold
                 )
-            kmer_batches = iter(_pair_batches(kmer_pairs, locators, workers))
+            kmer_batches = iter(_pair_batches(
+                kmer_pairs, locators, workers, KMER_BATCH_BASES,
+            ))
             while True:
                 tasks, task_roots = [], []
                 for _ in range(max(1, workers) * 2):

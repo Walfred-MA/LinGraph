@@ -8,7 +8,6 @@ strings are retained during chromosome sorting.
 """
 from __future__ import annotations
 
-from bisect import bisect_right
 from collections import defaultdict
 from contextlib import nullcontext
 import hashlib
@@ -905,55 +904,86 @@ def _emit_chrom(manifest, key, processes, root=None):
 def write_locus(handle, chrom, ordered, query_list, allele_list, label_groups, coverage, samples, *, progress=False):
     """Emit sorted SNP observations with identical semantics for either merge stage."""
     coverage = {sample: vcf._merge_intervals(values) for sample, values in coverage.items()}
-
-    def covered(sample, pos):
-        intervals = coverage.get(sample, ())
-        start = max(0, pos - 1)
-        index = bisect_right(intervals, (start, float('inf'))) - 1
-        return index >= 0 and intervals[index][0] <= start and pos <= intervals[index][1]
-
     missing_field = vcf._state_sample_field('.', vcf.SNP_FORMAT)
     reference_field = vcf._state_sample_field('0', vcf.SNP_FORMAT)
     chrom_token = vcf._safe_variant_token(chrom)
+    columns = defaultdict(list)
+    for column, sample in enumerate(samples):
+        columns[sample].append(column)
+    # Sites come in position order, so each sample's default genotype (reference
+    # while covered, else missing) is swept forward instead of bisected per site.
+    # A sample's current interval is the last one starting at or before
+    # max(0, pos - 1); it covers pos while pos <= its end.
+    starts, ends = [], []
+    for sample, intervals in coverage.items():
+        if sample in columns:
+            for index, (start, end) in enumerate(intervals):
+                starts.append((start, sample, index, end))
+                ends.append((end, sample, index))
+    starts.sort(key=lambda item: item[0])
+    ends.sort(key=lambda item: item[0])
+    defaults, current = [missing_field] * len(samples), {}
+    next_start = next_end = 0
+    positions, bases_column = ordered['pos'], ordered['bases']
+    bounds = [0, *(np.flatnonzero((positions[1:] != positions[:-1]) | (bases_column[1:] != bases_column[:-1]))
+                   + 1).tolist(), len(ordered)] if len(ordered) else [0]
+    positions, bases_column = positions.tolist(), bases_column.tolist()
+    record_queries, record_query_pos = ordered['query'].tolist(), ordered['query_pos'].tolist()
+    record_alleles, record_labels = ordered['allele'].tolist(), ordered['label_h'].tolist()
+    labels = {}
     last_report = time.monotonic()
-    left = count = 0
-    while left < len(ordered):
-        pos, bases = int(ordered[left]['pos']), int(ordered[left]['bases'])
-        right = left + 1
-        while right < len(ordered) and ordered[right]['pos'] == pos and ordered[right]['bases'] == bases:
-            right += 1
+    count = 0
+    for left, right in zip(bounds, bounds[1:]):
+        pos, bases = positions[left], bases_column[left]
         ref, alt = BASES[bases >> 4], BASES[bases & 15]
         observations, states, filters = defaultdict(set), defaultdict(set), set()
-        for record in ordered[left:right]:
-            sample, query, strand, kind, state, label_mode, filt = query_list[int(record['query'])]
+        for row in range(left, right):
+            sample, query, strand, kind, state, label_mode, filt = query_list[record_queries[row]]
             filters.update(filt.split(';'))
             if state != '1':
                 states[sample].add(state)
                 continue
+            label = labels.get((record_labels[row], label_mode))
+            if label is None:
+                label = labels[record_labels[row], label_mode] = label_text(
+                    record_labels[row], label_mode, label_groups)
             observations[sample].add((
-                '1', kind, '1', alt, query, f'{int(record["query_pos"])}{strand}',
-                allele_list[int(record['allele'])], label_text(record['label_h'], label_mode, label_groups),
+                '1', kind, '1', alt, query, f'{record_query_pos[row]}{strand}',
+                allele_list[record_alleles[row]], label,
             ))
         if observations:
-            fields = []
-            for sample in samples:
-                values = observations.get(sample)
-                if values:
+            start = max(0, pos - 1)
+            while next_start < len(starts) and starts[next_start][0] <= start:
+                _, sample, index, end = starts[next_start]
+                next_start += 1
+                current[sample] = index
+                for column in columns[sample]:
+                    defaults[column] = reference_field if pos <= end else missing_field
+            while next_end < len(ends) and ends[next_end][0] < pos:
+                _, sample, index = ends[next_end]
+                next_end += 1
+                if current.get(sample) == index:
+                    for column in columns[sample]:
+                        defaults[column] = missing_field
+            fields = defaults.copy()
+            for sample, sample_states in states.items():
+                if sample not in observations and ('.' in sample_states or '0' in sample_states):
+                    for column in columns.get(sample, ()):
+                        fields[column] = missing_field if '.' in sample_states else reference_field
+            for sample, values in observations.items():
+                if sample in columns:
                     values = sorted(values)
-                    fields.append('1:' + ':'.join(','.join(vcf.vcf_escape(value[index]) for value in values)
-                                                for index in range(1, len(vcf.SNP_EVENT_FIELDS))))
-                else:
-                    sample_states = states.get(sample, ())
-                    fields.append(missing_field if '.' in sample_states else reference_field
-                                  if '0' in sample_states or covered(sample, pos) else missing_field)
+                    field = '1:' + ':'.join(','.join(vcf.vcf_escape(value[index]) for value in values)
+                                            for index in range(1, len(vcf.SNP_EVENT_FIELDS)))
+                    for column in columns[sample]:
+                        fields[column] = field
             filt = 'PASS' if 'PASS' in filters else ';'.join(sorted(filters - {'.', ''})) or '.'
             # REF is fixed by the position: (position, ALT) names the site.
             handle.write('\t'.join([chrom, str(pos), f'S_{chrom_token}_{pos}_{alt}',
                                     ref, alt, '.', filt, f'NSUP={len(observations)}', vcf.SNP_FORMAT, *fields]) + '\n')
             count += 1
-        left = right
         if progress and count % 10000 == 0 and time.monotonic() - last_report >= 10:
-            print(f'[merge:snp] {chrom}: wrote {count:,} sites; {left:,}/{len(ordered):,} observations',
+            print(f'[merge:snp] {chrom}: wrote {count:,} sites; {right:,}/{len(ordered):,} observations',
                   file=sys.stderr, flush=True)
             last_report = time.monotonic()
     return count

@@ -56,6 +56,7 @@ import shutil
 import garbage
 import signal
 import struct
+import queue
 import threading
 import types
 
@@ -76,7 +77,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter, OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 import dataclasses
 from dataclasses import dataclass
@@ -756,9 +757,11 @@ def run_sort(input_path: str, output_path: str, keys: Sequence[str]) -> None:
     # under a UTF-8 locale GNU sort orders punctuation differently, which
     # silently misaligns the rowmeta/results group readers.
     environment = dict(os.environ, LC_ALL="C")
+    # Spill next to the output, not to a small node-local /tmp.
+    spill = os.path.dirname(os.path.abspath(output_path))
     with open(output_path, "w") as out_h:
         subprocess.run(
-            ["sort", "-t", "\t", *keys, input_path],
+            ["sort", "-t", "\t", "-T", spill, *keys, input_path],
             check=True, stdout=out_h, env=environment,
         )
 
@@ -2999,9 +3002,12 @@ def _merge_intervals(intervals: Sequence[Tuple[int, int]]) -> List[Tuple[int, in
 def _covered(
     intervals: Sequence[Tuple[int, int]], pos: int, end: int,
 ) -> bool:
+    """``intervals`` are sorted and disjoint (``_merge_intervals``), so only
+    the last interval starting at or before the span can contain it."""
     start0 = max(0, int(pos) - 1)
     end0 = max(start0 + 1, int(end))
-    return any(left <= start0 and end0 <= right for left, right in intervals)
+    index = bisect.bisect_right(intervals, (start0, math.inf)) - 1
+    return index >= 0 and end0 <= intervals[index][1]
 
 
 def _state_sample_field(genotype: str, output_format: str = SV_FORMAT) -> str:
@@ -5013,6 +5019,9 @@ _FAST_GIANT_SAMPLES_FACTOR = 2
 # It is handled after ordinary clusters, one at a time, using the disk-backed
 # sequence view.  This bounds both task pickling and concurrent k-mer indexes.
 _FAST_GIANT_INSERTION_BASES = 100_000_000
+# Giant clusters refined at once (parent threads sharing the worker pool),
+# at most one per 8 workers.
+_FAST_GIANT_CONCURRENT = 4
 
 
 def _fast_defer_cluster(
@@ -7496,6 +7505,7 @@ def _fast_process_chrom_spooled(
     )
     refine_tasks = []
     giant_jobs: list = []
+    giant_costs: list = []
     pre_skipped_clusters = 0
     pre_skipped_members = 0
     for svtype, bundle in (
@@ -7533,6 +7543,7 @@ def _fast_process_chrom_spooled(
                 # Giant insertions stay parent-driven (pooled member
                 # alignments); tuples are built lazily when processed.
                 giant_jobs.append((svtype, matrix_path, rows, ranges))
+                giant_costs.append(cost)
                 continue
             total_cost += cost
             small.append((cost, rows))
@@ -7608,12 +7619,131 @@ def _fast_process_chrom_spooled(
             f"their largest event is below {minsvsize}bp",
             file=sys.stderr,
         )
-    # Ordinary clusters first, across the whole pool ...
+    # Giant clusters start first, a few at once on parent threads sharing the
+    # pool; ordinary batches fill the workers they leave idle.  Each giant's
+    # groups are spooled after the ordinary ones, in giant order, as before.
+    pool = getattr(pooled_imap, "pool", None)
+    giant_spools = [
+        os.path.join(spool_dir, f"giant-{index:06d}.pkl")
+        for index in range(len(giant_jobs))
+    ]
+
+    def refine_giant(giant_index):
+        svtype, g_matrix_path, g_rows, g_ranges = giant_jobs[giant_index]
+        print(
+            f"[merge:fast] {chrom}: refining giant {svtype} cluster "
+            f"{giant_index + 1}/{len(giant_jobs)} "
+            f"({int(g_rows.shape[0])} member(s)) with parallel "
+            "alignment-first refinement and sparse KmerMatch fallback",
+            file=sys.stderr,
+        )
+        g_matrix = np.load(g_matrix_path, mmap_mode="r")
+        members = _fast_member_tuples(g_matrix, g_rows, g_ranges, svtype)
+        with open(giant_spools[giant_index], "wb") as handle:
+            for rep, chosen in _fast_refine_giant(
+                svtype, members, pooled_map, pooled_imap_unordered, workers,
+            ):
+                pickle.dump((rep, chosen), handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def refine_giants():
+        """Up to _FAST_GIANT_CONCURRENT giants at once while their insertion
+        bases stay within _FAST_GIANT_INSERTION_BASES (one above runs alone).
+        The first failure is raised at once; daemon threads mean a failed
+        merge never waits on the other giants' pool calls."""
+        limit = (
+            max(1, min(_FAST_GIANT_CONCURRENT, workers // 8))
+            if pool is not None else 1
+        )
+        state = {"load": 0, "running": 0, "error": None}
+        changed = threading.Condition()
+
+        def run(giant_index, cost):
+            try:
+                refine_giant(giant_index)
+            except BaseException as error:
+                with changed:
+                    state["error"] = state["error"] or error
+            finally:
+                with changed:
+                    state["load"] -= cost
+                    state["running"] -= 1
+                    changed.notify_all()
+
+        for giant_index, cost in enumerate(giant_costs):
+            with changed:
+                changed.wait_for(lambda: state["error"] is not None or not state["running"] or (
+                    state["running"] < limit
+                    and state["load"] + cost <= _FAST_GIANT_INSERTION_BASES
+                ))
+                if state["error"] is not None:
+                    break
+                state["load"] += cost
+                state["running"] += 1
+            threading.Thread(target=run, args=(giant_index, cost), daemon=True).start()
+        with changed:
+            changed.wait_for(lambda: state["error"] is not None or not state["running"])
+        if state["error"] is not None:
+            raise state["error"]
+
+    giant_driver = None
+    giant_failure: list = []
+    if giant_jobs:
+        if pool is not None:
+            def drive_giants():
+                try:
+                    refine_giants()
+                except BaseException as error:
+                    giant_failure.append(error)
+
+            giant_driver = threading.Thread(target=drive_giants, daemon=True)
+            giant_driver.start()
+        else:
+            refine_giants()
+    # ... then ordinary clusters, at most one queued batch per worker so the
+    # giants' pooled alignments never wait behind the whole batch list.
     clusters_done = 0
     refine_progress = time.monotonic()
-    refine_results = pooled_imap_unordered(
-        _fast_refine_task, refine_tasks,
-    )
+    if pool is not None and giant_jobs:
+        refined_queue: "queue.Queue" = queue.Queue()
+        pending_tasks = iter(refine_tasks)
+
+        def submit_next():
+            task = next(pending_tasks, None)
+            if task is not None:
+                pool.apply_async(
+                    _fast_refine_task, (task,), callback=refined_queue.put,
+                    error_callback=lambda error: refined_queue.put(error),
+                )
+
+        for _ in range(max(1, workers)):
+            submit_next()
+
+        class _RefinedResults:
+            def next(self, timeout):
+                # A failed giant stops the chromosome without waiting for the
+                # remaining ordinary batches.
+                deadline = time.monotonic() + timeout
+                while True:
+                    if giant_failure:
+                        raise giant_failure[0]
+                    try:
+                        result = refined_queue.get(timeout=min(
+                            1.0, max(0.0, deadline - time.monotonic()),
+                        ))
+                        break
+                    except queue.Empty:
+                        if time.monotonic() >= deadline:
+                            raise mp.TimeoutError from None
+                if isinstance(result, BaseException):
+                    raise result
+                submit_next()
+                return result
+
+        refine_results = _RefinedResults()
+    else:
+        refine_results = pooled_imap_unordered(
+            _fast_refine_task, refine_tasks,
+        )
     with open(refined_spool_path, "wb") as refined_out:
         recovered_spool = context.get("recovered_spool")
         if recovered_spool:
@@ -7652,25 +7782,19 @@ def _fast_process_chrom_spooled(
                     file=sys.stderr,
                 )
                 refine_progress = now
-        # ... then each giant cluster one by one, parallel inside.
-        for giant_index, (
-            svtype, g_matrix_path, g_rows, g_ranges,
-        ) in enumerate(giant_jobs):
-            print(
-                f"[merge:fast] {chrom}: refining giant {svtype} cluster "
-                f"{giant_index + 1}/{len(giant_jobs)} "
-                f"({int(g_rows.shape[0])} member(s)) with parallel "
-                "alignment-first refinement and sparse KmerMatch fallback",
-                file=sys.stderr,
-            )
-            g_matrix = np.load(g_matrix_path, mmap_mode="r")
-            members = _fast_member_tuples(
-                g_matrix, g_rows, g_ranges, svtype,
-            )
-            for rep, chosen in _fast_refine_giant(
-                svtype, members, pooled_map, pooled_imap_unordered, workers,
-            ):
-                spool_group(refined_out, svtype, rep, chosen)
+        if giant_driver is not None:
+            giant_driver.join()
+            if giant_failure:
+                raise giant_failure[0]
+        for giant_index, path in enumerate(giant_spools):
+            with open(path, "rb") as handle:
+                while True:
+                    try:
+                        rep, chosen = pickle.load(handle)
+                    except EOFError:
+                        break
+                    spool_group(refined_out, giant_jobs[giant_index][0], rep, chosen)
+            os.remove(path)
     refined_descriptors.sort(key=lambda entry: (entry[0], entry[1]))
     checkpoints.commit(spool_dir, "refined", {
         "descriptors": refined_descriptors, "template_groups": template_groups,
@@ -8999,26 +9123,31 @@ def _fast_emit_refined(
                           _FAST_DUP_STATE["exact"], pooled_imap, workers)
         if _FAST_DUP_STATE.get("exact") is not None else {}
     )
-    # Bound both queued inputs and completed full-width VCF rows to one task
-    # per worker.  Results are consumed in task order and written immediately.
+    # Bound both queued inputs and completed full-width VCF rows to two tasks
+    # per worker.  Results are consumed in task order and written immediately;
+    # the next task is prepared while the workers run, not after a window.
+    pool = getattr(pooled_imap, "pool", None)
+    in_flight: deque = deque()
     with open(refined_spool_path, "rb") as refined_in, open(
         part_work_path, "w",
     ) as main_out, open(small_sink_path, "w") as small_out:
         finished = False
-        while not finished:
-            task_window = []
-            window_metadata = {}
-            for _ in range(max(1, workers)):
+        while True:
+            while not finished and len(in_flight) < 2 * max(1, workers):
                 prepared = next_emit_batch(refined_in)
                 if prepared is None:
                     finished = True
                     break
-                task_args, metadata = prepared
-                task_window.append(task_args)
-                window_metadata.update(metadata)
-            if not task_window:
+                task_args, window_metadata = prepared
+                in_flight.append((
+                    pool.apply_async(_fast_emit_task, (task_args,))
+                    if pool is not None else _fast_emit_task(task_args),
+                    window_metadata,
+                ))
+            if not in_flight:
                 break
-            for batch_rows in pooled_imap(_fast_emit_task, task_window):
+            result, window_metadata = in_flight.popleft()
+            for batch_rows in [result.get() if pool is not None else result]:
                 for emit_index, row, path_info, extra in batch_rows:
                     row_id, svtype, rep = window_metadata[emit_index]
                     size = rep[2]
@@ -9236,6 +9365,7 @@ def _fast_pool_helpers(pool):
             return pool.imap_unordered(task, items)
         return iter([task(item) for item in items])
 
+    pooled_imap.pool = pool   # emission keeps its own rolling task queue
     return pooled_map, pooled_imap, pooled_imap_unordered
 
 
@@ -10420,6 +10550,8 @@ def merge_sample_vcfs_fast(
             if pool is not None and len(items) > 1:
                 return pool.imap_unordered(task, items)
             return iter([task(item) for item in items])
+
+        pooled_imap.pool = pool
 
         try:
             print(

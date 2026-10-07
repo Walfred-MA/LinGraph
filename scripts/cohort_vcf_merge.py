@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import heapq
 import json
 from pathlib import Path
 import pickle
@@ -153,10 +154,12 @@ def combine(paths, output):
                 seen.add(line)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    contig_order = sv._contig_order(metadata)
+    if len(paths) == 1 and _combine_sorted(paths[0], output, metadata, samples, contig_order):
+        return
     import tempfile
     with tempfile.TemporaryDirectory(prefix='combine-vcf-', dir=output.parent) as directory:
         body, ordered = Path(directory)/'rows.tsv', Path(directory)/'sorted.tsv'
-        contig_order = sv._contig_order(metadata)
         with body.open('w') as handle:
             for path, names in zip(paths, file_samples):
                 indexes = {name: index for index, name in enumerate(names)}
@@ -176,6 +179,83 @@ def combine(paths, output):
             with ordered.open() as source:
                 for raw in source:
                     handle.write(raw.split('\t', 1)[1])
+
+
+# A merged VCF arrives in (or close to) publication order: its rows are copied
+# in one pass, or its few sorted runs k-way merged, instead of the full sort.
+_SORTED_RUNS_LIMIT = 64
+
+
+class _Unsortable(Exception):
+    """A row only the full parse and sort reproduces (or reports) exactly."""
+
+
+def _combine_sorted(path, output, metadata, samples, contig_order):
+    """Write one file's rows in the order combine()'s external sort gives:
+    contig rank, CHROM, POS, REF, ALT, ID, then the whole line (sort's last
+    resort), compared as bytes like LC_ALL=C.  False when the full sort is
+    needed (odd rows, too many runs, gzip input)."""
+    if str(path).endswith('.gz') or str(output).endswith('.gz'):
+        return False
+    ranks = {name.encode(): rank for name, rank in contig_order.items()}
+    unknown, columns = len(contig_order), 9 + len(samples)
+
+    def key(line):
+        fields = line.split(b'\t', 6)
+        if len(fields) < 7 or b'\r' in line or line.count(b'\t') != columns - 1:
+            raise _Unsortable
+        try:
+            pos = int(fields[1])
+        except ValueError:
+            raise _Unsortable from None
+        if b'%d' % pos != fields[1]:
+            raise _Unsortable  # the full parse rewrites POS
+        return ranks.get(fields[0], unknown), fields[0], pos, fields[3], fields[4], fields[2], line
+
+    def rows(source, start=0, end=None):
+        """(offset, line) of each data row in [start, end)."""
+        source.seek(start)
+        offset = start
+        while end is None or offset < end:
+            raw = source.readline()
+            if not raw:
+                return
+            offset += len(raw)
+            if raw.startswith(b'#') or not raw.strip():
+                continue
+            yield offset - len(raw), raw[:-1] if raw.endswith(b'\n') else raw
+
+    def keyed(start, end):
+        with open(path, 'rb') as source:
+            for _offset, line in rows(source, start, end):
+                yield key(line)
+
+    try:
+        with snp.atomic_output(output) as handle:
+            sv.write_vcf_header(handle, metadata, samples, 'small')
+            handle.flush()
+            out = handle.buffer
+            body = out.tell()
+            starts, previous = [], None
+            with open(path, 'rb') as source:
+                for offset, line in rows(source):
+                    current = key(line)
+                    if previous is None or current < previous:
+                        starts.append(offset)
+                        if len(starts) > _SORTED_RUNS_LIMIT:
+                            raise _Unsortable
+                    if len(starts) == 1:
+                        out.write(line + b'\n')
+                    previous = current
+            if len(starts) > 1:
+                out.seek(body)
+                out.truncate()
+                ends = starts[1:] + [None]
+                for current in heapq.merge(*(keyed(start, end) for start, end in zip(starts, ends))):
+                    out.write(current[-1] + b'\n')
+    except _Unsortable:
+        return False
+    return True
 
 
 def cleanup_merge_directories(output, directories, *, protected=()):
@@ -256,8 +336,12 @@ def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
     if any(path is None or not Path(path).is_file() for path in sources):
         raise ValueError(f'{mode}: missing merged input VCFs: {sources}')
     if mode in ('svindel', 'all'):
-        for source, target in zip(sources, targets):
-            combine([source], target)
+        # One process per category file: each combine is a separate stream.
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=len(targets)) as pool:
+            for done in [pool.submit(combine, [source], target)
+                         for source, target in zip(sources, targets)]:
+                done.result()
     else:
         combine(sources, targets[0])
     if sample_vcfs is None:

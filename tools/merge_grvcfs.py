@@ -10,9 +10,11 @@ and writes OUTPUT/cohort.sv.vcf, cohort.indel.vcf and cohort.snp.vcf.
       moved onto the representative's breakpoint (needs the assemblies,
       NAME FASTA [FAI] per line, and --reference-fasta).
 
-The merge runs as stages, in order: SV scan, SV merge per chromosome, SV
-concat, SNP prepare, SNP merge per chromosome, SNP concat, publish (stages a
-mode does not need are skipped). Each stage is its own process:
+The merge runs as stages: SV scan, SNP prepare, SV and SNP merge per
+chromosome, SV concat, SNP concat, publish (stages a mode does not need are
+skipped). SNP chromosomes share the SV chromosomes' job queue; with --exact
+each waits for its own SV chromosome (which writes its realignment records).
+Each stage is its own process:
   default   locally, one after another (chromosomes one at a time), -t workers
   --slurm   one Slurm job per stage; run-once stages get -t CPUs and
             --slurm-memory (default 64G below 100 input grVCFs, 128G from 100
@@ -30,7 +32,7 @@ Examples:
       --slurm-account ACCOUNT --slurm-partition PARTITION
 """
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import json
 from pathlib import Path
@@ -219,29 +221,88 @@ class Stages:
                   'chromosome(s) done before', file=sys.stderr, flush=True)
         if not self.args.slurm:
             for number, chrom in enumerate(pending, 1):
-                what = f'{stage} {number}/{len(pending)} {label(chrom, chrom)}'
-                if self._run(self._command(stage, self.args.threads, chrom), what):
+                if self._job(stage, chrom, number, len(pending), label(chrom, chrom)):
                     raise RuntimeError(f'{stage} failed for {label(chrom, chrom)}; see the messages above')
-                self._marker(stage, chrom).touch()
             return
 
         def submit(item):
             number, chrom = item
-            cpus, memory = self._resources(stage, label(chrom, chrom))
-            command = self._slurm(self._command(stage, cpus, chrom), cpus, memory,
-                                  f'merge-{stage}-{number}')
-            code = self._run(command, f'{stage} {number}/{len(pending)} {label(chrom, chrom)}')
-            if not code:
-                self._marker(stage, chrom).touch()
-            return label(chrom, chrom), code
+            return label(chrom, chrom), self._job(stage, chrom, number, len(pending), label(chrom, chrom))
 
         if not pending:
             return
         with ThreadPoolExecutor(min(self.args.slurm_jobs, len(pending))) as pool:
             failed = [chrom for chrom, code in pool.map(submit, enumerate(pending, 1)) if code]
+        self._raise_failed(stage, failed)
+
+    def _job(self, stage, chrom, number, total, name):
+        """One chromosome job (a Slurm job with --slurm); its exit code."""
+        if self.args.slurm:
+            cpus, memory = self._resources(stage, name)
+            command = self._slurm(self._command(stage, cpus, chrom), cpus, memory,
+                                  f'merge-{stage}-{number}')
+        else:
+            command = self._command(stage, self.args.threads, chrom)
+        code = self._run(command, f'{stage} {number}/{total} {name}')
+        if not code:
+            self._marker(stage, chrom).touch()
+        return code
+
+    def _raise_failed(self, stage, failed):
         if failed:
             raise RuntimeError(f'{stage} failed for {len(failed)} chromosome(s): {", ".join(failed[:8])}; '
-                               f'see {self.output / "slurm_logs"}; repeat the command to rerun only these')
+                               + (f'see {self.output / "slurm_logs"}; ' if self.args.slurm else 'see the messages above; ')
+                               + 'repeat the command to rerun only these')
+
+    def each_with_snps(self, sv_chroms, snp_chroms, names, after):
+        """The SV and SNP chromosome stages together. A SNP chromosome starts
+        once the SV chromosome named by ``after`` (SNP key -> SV chromosome:
+        --exact realignment records) is done, the others right away. One queue,
+        SV chromosomes first: locally one job at a time (as before), with
+        --slurm up to --slurm-jobs jobs."""
+        sv_pending = [chrom for chrom in sv_chroms if not self._marker('sv-chrom', chrom).is_file()]
+        snp_pending = [key for key in snp_chroms if not self._marker('snp-chrom', key).is_file()]
+        for stage, chroms, pending in (('sv-chrom', sv_chroms, sv_pending), ('snp-chrom', snp_chroms, snp_pending)):
+            if len(pending) < len(chroms):
+                print(f'[merge_grvcfs] {stage}: {len(chroms) - len(pending)} of {len(chroms)} '
+                      'chromosome(s) done before', file=sys.stderr, flush=True)
+        if not sv_pending and not snp_pending:
+            return
+        numbers = {('sv-chrom', chrom): number for number, chrom in enumerate(sv_pending, 1)}
+        numbers.update({('snp-chrom', key): number for number, key in enumerate(snp_pending, 1)})
+        totals = {'sv-chrom': len(sv_pending), 'snp-chrom': len(snp_pending)}
+        jobs = max(1, min(self.args.slurm_jobs, len(sv_pending) + len(snp_pending)))
+        pool = ThreadPoolExecutor(jobs if self.args.slurm else 1)
+        running, waiting, failed = {}, {}, {'sv-chrom': [], 'snp-chrom': []}
+
+        def start(stage, chrom):
+            name = names.get(chrom, chrom) if stage == 'snp-chrom' else chrom
+            running[pool.submit(self._job, stage, chrom, numbers[stage, chrom], totals[stage], name)] = (stage, chrom)
+
+        try:
+            for chrom in sv_pending:
+                start('sv-chrom', chrom)
+            for key in snp_pending:
+                needed = after.get(key)
+                if needed in sv_pending:
+                    waiting.setdefault(needed, []).append(key)
+                else:
+                    start('snp-chrom', key)
+            while running:
+                finished, _ = wait(running, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    stage, chrom = running.pop(future)
+                    blocked = waiting.pop(chrom, []) if stage == 'sv-chrom' else []
+                    if future.result():
+                        failed[stage].append(chrom)
+                        failed['snp-chrom'].extend(names.get(key, key) for key in blocked)
+                        continue
+                    for key in blocked:
+                        start('snp-chrom', key)
+        finally:
+            pool.shutdown()
+        for stage in ('sv-chrom', 'snp-chrom'):
+            self._raise_failed(stage, [names.get(chrom, chrom) for chrom in failed[stage]])
 
 
 def main(argv=None):
@@ -267,14 +328,26 @@ def main(argv=None):
     stages = Stages(args, plan, plan_path)
     if mode != 'snp':
         stages.once('sv-scan')
-        stages.each('sv-chrom', cohort_vcf_merge.sv_chroms(plan))
-        stages.once('sv-concat')
     if mode in ('all', 'snp'):
+        # Needs only the scan's raw SNP manifest; insertion SNPs come at concat.
         stages.once('snp-prepare')
         manifest = Path(plan['root']) / 'snp_shards' / 'manifest.json'
         names = {key: str(value.get('chrom', key)) if isinstance(value, dict) else str(value)
                  for key, value in json.loads(manifest.read_text())['chroms'].items()}
+    if mode == 'all':
+        sv_chroms = cohort_vcf_merge.sv_chroms(plan)
+        # --exact: a SNP chromosome applies the realignment records its SV
+        # chromosome writes.
+        after = ({key: name for key, name in names.items() if name in sv_chroms}
+                 if plan['exact_query_paths'] else {})
+        stages.each_with_snps(sv_chroms, cohort_vcf_merge.snp_chroms(plan), names, after)
+        stages.once('sv-concat')
+    elif mode != 'snp':
+        stages.each('sv-chrom', cohort_vcf_merge.sv_chroms(plan))
+        stages.once('sv-concat')
+    else:
         stages.each('snp-chrom', cohort_vcf_merge.snp_chroms(plan), names)
+    if mode in ('all', 'snp'):
         stages.once('snp-concat')
     stages.once('publish')
     targets = cohort_vcf_merge.output_paths(output, mode)
