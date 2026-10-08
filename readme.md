@@ -17,6 +17,7 @@ information in grVCF and can export cohort calls as a pangenome graph.
 7. [grVCF format and standard VCF conversion](#grvcf-format-and-standard-vcf-conversion)
 8. [Build a pangenome GFA from grVCF](#build-a-pangenome-gfa-from-grvcf)
 9. [Benchmark trio consistency](#benchmark-trio-consistency)
+10. [Questions and answers](#questions-and-answers)
 
 ## Workflow overview
 
@@ -172,7 +173,8 @@ Input rules:
 - **`CHM13_h1` and `HG38_h1` can keep their native contig names and masking.**
   They still need matching indexes, created with `samtools faidx reference.fa`.
 - Calling checks the first sequence and index entry. Run preparation explicitly
-  before calling; the calling commands do not prepare assemblies.
+  before calling; otherwise calling stops, unless `--force-prepare` is given
+  (see [the input format question](#why-is-a-specific-input-assembly-format-required-and-what-is-it)).
 
 See [assembly preparation](tools/assembly_preparation.md) for more options.
 
@@ -808,6 +810,133 @@ whether child variants have a match in either parent:
 
 Each guide explains requirements, coverage filtering, commands, and outputs.
 Use calls made against the same reference and retain their coverage headers.
+
+## Questions and answers
+
+### Why is a specific input assembly format required, and what is it?
+
+Each haplotype is one uncompressed FASTA with an adjacent `.fai` index, and
+every contig is named `SAMPLE#N#CONTIG` (for example `HG002#1#chr1` for
+`HG002_h1`); see [Prepare assembly FASTAs](#prepare-assembly-fastas). The
+prefix keeps every contig name unique across all assemblies of a run, so each
+call can always be traced back to its contig in the original assembly; plain
+names such as `chr1` would collide between assemblies. Assemblies must also be
+soft-masked, which helps the aligners.
+
+If inputs are not in this format, LinGraph stops and prints a preparation
+command for each one. The lazy mode, `--force-prepare`, instead prepares
+formatted copies in `OUTPUT/PreparedAssemblies/` and deletes them after the run
+finishes. It needs extra temporary disk space for a full copy of every
+assembly it prepares. Use it for a few samples; for a large cohort, we highly
+recommend preparing the assemblies in the correct format beforehand with
+`tools/prepare_assemblies.py`.
+
+### What are local graphs, and how are they made?
+
+Local graphs apply divide and conquer to make graph building and SV calling
+faster and simpler. The genome is divided into blocks; each block's sequences
+from all assemblies form one small local graph, which is built, aligned and
+called on its own, and the results are joined back on the reference.
+
+Two blocking profiles are provided in `windowprofs/` (both CHM13 coordinates,
+used with `-b BED --bed-grouped`):
+
+1. **Balanced blocks** (`balanceblocks.bed`): chosen by automatic code to
+   optimize the local alignments and avoid breakpoints in repeats. This is
+   better for SV calling (about 0.1-0.2% fewer errors, a 10-20% improvement).
+   The supplied Win50KGraph cache uses these blocks.
+2. **Gene blocks** (`geneblocks.bed`): adjusted to gene coordinates, which
+   helps downstream gene-based annotation, for example by genotyping tools
+   such as ctyper. **Highly recommended when building a graph.** SV calling
+   is slightly less accurate because block breakpoints can fall in repeats,
+   but the additional errors are generally in tandem repeats, not in gene
+   bodies.
+
+### How long does a run take?
+
+About **1 hour per haplotype on 64 cores** for individual VCF calling. Merging
+depends on the cohort size but usually adds 10-20% of the individual calling
+time. With `--slurm`, haplotypes are called in parallel (up to `--slurm-jobs`,
+default 20, at once).
+
+### How much memory is used, and how do I increase it after an out-of-memory failure?
+
+Locally, LinGraph uses the memory of the machine. With `--slurm`:
+
+| Job | Default memory | Increase with |
+| --- | --- | --- |
+| `individual`: one job per haplotype (and the `--merge` job) | 64G | `--slurm-memory` |
+| `graph`: per-sample matching, lifting, graph CIGAR, gap filling, VCF | 32G each | `--match-memory`, `--genomelift-memory`, `--graphcigar-memory`, `--gapfill-memory`, `--vcf-memory` |
+| `graph`: cohort extraction and local templates | 64G | `--extraction-memory` |
+| `graph`: run-once merge scans, concats, publish, GFA export | 64G below 100 sample VCFs, 128G from 100 on | `--slurm-memory` |
+| `graph`: per-chromosome merge jobs | 2G per CPU below 100 samples, 64G from 100 on (chr1 doubled) | `--merge-memory` |
+| `graph`: novel-locus discovery | 128G | `--novel-slurm-memory` |
+
+To find the failed job, check `sacct -j JOBID` (state `OUT_OF_MEMORY`) and the
+logs under `OUTPUT/lingraph/`. Then repeat the same command with the larger
+memory option: finished stages are reused and only the failed ones run again.
+See `--help-all` for every per-stage option.
+
+### How do I output versions of the graph with different references as the backbone?
+
+Run `graph` again with the same `-G`, a different `-r` (any haplotype in the
+cohort list) and a new `-O`, with `--make-graph`. Saved local graph alignments
+are reused; only the reference-dependent steps run again. See
+[Choose or change the reference/backbone](#choose-or-change-the-referencebackbone).
+
+### How are non-reference sequences represented in the VCF?
+
+At three levels:
+
+1. **Alternatives**: novel genes found in open-source assemblies, supplied
+   with `--alternative` (for example `data/alternatives.fa`).
+2. **Novel loci**: large insertions found in the cohort, usually novel
+   immune-related genes.
+3. **Insertions**: called dynamically in each sample. Variants inside an
+   inserted sequence are nested rows whose `CHROM` is the insertion's row ID.
+
+### How are duplicated genes represented?
+
+By a primary alignment, reported as an insertion, and an alternative alignment
+to the closest reference gene.
+
+### How do I convert grVCF to a normal VCF?
+
+Use `tools/grvcf_to_vcf.py`; see [Convert to standard VCF](#convert-to-standard-vcf).
+
+### How do I add my own samples to known VCFs?
+
+1. Call your samples with `individual`, using the same graph and reference as
+   the known VCFs.
+2. Split the known merged grVCFs (exact or CIGAR version) into one grVCF per
+   sample; each sample's own call is rebuilt from the CIGAR in its sample
+   fields:
+
+   ```bash
+   python3 tools/convert_merged_grvcf.py split \
+     -v known/cohort.sv.vcf known/cohort.indel.vcf known/cohort.snp.vcf \
+     -r reference.fa -o known_individual
+   ```
+
+3. Merge the split grVCFs together with your samples' grVCFs into new merged
+   grVCFs:
+
+   ```bash
+   python3 tools/merge_grvcfs.py -I all_vcfs.list -O merged_new -t 16
+   ```
+
+See [the tools guide](tools/README.md#split-merged-grvcfs-or-convert-between-exact-and-cigar)
+for `--exact` merging and other options.
+
+### Which regions are not included?
+
+1. Regions with N gaps.
+2. The edges of scaffolds.
+3. Constitutive heterochromatin and other simple repeats longer than 1 Mb.
+
+Check each haplotype's coverage report, `samples/NAME/NAME.coverage.summary.tsv`,
+with the uncovered intervals in `NAME.coverage.missing_reference.bed` and
+`NAME.coverage.missing_query.bed`.
 
 ## Repository layout
 
