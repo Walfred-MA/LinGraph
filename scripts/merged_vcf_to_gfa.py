@@ -39,6 +39,9 @@ def build_parser():
     parser.add_argument('-r', '--reference-fasta', help='backbone FASTA; default: GRAPH/inputs/reference_alternatives_novels.fa')
     parser.add_argument('--reference-haplotype', help='selected backbone sample/haplotype; inferred from source metadata when available')
     parser.add_argument('--reference-fai', help='optional index for --reference-fasta')
+    parser.add_argument('--no-preload-reference', dest='preload_reference', action='store_false',
+                        help='read reference/alternative segments from FASTA windows instead '
+                             'of loading their sequences once into memory shared by GFA writers')
     parser.add_argument('--local-reference-templates', action='append', default=[], metavar='FASTA',
                         help='fallback templates freshly lifted to this backbone; may be repeated')
     parser.add_argument('-a', '--alternatives-fasta', action='append', nargs='+', default=[],

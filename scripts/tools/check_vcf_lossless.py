@@ -160,7 +160,7 @@ def read_header(vcf):
 
 class Run:
     __slots__ = ('contig', 'qs', 'qe', 'qstrand', 'path', 'rs', 're', 'rstrand',
-                 'categories', 'mappings', 'events')
+                 'categories', 'mappings', 'events', 'last')
 
     def __init__(self, query, reference, category):
         self.contig, self.qs, self.qe, self.qstrand = query
@@ -168,6 +168,7 @@ class Run:
         self.categories = Counter([category])
         self.mappings = 1
         self.events = []
+        self.last = (category, self.rs, self.re)
 
     def extend(self, query, reference, category):
         contig, qs, qe, qstrand = query
@@ -176,6 +177,15 @@ class Run:
             return False
         if qs != self.qe:
             return False
+        if category == 'INSERTION' and self.last == ('DELETION', rs, re_):
+            # A replacement listed as DELETION + INSERTION of one reference
+            # span: the deletion already took the reference bases, the
+            # insertion adds only query bases (its row spans both lines).
+            self.qe = qe
+            self.categories[category] += 1
+            self.mappings += 1
+            self.last = (category, rs, re_)
+            return True
         if qstrand == rstrand:
             if rs != self.re:
                 return False
@@ -187,6 +197,7 @@ class Run:
         self.qe = qe
         self.categories[category] += 1
         self.mappings += 1
+        self.last = (category, rs, re_)
         return True
 
 
@@ -345,14 +356,18 @@ def assign(runs, events, query, stats, unassigned):
         index = bisect_right(starts.get(contig, []), q0) - 1
         chosen = None
         # Runs are disjoint on the query, but a boundary point (e.g. a pure
-        # deletion) can touch two; the reference interval decides.
+        # deletion) can touch two; the reference interval decides, then the
+        # QUERYCOORD strand (at a strand switch both runs can hold the span).
         for probe in (index, index - 1, index + 1):
             if 0 <= probe < len(candidates):
                 run = candidates[probe]
                 if (run.qs <= q0 and q1 <= run.qe and run.path == chrom
                         and run.rs <= r0 and r1 <= run.re):
-                    chosen = run
-                    break
+                    if chosen is None:
+                        chosen = run
+                    if run.qstrand == qstrand:
+                        chosen = run
+                        break
         if chosen is None:
             stats[f'unassigned_{kind}_observations'] += 1
             unassigned.append(event)

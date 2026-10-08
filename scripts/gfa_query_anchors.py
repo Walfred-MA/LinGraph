@@ -135,6 +135,7 @@ def interval_chunks(reader, contig, start, end, strand):
 
 
 def scaffold_pool(workers):
-    # Each worker exits after one batch so its FASTA index and allocator pages
-    # are returned to the operating system immediately.
-    return multiprocessing.get_context('spawn').Pool(workers, maxtasksperchild=1)
+    # Reuse workers across bounded batches. Restarting a Python interpreter
+    # for every 2,048 SNPs spends much of extraction time on process startup.
+    # Periodic recycling still releases retained allocator pages.
+    return multiprocessing.get_context('spawn').Pool(workers, maxtasksperchild=32)

@@ -2534,12 +2534,15 @@ def _drop_dup_snp_observations(line: str, spans) -> Optional[str]:
     return "\t".join(fields)
 
 
-def _fast_load_exact_coverage(subfolder: str) -> Optional[Dict[int, "np.ndarray"]]:
+def _fast_load_exact_coverage(subfolder: str) -> Optional[Dict[Tuple[int, str], "np.ndarray"]]:
+    """{(sample, query strand): intervals}; an older scan's keys have no
+    strand ("") and cover both strands."""
     path = os.path.join(subfolder, _EXACT_COVERAGE_NAME)
     if not os.path.isfile(path):
         return None
     with np.load(path) as data:
-        return {int(key): data[key] for key in data.files}
+        return {(int(key.rstrip("+-")), key[len(key.rstrip("+-")):]): data[key]
+                for key in data.files}
 
 
 def _vcf_meta_quote(value: str) -> str:
@@ -3375,7 +3378,9 @@ def _fast_scan_input_task(
     by_chrom: Dict[str, bytearray] = {}
     exact = bool(context.get("exact"))
     file_samples = {sample_names[index]: index for index in sample_indexes}
-    exact_intervals: Dict[Tuple[str, int], list] = {}
+    # Keyed (chrom, sample, query strand): a member moves only within the
+    # sample's mappings of its own QUERYCOORD strand.
+    exact_intervals: Dict[Tuple[str, int, str], list] = {}
     placement_lines: list = []
     dup_parents, dup_spans = (
         _dup_parent_spans(path, sample_indexes, sample_names)
@@ -3460,7 +3465,8 @@ def _fast_scan_input_task(
                                 )
                             name = next(iter(file_samples))
                         exact_intervals.setdefault(
-                            (reference.group(1), file_samples[name]), [],
+                            (reference.group(1), file_samples[name],
+                             placed_query.group(4) if placed_query is not None else ""), [],
                         ).append((
                             int(reference.group(2)), int(reference.group(3)),
                         ))
@@ -5747,12 +5753,18 @@ def _exact_with(item, **changes):
     return types.SimpleNamespace(**{**vars(item), **changes})
 
 
-def _exact_window(w0, w1, sample, chrom, exact, path_sequence):
+def _exact_window(w0, w1, sample, chrom, exact, path_sequence, strand=""):
     """Reference (top level) or parent-path (nested) bases of [w0, w1);
-    None when uncovered (top level) or outside the parent path."""
+    None when uncovered (top level) or outside the parent path. Top level,
+    the window must lie in the sample's mappings of the member's QUERYCOORD
+    strand: a move never crosses onto a mapping of the other query strand."""
     if path_sequence is not None:
         return path_sequence[w0:w1] if 0 <= w0 <= w1 <= len(path_sequence) else None
-    if not exact_covered(exact["coverage"].get(sample), w0, w1):
+    coverage = exact["coverage"]
+    array = coverage.get((sample, strand))
+    if array is None:
+        array = coverage.get((sample, ""))
+    if not exact_covered(array, w0, w1):
         return None
     return _exact_fetch(exact["references"], chrom, w0, w1)
 
@@ -5890,7 +5902,7 @@ def _exact_realign_member(member, representative, exact, aligner_cache, core,
     s_r, e_r = representative.pos, max(representative.pos, representative.end)
     w0, w1 = min(s_m, s_r), max(e_m, e_r)
     bases = _exact_window(w0, w1, member.sample_index, getattr(representative, "chrom", ""),
-                          exact, path_sequence)
+                          exact, path_sequence, getattr(member, "qry_strand", ""))
     if bases is None:
         return None, "uncovered"
     left, right = bases[:s_r - w0], bases[e_r - w0:]
@@ -5991,7 +6003,7 @@ def _exact_realign_deletion(member, representative, exact, core, path_sequence=N
     s_r, e_r = representative.pos, representative.pos + representative.size
     w0, w1 = min(s_m, s_r), max(e_m, e_r)
     bases = _exact_window(w0, w1, member.sample_index, getattr(representative, "chrom", ""),
-                          exact, path_sequence)
+                          exact, path_sequence, getattr(member, "qry_strand", ""))
     if bases is None:
         return None, "uncovered"
     left, right = bases[:s_r - w0], bases[e_r - w0:]
@@ -8424,7 +8436,7 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
     if any((member.sample_index, member.qry_contig, member.qry_strand)
            != (sample_index, contig, strand) for member in members):
         return key, None, "mixed_contigs"
-    bases = _exact_window(w0, w1, sample_index, chrom, exact, None)
+    bases = _exact_window(w0, w1, sample_index, chrom, exact, None, strand)
     if bases is None:
         return key, None, "uncovered"
     snps = _exact_window_snps(exact["records_dir"], chrom, file_index, contig, w0, w1)
@@ -9953,12 +9965,12 @@ def _fast_stage_scan(
     coverage_by_chrom: Dict[str, list] = defaultdict(list)
     for cov_chrom, sample, start, end in coverage_tuples:
         coverage_by_chrom[cov_chrom].append((sample, start, end))
-    exact_by_chrom: Dict[str, Dict[int, list]] = defaultdict(dict)
+    exact_by_chrom: Dict[str, Dict[str, list]] = defaultdict(dict)
     if exact_queries:
         for file_index in range(len(input_paths)):
             with open(_fast_exact_sidecar_path(records_dir, file_index), "rb") as handle:
-                for (cov_chrom, sample), array in pickle.load(handle).items():
-                    exact_by_chrom[cov_chrom].setdefault(sample, []).append(array)
+                for (cov_chrom, sample, strand), array in pickle.load(handle).items():
+                    exact_by_chrom[cov_chrom].setdefault(f"{sample}{strand}", []).append(array)
     chrom_root = os.path.join(shards_dir, "chroms")
     os.makedirs(chrom_root, exist_ok=True)
     missing_lengths: List[str] = []
@@ -9989,7 +10001,7 @@ def _fast_stage_scan(
                 )
             if exact_queries:
                 np.savez(os.path.join(subfolder, _EXACT_COVERAGE_NAME), **{
-                    str(sample): (
+                    sample: (
                         arrays[0] if len(arrays) == 1
                         else _exact_coverage_array(
                             np.concatenate(arrays).reshape(-1, 2).tolist()
@@ -10224,7 +10236,7 @@ def _fast_stage_chrom(
                 if exact_coverage is not None:
                     print(
                         f"[merge:exact] {chrom}: coverage for "
-                        f"{len(exact_coverage)} sample(s), "
+                        f"{len({sample for sample, _strand in exact_coverage})} sample(s), "
                         f"{sum(len(a) // 2 for a in exact_coverage.values())} "
                         "interval(s)",
                         file=sys.stderr,

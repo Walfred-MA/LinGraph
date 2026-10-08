@@ -457,7 +457,8 @@ def _write_partition(args, folder, context, numbering, log):
     rank_of = dict(zip(init_order, global_rank.tolist()))
     s_parts, p_parts, (left, right, link_ranks) = _write_parts(
         folder, specs, roots, leaves, first, last, numbers, segments, '', hits,
-        meta['aliases'], rank_of, True, args.processes)
+        meta['aliases'], rank_of, True, args.processes,
+        preload_reference=getattr(args, 'preload_reference', True), log=log)
     for name, values in (('left', left), ('right', right), ('ranks', link_ranks)):
         np.save(folder / f'links.{name}.npy', values)
     # Per-event byte sizes let the blocks be copied in global rank order.
@@ -699,7 +700,8 @@ def _assemble(args, output, folders, context, numbering, root_part, work, log):
     ranks = {name: 0 if roots[name].kind == 'reference' else 1 for name in roots}
     s_parts, p_parts, root_links = _write_parts(
         work, specs, roots, leaves, first, last, root_numbers, segments, '', {}, {},
-        ranks, True, args.processes, tag='roots.')
+        ranks, True, args.processes, tag='roots.',
+        preload_reference=getattr(args, 'preload_reference', True), log=log)
     link_parts = [root_links] + [
         tuple(np.load(folder / f'links.{name}.npy', mmap_mode='r')
               for name in ('left', 'right', 'ranks')) for folder in folders]

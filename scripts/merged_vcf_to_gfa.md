@@ -353,7 +353,23 @@ an index built from a GFA or sidecar with another size or mtime.
 The converter reads the VCF body sequentially and retains coordinate/run
 metadata and sequence digests, not the sample matrix or sequence payloads.
 Query extraction uses scaffold batches and temporary files. Sequence copying
-uses bounded chunks. Memory still scales with the number of events, graph
+uses bounded chunks. Nearby short query intervals share a 64 KiB read window,
+and their sequence checks happen in memory before buffered output, avoiding a
+temporary-file write/read cycle for every SNP. Query workers handle up to 32
+batches before recycling, rather than starting a new interpreter for each batch.
+FASTA interval reads include wrapped lines in one contiguous read.
+
+Before writing the GFA, the converter loads the reference and alternative
+FASTA records supplying graph segments into memory once. Forked writer workers
+share these immutable sequences; duplication paths reuse their backing record.
+Lookup-only catalog records and query assemblies are not loaded wholesale.
+Allow roughly one additional byte per loaded base, plus temporary loading
+buffers (about 3 GB of retained sequence for a human reference, plus alternatives).
+Use `--no-preload-reference` to keep bounded FASTA read windows instead. The
+preload option applies to both normal and partitioned output and preserves the
+same GFA and sidecars.
+
+Memory still scales with the number of events, graph
 segments, and edges; emitting the full reference and chopping nodes increases
 both graph size and memory relative to the legacy local graph.
 
@@ -364,7 +380,8 @@ deduplicated with their minimum rank by sorting. Path leaves are resolved,
 and S/P lines written, by `--processes` forked workers that each exit after
 one batch; the parent concatenates the blocks in order, so the GFA is
 byte-identical for any worker count. Log lines `Topology: ...` report the
-time of each stage.
+time of each stage. Progress is written to stderr (the Slurm `.err` file),
+including catalog/dependency resolution, metadata writing, and carrier junctions.
 
 ## Very large cohorts: `--partition-records`
 

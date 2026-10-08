@@ -1,5 +1,6 @@
 """Simple, query-backed GFA construction without a database."""
 from collections import Counter, defaultdict, OrderedDict
+from contextlib import ExitStack
 from dataclasses import dataclass
 import gzip
 import hashlib
@@ -11,11 +12,12 @@ import shutil
 import tempfile
 import time
 
-from gfa_query_anchors import interval_chunks, read_query_list, scaffold_pool
+from gfa_query_anchors import interval_chunks, read_query_list, reverse_complement, scaffold_pool
 from minsetref_core import IndexedFasta
 
 CHUNK = 1024 * 1024
 ROOT_WINDOW = 4 * CHUNK
+QUERY_WINDOW = 64 * 1024
 VALID_SEQUENCE = re.compile(r'[A-Za-z=.]+')
 VG_SEQUENCE = re.compile(r'[ACGTNacgtn]+')
 
@@ -201,11 +203,46 @@ def _extract_batch(task):
     hits = []
     failures = []
     try:
+        window_start, window = 0, ''
+        # Requests are sorted and bounded to one scaffold. Limit read-ahead to
+        # this batch, so sparse requests do not read past its final interval.
+        window_limit = max((request[2] for request in requests), default=0)
         with open(output, 'w+b', buffering=CHUNK) as sequences:
             for request in requests:
                 event, low, high, start, end, strand = request[:6]
                 checks = request[6] if len(request) > 6 else ()
                 offset = sequences.tell()
+                if high - low <= QUERY_WINDOW:
+                    if not (window_start <= low and high <= window_start + len(window)):
+                        window_start = low
+                        window = reader.fetch(contig, low, min(window_limit, low + QUERY_WINDOW))
+                    sequence = window[low-window_start:high-window_start]
+                    if strand != '+':
+                        sequence = reverse_complement(sequence)
+                    if not VALID_SEQUENCE.fullmatch(sequence):
+                        raise ValueError(f'{contig}: sequence contains characters invalid in GFA')
+                    data = sequence.encode('ascii')
+                    if len(data) != high-low:
+                        raise ValueError(f'{contig}:{low}-{high}: incomplete FASTA interval')
+                    left = start-low if strand == '+' else high-end
+                    # Validate short alleles directly before buffering their
+                    # bytes. Seeking back into w+b after every SNP flushes the
+                    # write buffer and turns millions of SNPs into tiny I/Os.
+                    mismatch = None
+                    for qstart, qend, expected in checks:
+                        block = data[left+qstart:left+qend]
+                        if len(block) != qend-qstart:
+                            raise ValueError(f'{event}: incomplete query sequence for validation')
+                        if hashlib.sha256(block.upper()).digest() != expected:
+                            mismatch = _sequence_mismatch(contig, start, end, strand, qstart, qend)
+                            break
+                    if mismatch is not None:
+                        failures.append((event, mismatch))
+                        continue
+                    sequences.write(data)
+                    hits.append((event, output, offset, len(data), left,
+                                 len(data)-left-(end-start)))
+                    continue
                 written = 0
                 for sequence in interval_chunks(reader, contig, low, high, strand):
                     if not VALID_SEQUENCE.fullmatch(sequence):
@@ -228,10 +265,7 @@ def _extract_batch(task):
                         digest.update(block.upper())
                         remaining -= len(block)
                     if digest.digest() != expected:
-                        mismatch = (f'sequence_mismatch: selected query {contig}:{start}-{end}{strand} '
-                                    f'does not match INFO/SEQ at insertion offsets '
-                                    f'{qstart}-{qend}; SIZE alone does not identify '
-                                    'the representative allele')
+                        mismatch = _sequence_mismatch(contig, start, end, strand, qstart, qend)
                         break
                 if mismatch is not None:
                     # A failed candidate must not become a graph source. Reuse
@@ -246,6 +280,13 @@ def _extract_batch(task):
     finally:
         reader.close()
     return hits, failures
+
+
+def _sequence_mismatch(contig, start, end, strand, qstart, qend):
+    return (f'sequence_mismatch: selected query {contig}:{start}-{end}{strand} '
+            f'does not match INFO/SEQ at insertion offsets '
+            f'{qstart}-{qend}; SIZE alone does not identify '
+            'the representative allele')
 
 
 class Resolver:
@@ -695,7 +736,8 @@ def _copy(source, offset, size, output, uppercase=False):
         size -= len(block)
 
 
-def _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks=None):
+def _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks=None,
+                    root_sequences=None):
     query_files = _OpenFiles()
     root_reader = None
     root_path = None
@@ -717,16 +759,21 @@ def _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks=Non
                     output.write(b'*')
                     root_kind = 'unknown'
                 else:
-                    if root.path != root_path:
-                        if root_reader:
-                            root_reader.close()
-                        root_reader = IndexedFasta(root.path, root.fai)
-                        root_path = root.path
-                        window = None
                     written = 0
                     record = root.record or source
                     low, high = root.base+start, root.base+end
-                    if high - low <= ROOT_WINDOW:
+                    if root_sequences is not None:
+                        root_sequence = root_sequences[root.path, record]
+                        pieces = (root_sequence[pos:min(high, pos+CHUNK)]
+                                  for pos in range(low, high, CHUNK))
+                    else:
+                        if root.path != root_path:
+                            if root_reader:
+                                root_reader.close()
+                            root_reader = IndexedFasta(root.path, root.fai)
+                            root_path = root.path
+                            window = None
+                    if root_sequences is None and high - low <= ROOT_WINDOW:
                         # Segments of one root arrive in coordinate order: read
                         # the FASTA in large windows, not one call per segment.
                         if not (window and window[0] == record and
@@ -735,7 +782,7 @@ def _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks=Non
                             window = (record, low, ''.join(interval_chunks(
                                 root_reader, record, low, max(high, min(limit, low + ROOT_WINDOW)), '+')))
                         pieces = (window[2][low-window[1]:high-window[1]],)
-                    else:
+                    elif root_sequences is None:
                         pieces = interval_chunks(root_reader, record, low, high, '+')
                     for sequence in pieces:
                         if not VALID_SEQUENCE.fullmatch(sequence):
@@ -762,14 +809,57 @@ def _write_segments(output, segment_ids, hits, roots, aliases, prefix, ranks=Non
 _WRITE_STATE = None
 
 
+def _preload_root_sequences(segment_ids, roots, log):
+    """Load only FASTA records supplying S lines, before the writer fork.
+
+    Duplication slices share their backing record. Lookup-only catalog names
+    and query assemblies are excluded. Immutable strings share their large
+    data buffers through copy-on-write, even across many writer processes.
+    """
+    import numpy as np
+    from gfa_topology import POINT_BITS
+
+    sequences = {}
+    with ExitStack() as stack:
+        readers, wanted = {}, {}
+        for source in np.flatnonzero(~segment_ids.is_query).tolist():
+            root = roots.get(segment_ids.names[source])
+            if root is None:
+                continue
+            low, high = np.searchsorted(segment_ids.keys,
+                                        [source << POINT_BITS, (source+1) << POINT_BITS])
+            if not segment_ids.used[low:high].any():
+                continue
+            record = root.record or root.name
+            key = root.path, record
+            if key in wanted:
+                continue
+            if root.path not in readers:
+                readers[root.path] = stack.enter_context(IndexedFasta(root.path, root.fai))
+            wanted[key] = readers[root.path].index[record][0]
+        if wanted:
+            log(f'Preloading {len(wanted)} reference/alternative FASTA records '
+                f'({sum(wanted.values()) / (1024**3):.2f} GiB of bases) for shared GFA writers')
+        started = time.monotonic()
+        for (path, record), length in wanted.items():
+            sequence = readers[path].sequence(record)
+            if len(sequence) != length:
+                raise ValueError(f'{record}: incomplete FASTA sequence')
+            sequences[path, record] = sequence
+        if wanted:
+            log(f'Preloaded reference/alternative sequences in {time.monotonic() - started:.1f}s')
+    return sequences
+
+
 def _write_part(task):
     """Write one ordered block of S or P lines to its own temporary file."""
     kind, low, high, path = task
-    specs, roots, leaves, first, last, numbers, segments, prefix, hits, aliases, ranks = _WRITE_STATE
+    specs, roots, leaves, first, last, numbers, segments, prefix, hits, aliases, ranks, root_sequences = _WRITE_STATE
     import gfa_topology as topology
     with open(path, 'wb', buffering=CHUNK) as output:
         if kind == 'S':
-            _write_segments(output, segments.part(low, high), hits, roots, aliases, prefix, ranks)
+            _write_segments(output, segments.part(low, high), hits, roots, aliases, prefix,
+                            ranks, root_sequences)
             return path
         for index in range(low, high):
             spec = specs[index]
@@ -787,7 +877,8 @@ def _write_part(task):
 
 
 def _write_parts(temporary_root, specs, roots, leaves, first, last, numbers, segment_ids,
-                 prefix, hits, aliases, ranks, stable, processes=1, tag=''):
+                 prefix, hits, aliases, ranks, stable, processes=1, tag='',
+                 preload_reference=True, log=print):
     """Write ordered S and P blocks (forked workers) and compute the links.
 
     Returns (S part files, P part files, (left, right, rank) link arrays).
@@ -803,8 +894,9 @@ def _write_parts(temporary_root, specs, roots, leaves, first, last, numbers, seg
         for number, low in enumerate(range(0, total, size)):
             tasks.append((kind, low, min(total, low + size),
                           temporary_root / f'part.{tag}{kind}.{number:06d}.gfa'))
+    root_sequences = _preload_root_sequences(segment_ids, roots, log) if preload_reference else None
     _WRITE_STATE = (specs, roots, leaves, first, last, numbers, segment_ids, prefix,
-                    hits, aliases, ranks)
+                    hits, aliases, ranks, root_sequences)
     try:
         if processes > 1 and len(tasks) > 1 and 'fork' in mp.get_all_start_methods():
             gc.freeze()
@@ -849,12 +941,12 @@ def _write_links(output, left, right, link_ranks, prefix, ranked):
 
 def _write_graph(output_path, temporary_root, specs, roots, resolver, leaves,
                  first, last, numbers, segment_ids, prefix, hits, aliases, stable,
-                 processes=1):
+                 processes=1, preload_reference=True, log=print):
     """Write H, S, L, P lines; S and P blocks are written by forked workers."""
     ranks = getattr(resolver, 'ranks', None)
     s_parts, p_parts, (left, right, link_ranks) = _write_parts(
         temporary_root, specs, roots, leaves, first, last, numbers, segment_ids, prefix,
-        hits, aliases, ranks, stable, processes)
+        hits, aliases, ranks, stable, processes, preload_reference=preload_reference, log=log)
     temporary = str(output_path) + f'.tmp.{os.getpid()}'
     try:
         opener = gzip.open if str(output_path).endswith('.gz') else open
@@ -884,11 +976,13 @@ def run(args, _read_vcf=None, _chunks=None, _operations=None, log=print):
 def _run(args, candidates, bed, log):
     from gfa_interval_metadata import read_header_contigs, rows
 
+    log('Indexing query list, VCF headers, and reference FASTAs')
     sources = read_query_list(args.query_fasta_list)
     header_ordinals, header_lengths = read_header_contigs(args.vcf)
     roots = _index_roots(args)
     sequence_checks = {} if args.gfa_mode == 'rgfa' else None
     log('Streaming VCF metadata and SIZE/span-matched query intervals')
+    started = time.monotonic()
     events = OrderedDict()
     event_kinds = {}
     record_indexes = {}
@@ -913,6 +1007,7 @@ def _run(args, candidates, bed, log):
                                    [Run(*run) for run in values], query, query_reason, retained, kind)
         if (order+1) % 10000 == 0:
             log(f'Indexed {order+1} insertion definitions')
+    log(f'Indexed {len(events)} variant definitions in {time.monotonic() - started:.1f}s')
 
     aliases = {name: f'ins_{header_ordinals[name]}'
                for name in events if name in header_ordinals}
@@ -920,6 +1015,8 @@ def _run(args, candidates, bed, log):
     reachable = _reachable_events(events, include_parents=stable)
     hits = {}
     if stable:
+        log('Resolving local source catalogs and variant dependencies')
+        started = time.monotonic()
         from gfa_source_catalog import resolve_local_sources
         from gfa_stable_coords import StableResolver
         source_aliases = resolve_local_sources(events, roots, reachable, sources,
@@ -951,8 +1048,10 @@ def _run(args, candidates, bed, log):
         for name in stable_names:
             _valid_name(name)
         stable_names = set(stable_names)
+        log(f'Resolved source catalogs and dependencies in {time.monotonic() - started:.1f}s')
     else:
         resolver = Resolver(events, roots, header_lengths, hits)
+    log('Preparing query intervals')
     intervals, missing = _prepare_intervals(events, reachable, sources, args.anchor,
                                           query_flanks=not stable)
     unresolved = Path(str(bed)+'.unresolved.tsv')
@@ -983,6 +1082,7 @@ def _run(args, candidates, bed, log):
         hits.update(extracted)
         if drop:
             _drop_unverified(events, resolver, intervals, dropped, unresolved, aliases, log)
+        log('Writing anchor and mapping metadata')
         _write_metadata(bed, events, intervals, aliases, resolver,
                         unique_minimum, args.anchor)
 
@@ -1004,6 +1104,7 @@ def _run(args, candidates, bed, log):
                                           event.identifier, run.qstart, run.qend))
         if stable:
             from gfa_junctions import junction_specs
+            log('Resolving carrier junctions')
             specs.extend(junction_specs(args.vcf, events, resolver, aliases, PathSpec, log,
                                         repeated=repeated))
 
@@ -1056,7 +1157,7 @@ def _run(args, candidates, bed, log):
         started = time.monotonic()
         links = _write_graph(output, temporary_root, specs, roots, resolver, leaves,
                              first, last, numbers, segment_ids, prefix, hits, aliases, stable,
-                             args.processes)
+                             args.processes, getattr(args, 'preload_reference', True), log)
         log(f'Wrote {len(segment_ids)} segments, {links} links, and '
             f'{len(specs)} paths to {output} in {time.monotonic() - started:.1f}s')
         if stable:

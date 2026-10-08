@@ -208,15 +208,18 @@ class IndexedFasta:
         length, offset, line_bases, line_width = self.index[name]
         start = max(0, min(int(start), length))
         end = max(start, min(int(end), length))
-        out = bytearray()
-        pos = start
-        while pos < end:
-            line_idx = pos // line_bases
-            within = pos % line_bases
-            n = min(end - pos, line_bases - within)
-            out.extend(self._pread(n, offset + line_idx * line_width + within))
-            pos += n
-        return out.decode("ascii")
+        if start == end:
+            return ""
+        # Read one contiguous byte span, including intervening line endings.
+        # Reading each wrapped line separately makes a genome traversal issue
+        # tens of millions of pread calls, even when callers request MB chunks.
+        first = offset + (start // line_bases) * line_width + start % line_bases
+        final = end - 1
+        stop = offset + (final // line_bases) * line_width + final % line_bases + 1
+        raw = self._pread(stop - first, first)
+        if line_width != line_bases:
+            raw = raw.replace(b"\r", b"").replace(b"\n", b"")
+        return raw.decode("ascii")
 
     def sequence(self, name: str) -> str:
         if name not in self.index:
