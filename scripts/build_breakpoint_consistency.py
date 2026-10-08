@@ -165,21 +165,20 @@ def _outputs_are_current(task: BreakpointTask) -> bool:
     )
 
 
-def _initial_has_contigs(path: str, contigs: Iterable[str]) -> bool:
-    """Whether the initial blocks were derived with these query contigs."""
-    contigs = set(contigs)
+def _imported_marker(task: BreakpointTask) -> str:
+    return task.initial + ".imported"
+
+
+def _imported_current(task: BreakpointTask, contigs: Iterable[str]) -> bool:
+    """Whether the outputs were derived with these imported identity rows."""
+    contigs = sorted(contigs)
     if not contigs:
         return True
-    found = set()
     try:
-        with open(path, "rt") as handle:
-            for line in handle:
-                fields = line.split("\t", 3)
-                if len(fields) > 2:
-                    found.add(fields[2])
+        with open(_imported_marker(task), "rt") as handle:
+            return handle.read() == "".join(contig + "\n" for contig in contigs)
     except OSError:
         return False
-    return contigs <= found
 
 
 def _base_cache_is_current(
@@ -272,8 +271,7 @@ def _process_task(task: BreakpointTask) -> BreakpointResult:
     imported_contigs = {
         row.contig for row, _path in imported_template_rows(task.graph)
     }
-    if (_outputs_are_current(task)
-            and _initial_has_contigs(task.initial, imported_contigs)):
+    if _outputs_are_current(task) and _imported_current(task, imported_contigs):
         metadata = _cache_metadata(task.cache) or {}
         return BreakpointResult(
             task.partition, "reused",
@@ -308,7 +306,7 @@ def _process_task(task: BreakpointTask) -> BreakpointResult:
 
     old_metadata = _cache_metadata(task.cache)
     if (_base_cache_is_current(task, old_metadata, file_row_count)
-            and _initial_has_contigs(task.initial, imported_contigs)):
+            and _imported_current(task, imported_contigs)):
         initial_blocks = read_initial_blocks(task.initial)
         graphdb = _GFIXBREAKS.graphDB.load_json(task.cache)
         raw_lengths = old_metadata.get("graph_path_lengths", {})
@@ -336,6 +334,9 @@ def _process_task(task: BreakpointTask) -> BreakpointResult:
             only_reference=_ONLY_REFERENCE,
         )
         write_final_segments(task.initial, segments)
+        if imported_contigs:
+            with open(_imported_marker(task), "wt") as handle:
+                handle.write("".join(contig + "\n" for contig in sorted(imported_contigs)))
         if not segments:
             return BreakpointResult(
                 task.partition, "skipped_no_segments",
@@ -407,7 +408,7 @@ def _process_task(task: BreakpointTask) -> BreakpointResult:
         usable_block_count, skipped_block_count, uniform_region_count,
     )
     return BreakpointResult(
-        task.partition, "built", len(rows), segment_count, len(blocked),
+        task.partition, "built", file_row_count, segment_count, len(blocked),
         task.cache, task.blocks,
     )
 

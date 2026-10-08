@@ -2361,14 +2361,17 @@ def build_adjusted_paths(
         )
         # Imported records are stored sequences in their own record space;
         # their provenance intervals select nothing of an input assembly.
-        fixed_provenance = {
-            (row.haplotype, row.source_contig, row.source_start, row.source_end)
-            for row in original if row.encoded_name in fixed
-        }
+        def imported_item(kind, payload):
+            if kind == FIXED_ROLE:
+                return True
+            return kind == "original_block" and any(
+                origin.startswith("block_reference:")
+                and origin.split(":", 1)[1] in fixed
+                for origin in json.loads(payload).get("origins", ())
+            )
         for item in provisional:
-            priority, _role, _label, kind, hap, start, end, contig, _payload = item
-            if (kind in {"original_block", FIXED_ROLE}
-                    and (hap, contig, start, end) in fixed_provenance):
+            priority, _role, _label, kind, hap, start, end, contig, payload = item
+            if fixed and imported_item(kind, payload):
                 continue
             if priority <= 1:
                 template_spans[(hap, contig)].append((start, end))

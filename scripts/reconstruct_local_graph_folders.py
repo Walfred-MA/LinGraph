@@ -533,6 +533,58 @@ def reference_header(
     )
 
 
+MERGED_ORIGINAL_BED = "original_intervals.bed"
+
+
+def _bed_source_contig(fields: Sequence[str]) -> str:
+    """The original row's source contig, recovered from its record ID.
+
+    PARTITION.bed column 1 renames chrN to the CHM13 NC_ accession even for
+    other haplotypes; the record ID (column 8) keeps the source contig:
+    ``{partition id}_{contig}_{start}_{end}``.
+    """
+    partition, record, start, end = fields[3], fields[7], fields[8], fields[9]
+    partition_fields = partition.split("_")
+    partition_id = partition_fields[0]
+    if partition_id == "merged" and len(partition_fields) > 1:
+        partition_id = partition_fields[1]
+    head, tail = partition_id + "_", f"_{start}_{end}"
+    if record.startswith(head) and record.endswith(tail) and len(record) > len(head) + len(tail):
+        return record[len(head):-len(tail)]
+    return fields[0]
+
+
+def write_merged_original_bed(
+    graph_dir: Path, partitions: Sequence[str], output: Path,
+) -> int:
+    """Merge every graph folder's PARTITION.bed into one original-interval BED.
+
+    Same columns as summary/original_intervals.bed (contig, start, end,
+    partition, 1000, strand, haplotype, record ID, start, end,
+    source_coordinates), with the source contig as named in local_graphs.tsv.
+    """
+    rows = []
+    for partition in partitions:
+        bed = graph_dir / partition / f"{partition}.bed"
+        with bed.open("rt") as handle:
+            for raw in handle:
+                if not raw.strip() or raw.startswith("#"):
+                    continue
+                fields = raw.rstrip("\n").split("\t")
+                if len(fields) < 11:
+                    raise ValueError(f"{bed}: expected the 11-column partition BED")
+                fields[0] = _bed_source_contig(fields)
+                rows.append(fields)
+    rows.sort(key=lambda fields: (fields[0], int(fields[1]), int(fields[2]), fields[3]))
+    text = "".join("\t".join(fields) + "\n" for fields in rows)
+    if not (output.is_file() and output.read_text() == text):
+        temporary = output.with_name(output.name + f".tmp.{os.getpid()}")
+        temporary.write_text(text)
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, output)
+    return len(rows)
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -560,7 +612,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-o", "--output-dir", required=True,
-        help="output root containing Graphs/, Graphs.list, Graphs.template.list[.bin], summary/ and optional references/ link",
+        help="output root containing Graphs/, Graphs.list, Graphs.template.list[.bin], summary/, original_intervals.bed (all graph folders' original intervals) and optional references/ link",
     )
     parser.add_argument("-j", "--jobs", type=int, default=16)
     parser.add_argument("--resume", action="store_true")
@@ -1074,6 +1126,12 @@ def run(args: argparse.Namespace) -> None:
         "%d FASTA paths and %d bases; resumed %d folders",
         len(items), graphs, bases, resumed,
     )
+    merged_bed = Path(output_dir) / MERGED_ORIGINAL_BED
+    merged_count = write_merged_original_bed(
+        graph_dir, [partition for partition, _rows in items], merged_bed,
+    )
+    LOG.info("Merged %d original intervals of all graph folders into %s",
+             merged_count, merged_bed)
     valid_graph_fastas = [
         graph_dir / partition / f"{partition}.FA"
         for partition, _rows in items

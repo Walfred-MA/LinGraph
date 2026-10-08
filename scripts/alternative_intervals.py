@@ -64,19 +64,6 @@ def read_bed(path):
     return intervals
 
 
-def _stored_record_segments(text):
-    """A reference row made of stored record bytes (an imported alternative)."""
-    if not text or not text.startswith("["):
-        return False
-    try:
-        segments = json.loads(text)
-    except ValueError:
-        return False
-    return bool(segments) and all(
-        isinstance(segment, dict) and "record" in segment for segment in segments
-    )
-
-
 def write_bed(summary, output, reference_haplotype="CHM13_h1", all_templates=False):
     """Stream either the legacy nine-column or current graph summary.
 
@@ -86,7 +73,6 @@ def write_bed(summary, output, reference_haplotype="CHM13_h1", all_templates=Fal
     """
     from assembly_contigs import accepted_contig
     rows = set()
-    originals, stored = [], set()
     with open(summary) as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"partition", "type", "source_haplotype", "source_contig",
@@ -94,27 +80,21 @@ def write_bed(summary, output, reference_haplotype="CHM13_h1", all_templates=Fal
         if not required.issubset(reader.fieldnames or ()):
             raise ValueError(f"{summary}: missing columns: {sorted(required - set(reader.fieldnames or ())) }")
         for number, row in enumerate(reader, 2):
-            if row["type"] == "original":
-                originals.append((number, row))
-            elif row["type"] == "reference" and _stored_record_segments(row.get("segments")):
-                stored.add(row["partition"])
-    for number, row in originals:
-        prefix = partition_prefix(row["partition"])
-        haplotype = row["source_haplotype"]
-        contig = row["source_contig"]
-        # An imported (stored) record is always an alternative of its own;
-        # its source= labels are provenance, never a reason to drop it.
-        if row["partition"] not in stored:
+            if row["type"] != "original":
+                continue
+            prefix = partition_prefix(row["partition"])
+            haplotype = row["source_haplotype"]
+            contig = row["source_contig"]
             if not accepted_contig(haplotype, contig):
                 continue
             if not (all_templates or prefix.startswith(("alternative", "novel"))
                     or haplotype != reference_haplotype):
                 continue
-        start, end = int(row["source_start"]), int(row["source_end"])
-        if start < 0 or end <= start:
-            raise ValueError(f"{summary}:{number}: invalid original interval")
-        name = f"{prefix}_{contig}_{start}_{end}"
-        rows.add((contig, start, end, name))
+            start, end = int(row["source_start"]), int(row["source_end"])
+            if start < 0 or end <= start:
+                raise ValueError(f"{summary}:{number}: invalid original interval")
+            name = f"{prefix}_{contig}_{start}_{end}"
+            rows.add((contig, start, end, name))
     destination = Path(output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".alternative_intervals.", dir=destination.parent)

@@ -383,6 +383,9 @@ def read_graph_path_records(graph_fasta: str) -> Dict[str, GraphPathRecord]:
 IMPORTED_ALTERNATIVE_TAG = "sequence_role=imported_alternative"
 IMPORTED_QUERY_HAPLOTYPE = "alternative"
 IMPORTED_QUERY_PREFIX = IMPORTED_QUERY_HAPLOTYPE + "#"
+# Each imported path gets its own range of record space, so two imported
+# paths of one partition never share graph coordinates.
+IMPORTED_RANGE_GAP = 10_000_000
 
 
 def imported_template_rows(
@@ -407,6 +410,7 @@ def imported_template_rows(
     paths = read_graph_path_records(graph_fasta)
     prefix = graph_name_from_fasta(graph_fasta).split("_", 1)[0]
     output = []
+    offset = 0
     for index, name in enumerate(names, 1):
         path = paths.get(name)
         if path is None:
@@ -415,11 +419,12 @@ def imported_template_rows(
                 "HAPLOTYPE:CONTIG:START-END metadata"
             )
         output.append((OutputRow(
-            1, IMPORTED_QUERY_PREFIX + name, 0, path.length, "+",
+            1, IMPORTED_QUERY_PREFIX + name, offset, offset + path.length, "+",
             f"{prefix}_{IMPORTED_QUERY_HAPLOTYPE}_{index}",
             f">{name}", f">{name}:{path.length}M",
             f"0_{path.length}", f"0_{path.length}",
         ), path))
+        offset += path.length + IMPORTED_RANGE_GAP
     return output
 
 
@@ -447,7 +452,7 @@ def with_imported_templates(
         for row, path in imported:
             paths[path.name] = dataclasses.replace(
                 path, haplotype=IMPORTED_QUERY_HAPLOTYPE, contig=row.contig,
-                start=0, end=path.length, strand="+",
+                start=row.start, end=row.end, strand="+",
             )
     present = {row.contig for row in rows}
     rows = [*rows, *(row for row, _path in imported if row.contig not in present)]
@@ -459,7 +464,7 @@ def with_imported_templates(
         bed for bed in beds
         if (bed.haplotype, bed.contig, bed.start, bed.end) not in provenance
     ] + [
-        OriginalBedInterval(IMPORTED_QUERY_HAPLOTYPE, row.contig, 0, row.end, "+")
+        OriginalBedInterval(IMPORTED_QUERY_HAPLOTYPE, row.contig, row.start, row.end, "+")
         for row, _path in imported
     ]
     return rows, beds

@@ -94,7 +94,11 @@ def build_loci(templates, blocks, log=print, originals=None):
     owner = {}          # block -> (template, template_start, sequence)
     whole = []          # templates holding none of their blocks
     counts = defaultdict(int)
-    for template in sorted(templates, key=lambda t: t.name):
+    imported = set()    # blocks that are an imported record's own block
+    # An imported alternative is its own sequence: it owns only the block that
+    # is exactly its record, and no input template is matched to that block
+    # by provenance. Imported templates are therefore placed first.
+    for template in sorted(templates, key=lambda t: (not t.fixed, t.name)):
         candidates = by_partition.get(template.graph_name)
         if candidates is None:
             candidates = by_prefix.get(partition_prefix(template.graph_name), [])
@@ -107,6 +111,10 @@ def build_loci(templates, blocks, log=print, originals=None):
             if (haplotype, contig, strand) != (template.source_haplotype, template.source_contig,
                                                template.source_strand):
                 continue
+            if template.fixed and (start, end) != (template.source_start, template.source_end):
+                continue
+            if not template.fixed and block in imported:
+                continue
             if not (template.source_start <= start and end <= template.source_end):
                 if template.source_start < end and start < template.source_end:
                     counts['blocks_partly_in_template'] += 1
@@ -118,15 +126,19 @@ def build_loci(templates, blocks, log=print, originals=None):
                 held += 1
                 continue
             owner[block] = (template.name, offset, template.sequence[offset:offset + end - start])
+            if template.fixed:
+                imported.add(block)
             held += 1
         if not held:
             whole.append(template)
     # Blocks touching end to end on one source contig and strand are one locus.
     groups = defaultdict(list)
     for block in owner:
-        groups[block[:3]].append(block)
+        # An imported record is never merged with another block.
+        groups[('imported', block) if block in imported else block[:3]].append(block)
     loci, pieces = [], []
-    for (haplotype, contig, strand), members in sorted(groups.items()):
+    for key, members in sorted(groups.items(), key=lambda item: (item[0][0] == 'imported', str(item[0]))):
+        haplotype, contig, strand = members[0][:3]
         members.sort(key=lambda block: (block[3], block[4]))
         runs = []
         for block in members:
