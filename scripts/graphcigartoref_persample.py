@@ -2910,7 +2910,11 @@ def _summary_header_mapping(
             return token
     # Prefer the mapped coordinate (column 3) before the source-haplotype
     # coordinate (column 2) when a package has no explicit mapping CIGAR.
-    for token in fields[2:3]:
+    # An imported alternative's column 3 is its provenance without the
+    # haplotype, not a calling-reference interval: it keeps the
+    # haplotype-qualified column 2, like any non-reference path.
+    imported = "sequence_role=imported_alternative" in fields
+    for token in () if imported else fields[2:3]:
         if token and token != "." and ";" not in token:
             mapping = core.synthesize_reference_mapping_from_coord(
                 token, ref_reader,

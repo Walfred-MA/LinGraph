@@ -2260,7 +2260,8 @@ def remove_legacy_partition_fastas(
     removed = 0
     allowed = {
         "local_graphs.tsv", "alternatives.fasta", "Graphs.list",
-        "alternative_intervals.bed",
+        "alternative_intervals.bed", "original_intervals.bed",
+        "novel_loci.fa", "novel_loci.fa.fai",
         "alternatives.fasta.fai", "partition_targets.list",
         "partition_targets.list.bin",
         PARTITION_CACHE_PACKAGE,
@@ -2571,6 +2572,12 @@ def run(args: argparse.Namespace) -> None:
         args.embed_all_templates,
     )
     LOG.info('Wrote %d original alternative/novel calling intervals', bed_count)
+    from alternative_intervals import ORIGINAL_BED_NAME, write_original_bed
+    original_count = write_original_bed(
+        os.path.join(output_dir, 'local_graphs.tsv'),
+        os.path.join(output_dir, ORIGINAL_BED_NAME),
+    )
+    LOG.info('Wrote %d original partition intervals', original_count)
     if graph_listing:
         destination = Path(output_dir) / 'Graphs.list'
         temporary = destination.with_suffix('.list.tmp')

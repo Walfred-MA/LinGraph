@@ -380,6 +380,91 @@ def read_graph_path_records(graph_fasta: str) -> Dict[str, GraphPathRecord]:
     return output
 
 
+IMPORTED_ALTERNATIVE_TAG = "sequence_role=imported_alternative"
+IMPORTED_QUERY_HAPLOTYPE = "alternative"
+IMPORTED_QUERY_PREFIX = IMPORTED_QUERY_HAPLOTYPE + "#"
+
+
+def imported_template_rows(
+    graph_fasta: str,
+) -> List[Tuple[OutputRow, GraphPathRecord]]:
+    """Identity alignment rows of the graph's imported alternative paths.
+
+    An imported alternative is its own sequence, never an interval of an input
+    assembly, whatever its source= provenance names. Like the reference on a
+    backbone window, it is aligned to its own graph path, by identity, under a
+    query contig of its own namespace (``alternative#PATH``) that no input
+    assembly can share. These rows are derived from the graph FASTA wherever
+    they are needed; the partition's alignment file stays the cohort's.
+    """
+    names = []
+    with open(graph_fasta, "rt") as handle:
+        for raw in handle:
+            if raw.startswith(">") and IMPORTED_ALTERNATIVE_TAG in raw.split():
+                names.append(raw[1:].split()[0])
+    if not names:
+        return []
+    paths = read_graph_path_records(graph_fasta)
+    prefix = graph_name_from_fasta(graph_fasta).split("_", 1)[0]
+    output = []
+    for index, name in enumerate(names, 1):
+        path = paths.get(name)
+        if path is None:
+            raise ValueError(
+                f"{graph_fasta}: imported alternative path {name!r} lacks "
+                "HAPLOTYPE:CONTIG:START-END metadata"
+            )
+        output.append((OutputRow(
+            1, IMPORTED_QUERY_PREFIX + name, 0, path.length, "+",
+            f"{prefix}_{IMPORTED_QUERY_HAPLOTYPE}_{index}",
+            f">{name}", f">{name}:{path.length}M",
+            f"0_{path.length}", f"0_{path.length}",
+        ), path))
+    return output
+
+
+def is_imported_template_row(row: OutputRow) -> bool:
+    return row.contig.startswith(IMPORTED_QUERY_PREFIX)
+
+
+def with_imported_templates(
+    rows: Sequence[OutputRow],
+    beds: Sequence[OriginalBedInterval],
+    graph_fasta: str,
+    paths: Optional[Dict[str, GraphPathRecord]] = None,
+) -> Tuple[List[OutputRow], List[OriginalBedInterval]]:
+    """Append imported identity rows; move their BED intervals onto them.
+
+    A BED interval of an imported path is its provenance, so it is replaced by
+    the whole identity row instead of being matched to any input-assembly
+    contig of the same name. With ``paths``, the imported paths' coordinates
+    are moved into the same record space (in place).
+    """
+    imported = imported_template_rows(graph_fasta)
+    if not imported:
+        return list(rows), list(beds)
+    if paths is not None:
+        for row, path in imported:
+            paths[path.name] = dataclasses.replace(
+                path, haplotype=IMPORTED_QUERY_HAPLOTYPE, contig=row.contig,
+                start=0, end=path.length, strand="+",
+            )
+    present = {row.contig for row in rows}
+    rows = [*rows, *(row for row, _path in imported if row.contig not in present)]
+    provenance = {
+        (path.haplotype, path.contig, path.start, path.end)
+        for _row, path in imported
+    }
+    beds = [
+        bed for bed in beds
+        if (bed.haplotype, bed.contig, bed.start, bed.end) not in provenance
+    ] + [
+        OriginalBedInterval(IMPORTED_QUERY_HAPLOTYPE, row.contig, 0, row.end, "+")
+        for row, _path in imported
+    ]
+    return rows, beds
+
+
 def parse_position_list(
     text: str, context: str, *, allow_empty: bool = False,
 ) -> List[Tuple[int, int]]:

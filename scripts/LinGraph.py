@@ -107,7 +107,8 @@ Examples:
                     "  python LinGraph.py singular -I samples.list -G graph -r reference.fa -O calls --merge")
                     + "\n\nLists: NAME FASTA, one sample/haplotype per row; index: FASTA.fai.\n"
                     "Prepare assemblies separately with LinGraph.py prepare.\n"
-                    "LinGraph checks the first sequence and adjacent index; it never prepares inputs.\n"
+                    "LinGraph checks the first sequence and adjacent index; with --force-prepare it\n"
+                    "prepares fixed copies of inputs that are not ready.\n"
                     "Relative FASTA paths are relative to the list. Omit -L to use all partitions.\n"
                     "Run locally by default. Repeat the command to resume. --dry-run only prints the plan.")
         q.add_argument("-G", "--graph", "--graph-folder", required=True,
@@ -143,6 +144,10 @@ Examples:
             # Former names, still accepted.
             q.add_argument("--MC-graph", "--mc-graph", dest="mc_graph", action="store_true",
                            help=argparse.SUPPRESS)
+        q.add_argument("--force-prepare", action="store_true",
+                       help="prepare fixed copies of assemblies that are not ready in "
+                            f"OUTPUT/{PREPARED_FOLDER} (removed when the run finishes) "
+                            "instead of stopping; duplicates those assemblies on disk")
         alignment = q.add_mutually_exclusive_group()
         if mode == "graph":
             alignment.add_argument("--fast", "--fast-mode", dest="alignment_mode", action="store_const", const="fast",
@@ -252,17 +257,27 @@ def unlock_workflows(run_dirs, dry_run=False):
     return 0
 
 
+PREPARED_FOLDER = "PreparedAssemblies"
+
+
+class NeedsPreparation(ValueError):
+    """An input assembly LinGraph can repair into OUTPUT/PreparedAssemblies."""
+
+
 def check_fasta(path):
     if not path.is_file() or not path.stat().st_size:
         raise ValueError(f"FASTA missing or empty: {path}")
     if any(c.isspace() for c in str(path)):
         raise ValueError(f"FASTA paths cannot contain whitespace: {path}")
     if path.suffix.lower() in {".gz", ".bgz", ".bgzf"}:
-        raise ValueError(f"Use an uncompressed assembly FASTA: {path}; run tools/prepare_assemblies.py separately")
+        raise ValueError(f"Compressed FASTA is not supported: {path}; decompress it first")
 
 
-def check_prepared(name, fasta):
-    """Inspect the first FASTA record and the FAI names; never modify inputs."""
+def check_prepared(name, fasta, require_mask=True):
+    """Inspect the first FASTA record and the FAI names; never modify inputs.
+
+    require_mask=False for a prepared copy: prepare_assemblies.py decides
+    masking over the whole assembly, not only the first record."""
     native_reference = name in {"CHM13_h1", "HG38_h1"}
     prefix = name.rsplit("_h", 1)[0] + "#" + name.rsplit("_h", 1)[1]
 
@@ -284,35 +299,9 @@ def check_prepared(name, fasta):
                 "FASTA index with samtools faidx. Do not add another prefix to "
                 "this contig. LinGraph has not modified the assembly."
             )
-        if fix_names:
-            output = Path("prepared_assemblies") / f"{name}.namefixed.fa"
-            fix_command = [
-                sys.executable, str(ROOT / "tools" / "namecontigsfix.py"),
-                "-i", str(fasta), "-n", prefix, "-o", str(output),
-            ]
-            index_command = ["samtools", "faidx", str(output)]
-            raise ValueError(
-                message + f"Expected {prefix!r} or contig names beginning with "
-                f"{prefix + '#'!r}. "
-                "For example, fix names and build the index with:\n  "
-                + shlex.join(fix_command) + "\n  "
-                + shlex.join(index_command) + "\nThen replace this FASTA path "
-                f"in your assembly list with {output}. LinGraph has not modified "
-                "the input assembly."
-            )
-
-        output_folder = "prepared_assemblies"
-        command = [
-            sys.executable, str(ROOT / "tools" / "prepare_assemblies.py"),
-            "-i", str(fasta), "--name", name, "-O", output_folder,
-            "--contignamefix",
-        ]
-        raise ValueError(
-            message + "Prepare the FASTA and index separately with:\n  "
-            + shlex.join(command)
-            + f"\nThen use {output_folder}/query_paths.prepared.txt with -I. "
-            "LinGraph has not modified the input assembly."
-        )
+        # Missing index, unprefixed contig names or no soft masking: LinGraph
+        # can prepare a fixed copy (--force-prepare); the input is never modified.
+        raise NeedsPreparation(message.rstrip("\n"))
 
     index = Path(str(fasta) + ".fai")
     if not index.is_file():
@@ -374,8 +363,89 @@ def check_prepared(name, fasta):
             if any(base in line for base in (b"a", b"c", b"g", b"t")):
                 masked = True
                 break
-        if not masked:
+        if not masked and require_mask:
             fail("no lowercase a/c/g/t masking was found in the first sequence")
+
+
+def prepared_map_path(output):
+    """Persistent map prepared copy -> original input; the copies are deleted
+    after a successful run but saved lists (e.g. GRAPH/inputs) keep naming them."""
+    return output / "lingraph" / "prepared_inputs.tsv"
+
+
+def read_prepared_map(*paths):
+    mapping = {}
+    for path in paths:
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                fields = line.split("\t")
+                if len(fields) == 3:
+                    mapping[fields[2]] = Path(fields[1])
+    return mapping
+
+
+def restore_prepared_inputs(rows, mapping):
+    """Saved rows whose prepared copy was removed point at the input again."""
+    return [(name, mapping[str(fasta)]
+             if not fasta.is_file() and str(fasta) in mapping else fasta)
+            for name, fasta in rows]
+
+
+def prepare_assemblies(args, output, pending, graph=None):
+    """Fixed copies of input assemblies that are not ready to use.
+
+    Each copy is OUTPUT/PreparedAssemblies/NAME/: contig names prefixed when
+    needed, WindowMasker only for an unmasked assembly (an existing mask is
+    kept), and a fresh index. Inputs are never modified. A copy made from the
+    same input (path, size, time) is reused; copies take the input's file
+    time, so a resumed run does not see newer inputs. The map copy -> input
+    is kept (OUTPUT/lingraph, and GRAPH/inputs in graph mode). Returns
+    {(name, input): prepared FASTA}.
+    """
+    folder = output / PREPARED_FOLDER
+    tool = ROOT / "tools" / "prepare_assemblies.py"
+    prepared = {}
+    for name, fasta in pending:
+        target = folder / name
+        listing = target / "query_paths.prepared.txt"
+        stamp_file = target / "input.stamp"
+        stat = fasta.stat()
+        stamp = f"{fasta.resolve()}\t{stat.st_size}\t{stat.st_mtime_ns}\n"
+        if listing.is_file() and stamp_file.is_file() and stamp_file.read_text() == stamp:
+            fields = listing.read_text().split()
+            previous = Path(fields[1]) if len(fields) == 2 and fields[0] == name else None
+            if previous and previous.is_file():
+                try:
+                    check_prepared(name, previous, require_mask=False)
+                except ValueError:
+                    pass
+                else:
+                    say(f"Reuse prepared assembly {name}: {previous}")
+                    prepared[(name, fasta)] = previous
+                    continue
+        command = [sys.executable, str(tool), "-i", str(fasta), "--name", name,
+                   "-O", str(target), "--contignamefix", "-t", str(args.threads)]
+        say("Prepare: " + shlex.join(command))
+        if args.dry_run:
+            continue
+        try:
+            subprocess.run(command, check=True)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f"preparing assembly {name} failed (exit {error.returncode}); "
+                               f"see the messages above. Input: {fasta}") from None
+        fields = listing.read_text().split()
+        result = Path(fields[1])
+        check_prepared(name, result, require_mask=False)
+        for path in (result, Path(str(result) + ".fai")):
+            os.utime(path, ns=(stat.st_mtime_ns, stat.st_mtime_ns))
+        stamp_file.write_text(stamp)
+        prepared[(name, fasta)] = result
+    if prepared:
+        lines = "".join(f"{name}\t{fasta}\t{copy}\n" for (name, fasta), copy in prepared.items())
+        for path in (prepared_map_path(output), *((graph / "inputs" / "prepared_inputs.tsv",) if graph else ())):
+            known = path.read_text() if path.is_file() else ""
+            write_text(path, known + "".join(line for line in lines.splitlines(True) if line not in known))
+    return prepared
 
 
 def read_samples(path, legacy=False, validate=True):
@@ -558,7 +628,7 @@ def reference(args, cohort, samples):
         with fasta.open() as handle:
             first_fields = handle.readline().lstrip(">").split()
         if not first_fields:
-            raise ValueError(f"Empty reference FASTA header: {fasta}; run tools/prepare_assemblies.py separately")
+            raise ValueError(f"Empty reference FASTA header: {fasta}")
         first = first_fields[0]
         prefix = first.split("#")
         inferred = prefix[0] + "_h" + prefix[1] if len(prefix) >= 2 else sample_pipeline.fasta_stem(fasta)
@@ -1505,7 +1575,14 @@ def main(argv=None):
             p.error(f"Graph assembly list not found: {saved}")
     # Saved build-cohort paths are provenance in singular mode. A distributed
     # summary must work after those source assemblies have been removed.
-    cohort = read_samples(saved, legacy=True, validate=args.mode != 'singular') if saved.is_file() else []
+    cohort = read_samples(saved, legacy=True, validate=False) if saved.is_file() else []
+    # Copies prepared by an earlier --force-prepare run are deleted when it
+    # finishes; its saved lists then point at their inputs again.
+    cohort = restore_prepared_inputs(cohort, read_prepared_map(
+        prepared_map_path(output), saved.parent / "prepared_inputs.tsv"))
+    if args.mode != 'singular':
+        for _name, fasta in cohort:
+            check_fasta(fasta)
     if args.input_list:
         samples = read_samples(absolute(args.input_list))
     elif args.mode == "singular" and args.input:
@@ -1532,12 +1609,52 @@ def main(argv=None):
             p.error('--samples contains names absent from the cohort: ' + ', '.join(sorted(unknown)))
         checked_samples = [(name, fasta) for name, fasta in samples if name in selected]
     checked = set()
+    pending = []
     # Saved graph sources may use legacy contig names. Only assemblies being
     # called and the chosen reference must satisfy the new-input convention.
     for name, fasta in [*checked_samples, ref]:
         if (name, fasta) not in checked:
-            check_prepared(name, fasta)
+            try:
+                check_prepared(name, fasta)
+            except NeedsPreparation as problem:
+                print(f"[LinGraph] WARNING: {problem}" + (
+                          f"\n  A fixed copy is prepared in {output / PREPARED_FOLDER / name} "
+                          "and used instead; the input is not modified."
+                          if args.force_prepare else ""), file=sys.stderr, flush=True)
+                pending.append((name, fasta))
             checked.add((name, fasta))
+    if pending and not args.force_prepare:
+        commands = "\n".join(
+            "  " + shlex.join([sys.executable, str(ROOT / "LinGraph.py"), "prepare", "-i", str(fasta),
+                               "--name", name, "-O", f"prepared_assemblies/{name}", "--contignamefix"])
+            for name, fasta in pending)
+        raise ValueError(
+            f"{len(pending)} assemblies are not ready (see the warnings above): "
+            + ", ".join(name for name, _fasta in pending) + ".\n"
+            "Contig names must start with the assembly's SAMPLE#HAPLOTYPE# prefix (e.g. "
+            "HG002#1#chr1) so that contig names from different assemblies can never "
+            "collide (two assemblies both naming a contig chr1).\n"
+            "Fix their format yourself, for example (soft-masks only unmasked assemblies, "
+            "prefixes contig names, indexes):\n" + commands + "\n"
+            "then point your assembly list at the prepared FASTAs "
+            "(each listed in prepared_assemblies/NAME/query_paths.prepared.txt).\n"
+            "Or rerun with --force-prepare to have LinGraph prepare copies in "
+            f"{output / PREPARED_FOLDER}. Warning: --force-prepare duplicates every one of "
+            "those assemblies on disk (whole FASTAs plus indexes) and can fill the drive; "
+            "the copies are removed when the run finishes.")
+    # A SLURM singular run prepares inside its job (the job reruns LinGraph).
+    prepared = ({} if not pending or (args.slurm and args.mode == "singular")
+                else prepare_assemblies(args, output, pending,
+                                        graph if args.mode == "graph" else None))
+    if pending and args.dry_run and not (args.slurm and args.mode == "singular"):
+        say("Plan stops here: the rest of the plan needs the prepared copies listed above.")
+        return 0
+    if prepared:
+        def use_prepared(rows):
+            return [(name, prepared.get((name, fasta), fasta)) for name, fasta in rows]
+        samples, checked_samples, cohort = (
+            use_prepared(samples), use_prepared(checked_samples), use_prepared(cohort))
+        ref = use_prepared([ref])[0]
     for alternative in args.alternative:
         fasta = absolute(alternative)
         check_fasta(fasta)
@@ -1567,6 +1684,11 @@ def main(argv=None):
         say('DAG preview complete; no workflow jobs were executed.')
     else:
         say("Plan complete; no commands were executed." if args.dry_run else "Complete.")
+        if (output / PREPARED_FOLDER).is_dir() and not args.dry_run:
+            # The prepared copies serve this run only; a failed run keeps them
+            # so its resume reuses them.
+            garbage.discard(output / PREPARED_FOLDER, ignore_errors=True)
+            say(f"Removed prepared assemblies: {output / PREPARED_FOLDER}")
     for path in vcfs:
         say(f"Sample VCF: {path}")
     if (args.mode == "graph" or partial or len(vcfs) > 1) and (

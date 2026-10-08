@@ -167,7 +167,7 @@ def _index_roots(args):
                     args.reference_haplotype = source[0]
                 sample = source[0] if source else (getattr(args, 'reference_haplotype', None) if input_kind == 'reference' else None)
                 contig = source[1] if source else name
-                if not accepted_contig(sample, contig):
+                if not fixed and not accepted_contig(sample, contig):
                     continue
                 emit = bool(length and (stable or (input_kind != 'reference' and
                             name.startswith(('alternative', 'novel')) and

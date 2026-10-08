@@ -62,8 +62,10 @@ from block_partition_alignments import (
 )
 from minsetref_core import IndexedFasta, mp_context, sanitize_id, wrap_fasta
 from summarize_partition_hotspot_segments import (
+    is_imported_template_row,
     query_name_matches_haplotype,
     read_alignment_output,
+    with_imported_templates,
 )
 from uniform_graph_blocks import load_graphfixbreaks
 
@@ -1037,8 +1039,14 @@ def _process_cohort_partition(task: CohortTask) -> CohortResult:
         raise ValueError(
             f"{task.partition}: alignment hotspot index is {bad}, expected 1"
         )
+    # The committed blocking also blocked the graph's imported alternatives
+    # through their identity rows; they are no sample and yield no allele.
+    rows, _beds = with_imported_templates(
+        rows, (), os.path.join(task.directory, f"{task.partition}.FA"),
+    )
     row_samples = [
-        cohort_sample_for_query(row.query_name, _COHORT_SAMPLE_FASTAS)
+        None if is_imported_template_row(row)
+        else cohort_sample_for_query(row.query_name, _COHORT_SAMPLE_FASTAS)
         for row in rows
     ]
     if _COHORT_GFIXBREAKS is None:
@@ -1100,7 +1108,10 @@ def _process_cohort_partition(task: CohortTask) -> CohortResult:
             f"generated={generated_row!r}; committed={committed_row!r}"
         )
 
-    ordered_blocks = sorted(blocked, key=lambda value: (
+    ordered_blocks = sorted((
+        block for block in blocked
+        if row_samples[block.input_index] is not None
+    ), key=lambda value: (
         row_samples[value.input_index] != _COHORT_REFERENCE,
         _COHORT_SAMPLE_ORDER[row_samples[value.input_index]],
         value.input_index, value.region_index,

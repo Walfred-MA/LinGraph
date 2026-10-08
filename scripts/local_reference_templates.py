@@ -126,7 +126,10 @@ def templates_from_graph(
         if source is None:
             continue
         haplotype, source_contig, start_text, end_text, strand = source.groups()
-        if not accepted_contig(haplotype, source_contig):
+        fixed = 'sequence_role=imported_alternative' in fields
+        # An imported alternative's source= is provenance only; the HG38
+        # main-contig rule applies to input assemblies, never to it.
+        if not fixed and not accepted_contig(haplotype, source_contig):
             continue
         start, end = int(start_text), int(end_text)
         if end <= start:
@@ -159,7 +162,7 @@ def templates_from_graph(
             source_end=end,
             storage_strand="+",
             sequence=sequence,
-            fixed='sequence_role=imported_alternative' in fields,
+            fixed=fixed,
         ))
     return templates
 

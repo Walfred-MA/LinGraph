@@ -98,6 +98,9 @@ class UsedNovelRegion:
     local_end: int
     block_id: str
     block_score: str
+    # An imported alternative's record: its coordinates are provenance, so
+    # it joins no input-assembly sweep and no contig filter applies to it.
+    imported: bool = False
 
 
 @dataclasses.dataclass
@@ -195,6 +198,23 @@ def split_coordinate_source(
     haplotype = f"{fields[0]}_{fields[1]}"
     contig = fields[2]
     return haplotype, contig
+
+
+def selected_used_novel_regions(
+    partition: PartitionFiles,
+    known_haplotypes: Iterable[str],
+    ignored_source_contigs: FrozenSet[str],
+) -> List[UsedNovelRegion]:
+    """Used block rows, imported alternatives marked and never filtered."""
+    from fixed_alternatives import partition_templates
+    imported = partition_templates(partition.partition, partition)
+    return [
+        dataclasses.replace(row, imported=True)
+        if row.encoded_name in imported else row
+        for row in parse_used_novel_regions(partition, known_haplotypes)
+        if row.encoded_name in imported
+        or row.source_contig not in ignored_source_contigs
+    ]
 
 
 def parse_used_novel_regions(
@@ -371,10 +391,9 @@ def parse_coordinate_catalog(
         )
         if row.source_contig not in ignored_source_contigs
     ]
-    used_novel_regions = [
-        row for row in parse_used_novel_regions(partition, haplotypes)
-        if row.source_contig not in ignored_source_contigs
-    ]
+    used_novel_regions = selected_used_novel_regions(
+        partition, haplotypes, ignored_source_contigs,
+    )
     return CoordinateCatalog(
         partition,
         headers,
@@ -516,6 +535,8 @@ def load_header_file_catalogs(
                 contig_index[key] = bucket
             bucket.unique_regions.append(row)
         for row in catalog.used_novel_regions:
+            if row.imported:
+                continue
             key = row.haplotype, row.source_contig
             bucket = contig_index.get(key)
             if bucket is None:
@@ -623,13 +644,9 @@ def parse_compact_annotation_catalog(
     return AnnotationCatalog(
         partition,
         unique_rows,
-        [
-            row
-            for row in parse_used_novel_regions(
-                partition, store.haplotypes,
-            )
-            if row.source_contig not in ignored_source_contigs
-        ],
+        selected_used_novel_regions(
+            partition, store.haplotypes, ignored_source_contigs,
+        ),
     )
 
 
@@ -684,9 +701,10 @@ def build_compact_contig_index(
         for row in catalog.unique_regions:
             bucket((row.haplotype, row.source_contig)).unique_regions.append(row)
         for row in catalog.used_novel_regions:
-            bucket((
-                row.haplotype, row.source_contig,
-            )).used_novel_regions.append(row)
+            if not row.imported:
+                bucket((
+                    row.haplotype, row.source_contig,
+                )).used_novel_regions.append(row)
     return index
 
 
@@ -710,7 +728,8 @@ def build_contig_index(
         for row in catalog.unique_regions:
             bucket((row.haplotype, row.source_contig)).unique_regions.append(row)
         for row in catalog.used_novel_regions:
-            bucket((row.haplotype, row.source_contig)).used_novel_regions.append(row)
+            if not row.imported:
+                bucket((row.haplotype, row.source_contig)).used_novel_regions.append(row)
     return index
 
 

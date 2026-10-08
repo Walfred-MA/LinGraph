@@ -51,8 +51,10 @@ from build_folder_uniformbreaks import (
 )
 from partition_hotspot_segments import build_partition_segments
 from summarize_partition_hotspot_segments import (
+    imported_template_rows,
     read_alignment_output,
     select_alignment_rows,
+    with_imported_templates,
     write_final_segments,
 )
 from uniform_graph_blocks import load_graphfixbreaks, read_initial_blocks
@@ -163,6 +165,23 @@ def _outputs_are_current(task: BreakpointTask) -> bool:
     )
 
 
+def _initial_has_contigs(path: str, contigs: Iterable[str]) -> bool:
+    """Whether the initial blocks were derived with these query contigs."""
+    contigs = set(contigs)
+    if not contigs:
+        return True
+    found = set()
+    try:
+        with open(path, "rt") as handle:
+            for line in handle:
+                fields = line.split("\t", 3)
+                if len(fields) > 2:
+                    found.add(fields[2])
+    except OSError:
+        return False
+    return contigs <= found
+
+
 def _base_cache_is_current(
     task: BreakpointTask, metadata: Optional[Dict[str, object]], row_count: int,
 ) -> bool:
@@ -248,7 +267,13 @@ def _process_task(task: BreakpointTask) -> BreakpointResult:
         return BreakpointResult(
             task.partition, "skipped_missing_bed", message=task.bed,
         )
-    if _outputs_are_current(task):
+    # Outputs made before imported alternatives had identity rows must be
+    # rebuilt; their blocks came from an input assembly's contig.
+    imported_contigs = {
+        row.contig for row, _path in imported_template_rows(task.graph)
+    }
+    if (_outputs_are_current(task)
+            and _initial_has_contigs(task.initial, imported_contigs)):
         metadata = _cache_metadata(task.cache) or {}
         return BreakpointResult(
             task.partition, "reused",
@@ -270,6 +295,11 @@ def _process_task(task: BreakpointTask) -> BreakpointResult:
     rows = select_alignment_rows(
         all_rows, _REFERENCE_HAPLOTYPES, _ONLY_REFERENCE,
     )
+    # Imported alternatives define their own blocks through identity rows
+    # (never through an input-assembly contig named like their provenance).
+    # The cache keeps counting only the alignment file's rows.
+    file_row_count = len(rows)
+    rows, _beds = with_imported_templates(rows, (), task.graph)
     if not rows:
         return BreakpointResult(
             task.partition,
@@ -277,7 +307,8 @@ def _process_task(task: BreakpointTask) -> BreakpointResult:
         )
 
     old_metadata = _cache_metadata(task.cache)
-    if _base_cache_is_current(task, old_metadata, len(rows)):
+    if (_base_cache_is_current(task, old_metadata, file_row_count)
+            and _initial_has_contigs(task.initial, imported_contigs)):
         initial_blocks = read_initial_blocks(task.initial)
         graphdb = _GFIXBREAKS.graphDB.load_json(task.cache)
         raw_lengths = old_metadata.get("graph_path_lengths", {})
@@ -352,7 +383,7 @@ def _process_task(task: BreakpointTask) -> BreakpointResult:
         hotspot_index=1,
         graph_name=task.partition,
         graph_fasta=task.graph,
-        row_count=len(rows),
+        row_count=file_row_count,
         block_count=len(initial_blocks),
         output=task.cache,
         source_alignment=task.alignment,

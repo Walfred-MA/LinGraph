@@ -1680,18 +1680,25 @@ def read_partition_reference_targets(
     reference_haplotypes: FrozenSet[str],
 ) -> Tuple[str, Tuple[BlockTarget, ...]]:
     """Resolve one partition's exact Ref target from its ``.header`` and BED."""
+    from fixed_alternatives import partition_templates
     headers = parse_header_records(
         partition_files,
         selected_haplotypes=set(reference_haplotypes),
     )
+    # An imported record is its own sequence: its source= provenance never
+    # selects bases of the reference assembly, even under the same name.
+    imported = partition_templates(mapped_partition, partition_files)
     catalog = CoordinateCatalog(
         partition_files,
         headers,
         [],
-        parse_used_novel_regions(
-            partition_files,
-            {row.haplotype for row in headers},
-        ),
+        [
+            used for used in parse_used_novel_regions(
+                partition_files,
+                {row.haplotype for row in headers},
+            )
+            if used.encoded_name not in imported
+        ],
     )
     targets = _reference_block_targets(
         catalog, reference_haplotypes,

@@ -189,7 +189,8 @@ def resolve_local_sources(events, roots, reachable, sources, catalogs, log,
                 if source is None:
                     raise ValueError(f'{name}: local path lacks source SAMPLE:CONTIG:START-END metadata')
                 sample, contig, low, high, strand = source
-                if not accepted_contig(sample, contig):
+                if ('sequence_role=imported_alternative' not in fields
+                        and not accepted_contig(sample, contig)):
                     if is_template:
                         continue
                     raise ValueError(f'{name}: excluded HG38 non-primary source contig {contig}')

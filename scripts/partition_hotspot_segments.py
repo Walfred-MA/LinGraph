@@ -34,6 +34,7 @@ from summarize_partition_hotspot_segments import (
     select_alignment_rows,
     stabilize_segment_redundancy,
     validate_nonoverlapping_segments,
+    with_imported_templates,
     write_final_segments,
 )
 
@@ -115,8 +116,6 @@ def build_partition_segments(
         [row for row in rows if row.hotspot_index == 1],
         accepted, only_reference,
     )
-    if not filtered:
-        raise ValueError("single-partition alignment contains no hotspot-index 1 rows")
     paths = read_graph_path_records(graph_fasta)
     bed_haplotypes = accepted if only_reference else ()
     if reference_bed:
@@ -128,6 +127,9 @@ def build_partition_segments(
             if os.path.isfile(adjacent)
             else graph_path_reference_bed(graph_fasta, bed_haplotypes)
         )
+    filtered, beds = with_imported_templates(filtered, beds, graph_fasta, paths)
+    if not filtered:
+        raise ValueError("single-partition alignment contains no hotspot-index 1 rows")
     if not beds:
         raise ValueError("reference BED/path selection produced no initial intervals")
 

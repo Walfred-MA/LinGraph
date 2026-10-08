@@ -18,6 +18,7 @@ import sys
 import tempfile
 
 BED_NAME = "alternative_intervals.bed"
+ORIGINAL_BED_NAME = "original_intervals.bed"
 TAG = "ALTERNATIVE_INTERVALS:Z:"
 PROTOCOL = "original-template-call-intervals-v1"
 
@@ -63,6 +64,19 @@ def read_bed(path):
     return intervals
 
 
+def _stored_record_segments(text):
+    """A reference row made of stored record bytes (an imported alternative)."""
+    if not text or not text.startswith("["):
+        return False
+    try:
+        segments = json.loads(text)
+    except ValueError:
+        return False
+    return bool(segments) and all(
+        isinstance(segment, dict) and "record" in segment for segment in segments
+    )
+
+
 def write_bed(summary, output, reference_haplotype="CHM13_h1", all_templates=False):
     """Stream either the legacy nine-column or current graph summary.
 
@@ -72,6 +86,7 @@ def write_bed(summary, output, reference_haplotype="CHM13_h1", all_templates=Fal
     """
     from assembly_contigs import accepted_contig
     rows = set()
+    originals, stored = [], set()
     with open(summary) as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"partition", "type", "source_haplotype", "source_contig",
@@ -79,21 +94,27 @@ def write_bed(summary, output, reference_haplotype="CHM13_h1", all_templates=Fal
         if not required.issubset(reader.fieldnames or ()):
             raise ValueError(f"{summary}: missing columns: {sorted(required - set(reader.fieldnames or ())) }")
         for number, row in enumerate(reader, 2):
-            if row["type"] != "original":
-                continue
-            prefix = partition_prefix(row["partition"])
-            haplotype = row["source_haplotype"]
-            contig = row["source_contig"]
+            if row["type"] == "original":
+                originals.append((number, row))
+            elif row["type"] == "reference" and _stored_record_segments(row.get("segments")):
+                stored.add(row["partition"])
+    for number, row in originals:
+        prefix = partition_prefix(row["partition"])
+        haplotype = row["source_haplotype"]
+        contig = row["source_contig"]
+        # An imported (stored) record is always an alternative of its own;
+        # its source= labels are provenance, never a reason to drop it.
+        if row["partition"] not in stored:
             if not accepted_contig(haplotype, contig):
                 continue
             if not (all_templates or prefix.startswith(("alternative", "novel"))
                     or haplotype != reference_haplotype):
                 continue
-            start, end = int(row["source_start"]), int(row["source_end"])
-            if start < 0 or end <= start:
-                raise ValueError(f"{summary}:{number}: invalid original interval")
-            name = f"{prefix}_{contig}_{start}_{end}"
-            rows.add((contig, start, end, name))
+        start, end = int(row["source_start"]), int(row["source_end"])
+        if start < 0 or end <= start:
+            raise ValueError(f"{summary}:{number}: invalid original interval")
+        name = f"{prefix}_{contig}_{start}_{end}"
+        rows.add((contig, start, end, name))
     destination = Path(output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".alternative_intervals.", dir=destination.parent)
@@ -110,6 +131,75 @@ def write_bed(summary, output, reference_haplotype="CHM13_h1", all_templates=Fal
         if os.path.exists(temporary):
             os.unlink(temporary)
     return len(rows)
+
+
+def write_original_bed(summary, output):
+    """Every partition's original interval in one BED, one line per row.
+
+    The columns are those of each graph folder's ``<partition>.bed``: contig,
+    start, end, partition, 1000, strand, haplotype, graph path ID, start, end,
+    ``source_coordinates``. Unlike the per-graph files, the contig is kept as
+    local_graphs.tsv names it (``chr2`` of HG38_h1 stays ``chr2``). A
+    partition without original rows contributes its reference rows, as the
+    graph folders do.
+    """
+    rows = original_rows(summary)
+    destination = Path(output)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".original_intervals.", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            for row in rows:
+                handle.write("\t".join(map(str, row)) + "\n")
+        os.chmod(temporary, 0o644)   # shared graph caches: readable by everyone
+        if destination.is_file() and destination.read_bytes() == Path(temporary).read_bytes():
+            os.unlink(temporary)
+        else:
+            os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return len(rows)
+
+
+def original_rows(summary):
+    """Rows of write_original_bed from local_graphs.tsv, sorted."""
+    from build_local_graphs import public_path_id_from_values
+    by_partition = {}
+    with open(summary) as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = {"partition", "type", "source_haplotype", "source_contig",
+                    "source_start", "source_end", "strand"}
+        if not required.issubset(reader.fieldnames or ()):
+            raise ValueError(f"{summary}: missing columns: {sorted(required - set(reader.fieldnames or ()))}")
+        for row in reader:
+            if row["type"] in ("original", "reference"):
+                by_partition.setdefault(row["partition"], {}).setdefault(row["type"], []).append(
+                    (row["source_contig"], int(row["source_start"]), int(row["source_end"]),
+                     row["strand"], row["source_haplotype"]))
+    rows = []
+    for partition, kinds in by_partition.items():
+        for contig, start, end, strand, haplotype in kinds.get("original") or kinds.get("reference", ()):
+            path_id = public_path_id_from_values(partition, contig, start, end)
+            rows.append((contig, start, end, partition, 1000, strand, haplotype, path_id,
+                         start, end, "source_coordinates"))
+    rows.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
+    return rows
+
+
+def read_original_bed(path):
+    """Rows of an original_intervals.bed, as written by write_original_bed."""
+    rows = []
+    with open(path) as handle:
+        for number, raw in enumerate(handle, 1):
+            if not raw.strip() or raw.startswith(("#", "track ", "browser ")):
+                continue
+            fields = raw.rstrip("\n").split("\t")
+            if len(fields) < 8:
+                raise ValueError(f"{path}:{number}: expected the original_intervals.bed columns")
+            rows.append((fields[0], int(fields[1]), int(fields[2]), fields[3], fields[4],
+                         fields[5], fields[6], fields[7], *fields[8:]))
+    return rows
 
 
 def merge_intervals(intervals):
@@ -320,7 +410,14 @@ def main(argv=None):
     parser.add_argument("-o", "--output", default="")
     parser.add_argument("--reference-haplotype", default="CHM13_h1")
     parser.add_argument("--all-templates", action="store_true", help="include every original row (template-defined backbone)")
+    parser.add_argument("--original-bed", nargs="?", const="", default=None, metavar="BED",
+                        help=f"instead write every partition's original interval (default: {ORIGINAL_BED_NAME} next to --summary)")
     args = parser.parse_args(argv)
+    if args.original_bed is not None:
+        output = args.original_bed or str(Path(args.summary).parent / ORIGINAL_BED_NAME)
+        count = write_original_bed(args.summary, output)
+        print(f"[original-bed] wrote {count} original intervals to {output}", file=sys.stderr)
+        return 0
     output = args.output or str(Path(args.summary).parent / BED_NAME)
     count = write_bed(args.summary, output, args.reference_haplotype, args.all_templates)
     print(f"[alternative-bed] wrote {count} original intervals to {output}", file=sys.stderr)

@@ -57,7 +57,8 @@ def lift_templates(templates, sources, backbone_fasta, backbone, workdir,
     a different assembly version under the same sample name cannot change or
     block its lift.  ``sources`` and ``flank`` are kept for call compatibility.
     """
-    templates = [t for t in templates if accepted_contig(t.source_haplotype, t.source_contig)]
+    templates = [t for t in templates
+                 if t.fixed or accepted_contig(t.source_haplotype, t.source_contig)]
     results, queries = {}, {}
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)

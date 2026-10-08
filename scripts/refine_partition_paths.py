@@ -1912,7 +1912,7 @@ def build_adjusted_paths(
     query_by_id = {row.query_id: row for row in global_queries}
     suppressed_unique_haplotypes = set(suppress_unique_haplotypes or ())
     score_validated_queries = set(prevalidated_query_ids or ())
-    from fixed_alternatives import FIXED_ROLE, fixed_partitions
+    from fixed_alternatives import ANNOTATION_HAPLOTYPE, FIXED_ROLE, fixed_partitions
     fixed_by_partition = fixed_partitions(partitions)
 
     def build_partition(partition: str):
@@ -1923,26 +1923,25 @@ def build_adjusted_paths(
             )
         fixed = fixed_by_partition.get(partition, {})
         fixed_only = bool(fixed) and all(row.encoded_name in fixed for row in original)
-        fixed_sources = {(item['source_haplotype'], item['source_contig'])
-                         for item in fixed.values()}
         def may_refine(unique):
-            if fixed_only:
-                return False
-            if (unique.haplotype, unique.source_contig) not in fixed_sources:
-                return True
-            # A separate novel template may share the imported record's
-            # provenance sample/contig. Its policy is still independent.
-            return any(row.encoded_name not in fixed and
-                       (row.haplotype, row.source_contig) == (unique.haplotype, unique.source_contig) and
-                       row.source_start < unique.source_end and unique.source_start < row.source_end
-                       for row in original)
-        spans: List[ReferenceSpan] = [
-            ReferenceSpan(
+            # An imported record's source= names no input assembly: input
+            # rows sharing its provenance names are refined like any other.
+            return not fixed_only
+
+        def original_span(row):
+            # An imported record is its own sequence, addressed in its own
+            # record space, never in an input assembly's coordinates.
+            if row.encoded_name in fixed:
+                record = fixed[row.encoded_name]
+                return ReferenceSpan(
+                    ANNOTATION_HAPLOTYPE, f"{ANNOTATION_HAPLOTYPE}#{record['record']}",
+                    0, int(record['end']), 0.0, {f"original:{row.encoded_name}"},
+                )
+            return ReferenceSpan(
                 row.haplotype, row.source_contig, row.source_start,
                 row.source_end, 0.0, {f"original:{row.encoded_name}"},
             )
-            for row in original
-        ]
+        spans: List[ReferenceSpan] = [original_span(row) for row in original]
         if include_reference_unique_spans and not fixed_only:
             for unique in unique_by_partition.get(partition, ()):
                 # Every reference-class row in the partition-cleaned union
@@ -2360,8 +2359,17 @@ def build_adjusted_paths(
         template_spans: DefaultDict[Tuple[str, str], List[Interval]] = (
             defaultdict(list)
         )
+        # Imported records are stored sequences in their own record space;
+        # their provenance intervals select nothing of an input assembly.
+        fixed_provenance = {
+            (row.haplotype, row.source_contig, row.source_start, row.source_end)
+            for row in original if row.encoded_name in fixed
+        }
         for item in provisional:
-            priority, _role, _label, _kind, hap, start, end, contig, _payload = item
+            priority, _role, _label, kind, hap, start, end, contig, _payload = item
+            if (kind in {"original_block", FIXED_ROLE}
+                    and (hap, contig, start, end) in fixed_provenance):
+                continue
             if priority <= 1:
                 template_spans[(hap, contig)].append((start, end))
         template_spans = defaultdict(list, {
