@@ -164,7 +164,7 @@ GAF record (the same mapped bases as above;
 mapped assembly bases; unmapped contigs and unanchored insertions are
 reported separately and are outside every check.
 
-### Trio consistency of the graph's variants
+### Trio consistency of the graph's variants (nodes)
 
 Each merged record is one variant allele of the graph, carried by the
 haplotypes on its line. `trio_line_check.py` checks every record a child
