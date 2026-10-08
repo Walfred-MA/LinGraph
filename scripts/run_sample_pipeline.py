@@ -536,6 +536,14 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
         genomelift_arguments.extend((
             "--non-reference-tags", args.non_reference_tags,
         ))
+    # With the graph's original intervals, the VCF stage writes local-template
+    # coordinates and a final stage moves them onto the alternative loci.
+    alternative_loci = bool(getattr(args, "original_intervals", ""))
+    template_vcf = (
+        paths.vcf.with_name(paths.vcf.name[:-len(".vcf")] + ".templates.vcf")
+        if alternative_loci else paths.vcf
+    )
+    loci_prefix = paths.local_templates.parent / "alternative_loci"
     vcf_arguments: List[object] = [
         "-i", paths.graphcigartoreffix,
         "-r", fasta_reference,
@@ -543,7 +551,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
         "--fasta-query", fasta_query,
         "-m", f"{paths.genomelift},{paths.genomeliftfix}",
         "--pseudo-linear-assignments", paths.pseudolinear,
-        "-o", paths.vcf,
+        "-o", template_vcf,
         "--columns", args.sample,
         "-t", args.threads,
         "--format-processes", args.format_processes,
@@ -659,11 +667,44 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
                 paths.local_templates,
                 Path(str(paths.local_templates) + ".fai"),
             ),
-            outputs=(paths.vcf,),
-            readiness_marker=Path(str(paths.vcf) + ".complete"),
+            outputs=(template_vcf,),
+            readiness_marker=Path(str(template_vcf) + ".complete"),
             readiness_protocol=f"insertion-snps-v1 svcutoff={args.svcutoff}\n",
         ),
     ))
+    if alternative_loci:
+        intervals = clean_path(args.original_intervals, "--original-intervals")
+        novel = clean_path(args.novel_loci, "--novel-loci") if args.novel_loci else None
+        loci_outputs = tuple(Path(str(loci_prefix) + suffix) for suffix in (
+            ".tsv", ".pieces.tsv", ".fa", ".fa.fai"))
+        stages.extend((
+            Stage(
+                name="alternative_loci",
+                command=script_command(
+                    script_dir, "alternative_loci.py",
+                    "-t", paths.local_templates,
+                    "-s" if intervals.name.endswith(".tsv") else "-b", intervals,
+                    *(("-n", novel) if novel else ()),
+                    "-o", loci_prefix,
+                    "-r", fasta_reference, "--reference-haplotype", args.reference_sample,
+                    "-j", args.threads,
+                ),
+                inputs=(paths.local_templates, intervals, script_dir / "alternative_loci.py",
+                        script_dir / "lift_local_templates.py", fasta_reference,
+                        *((novel,) if novel else ())),
+                outputs=loci_outputs,
+            ),
+            Stage(
+                name="alternative_coordinates",
+                command=script_command(
+                    script_dir, "alternative_coordinates.py",
+                    "-i", template_vcf, "-l", loci_prefix, "-o", paths.vcf,
+                ),
+                inputs=(template_vcf, *loci_outputs[:2],
+                        script_dir / "alternative_coordinates.py"),
+                outputs=(paths.vcf,),
+            ),
+        ))
     return paths, stages
 
 
@@ -1071,6 +1112,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="save compact alignments and restore payloads per comparison (default)",
     )
     parser.add_argument('--template-assemblies', default='', help='NAME FASTA [FAI] sources for lifting fallback templates')
+    parser.add_argument(
+        '--original-intervals', default='',
+        help='the graph\'s original block intervals (summary/original_intervals.bed, or '
+             'summary/local_graphs.tsv): report reference-free calls on the run\'s '
+             'alternative loci instead of local templates')
+    parser.add_argument(
+        '--novel-loci', default='',
+        help='original fixed alternatives FASTA (e.g. summary/novel_loci.fa): a merged '
+             'locus identical to one of its records takes that record\'s name')
     parser.add_argument(
         "--max-extension",
         type=int,

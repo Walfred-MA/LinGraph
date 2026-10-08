@@ -125,6 +125,10 @@ Examples:
                            help="use this reference cache folder without validation; default: a GRAPH/references/ cache "
                                 "matching the reference name, mode and contig fingerprint, else one built in OUTPUT/references/")
             q.add_argument("--merge", action="store_true", help="also write cohort SNP/indel/SV VCFs when calling multiple samples (off by default)")
+            q.add_argument("--novel-loci", metavar="FASTA",
+                           help="original fixed alternatives (alternatives and novel loci) with source= headers; "
+                                "a merged alternative locus identical to one of its records takes its name "
+                                "(default: GRAPH/summary/novel_loci.fa when present)")
             q.add_argument("--reuse-alignments", metavar="DIR",
                            help="reuse each sample's graph alignment (hotspots, align.txt, segment summary, blocks) "
                                 "from an earlier singular output DIR made with the same graph, e.g. to call the same "
@@ -1083,6 +1087,14 @@ def singular_mode(args, runner, graph, output, samples, ref, cohort):
         say(f"Reference cache ready: {align.parent}")
         return []
     vcfs = []
+    # Reference-free calls are reported on the run's alternative loci: the
+    # graph's original blocks (merged when touching), not local templates.
+    original_intervals = next((path for path in (
+        package / "original_intervals.bed", graphroot.parent / "original_intervals.bed",
+        package / "local_graphs.tsv") if path.is_file() or (args.dry_run and path.name == "local_graphs.tsv")), None)
+    novel_loci = absolute(args.novel_loci) if args.novel_loci else package / "novel_loci.fa"
+    loci_options = [*(("--original-intervals", str(original_intervals)) if original_intervals else ()),
+                    *(("--novel-loci", str(novel_loci)) if novel_loci.is_file() else ())]
     template_sources = {name: fasta for name, fasta in cohort if fasta.is_file()}
     template_sources.update(samples)
     template_sources[refname] = reffa
@@ -1096,6 +1108,7 @@ def singular_mode(args, runner, graph, output, samples, ref, cohort):
             "-G", str(graphroot), "-L", str(listing), "-O", str(output / "samples"),
             "-t", str(args.threads), "--threads-per-job", str(min(4, args.threads)),
             "--format-processes", str(min(16, args.threads)),
+            *loci_options,
             *cli_options.forward(args, 'sample')])
         options.kmer_searcher = searcher
         options.template_list = str(template_listing)
@@ -1158,6 +1171,11 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     for fasta in (fixed, templates):
         if not args.dry_run and not fasta.is_file():
             raise ValueError(f"--make-graph requires the backbone/catalog and lifted calling templates: {fasta}")
+    # Runs on alternative loci keep the loci that are not a template, lifted,
+    # in alternative_loci.fa next to the templates.
+    loci = templates.with_name("alternative_loci.fa")
+    template_options = ["--local-reference-templates", templates,
+                        *(["--local-reference-templates", loci] if loci.is_file() else [])]
     catalog = graph_root / "summary" / "alternatives.fasta"
     if not catalog.is_file() and (graph / "alternatives.fasta").is_file():
         catalog = graph / "alternatives.fasta"
@@ -1170,7 +1188,7 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     vcf_inputs = cohort_merge.output_paths(output, merge_mode)
     command = ["-v", *vcf_inputs, "-q", query_list,
                "--graph-folder", graph_root, "--reference-haplotype", ref[0],
-               "--local-reference-templates", templates, "-o", output / "cohort.gfa",
+               *template_options, "-o", output / "cohort.gfa",
                "--gfa-mode", "rgfa", "--processes", args.threads,
                "--svonly" if merge_mode == 'svonly' else "--all", "--svcutoff", args.svcutoff]
     if args.reference:
@@ -1178,7 +1196,8 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     if args.insertion_only is not None:
         command += ['--insertion-only', args.insertion_only]
     command += cli_options.forward(args, 'gfa')
-    inputs = [*vcf_inputs, query_list, fixed, templates, *query_sources.values()]
+    inputs = [*vcf_inputs, query_list, fixed, templates, *([loci] if loci.is_file() else []),
+              *query_sources.values()]
     if args.mode == 'singular':
         for value in args.alternative:
             fasta = absolute(value)

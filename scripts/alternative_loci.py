@@ -92,6 +92,7 @@ def build_loci(templates, blocks, log=print, originals=None):
         by_partition[partition].append(block)
         by_prefix[partition_prefix(partition)].append(block)
     owner = {}          # block -> (template, template_start, sequence)
+    by_name = {template.name: template for template in templates}
     whole = []          # templates holding none of their blocks
     counts = defaultdict(int)
     imported = set()    # blocks that are an imported record's own block
@@ -162,10 +163,13 @@ def build_loci(templates, blocks, log=print, originals=None):
                         log(f'[alternative-loci] warning: {name} has the source interval of an '
                             'original alternative but different bases; keeping the merged name')
                     name = record or name
+            first = by_name[owner[run[0]][0]]
             loci.append(dict(name=name, length=end - start, kind='block' if len(run) == 1 else 'merged',
                              haplotype=haplotype, contig=contig, start=start, end=end,
                              strand=strand, blocks=','.join(block[5] for block in run),
-                             sequence=sequence))
+                             sequence=sequence, graph=first.graph_name,
+                             graph_prefix=first.graph_prefix,
+                             fixed=all(by_name[owner[block][0]].fixed for block in run)))
             for block in run:
                 template, offset, bases = owner[block]
                 locus_start = block[3] - start if strand == '+' else end - block[4]
@@ -175,7 +179,9 @@ def build_loci(templates, blocks, log=print, originals=None):
         loci.append(dict(name=template.output_contig, length=length, kind='template',
                          haplotype=template.source_haplotype, contig=template.source_contig,
                          start=template.source_start, end=template.source_end,
-                         strand=template.source_strand, blocks='.', sequence=template.sequence))
+                         strand=template.source_strand, blocks='.', sequence=template.sequence,
+                         graph=template.graph_name, graph_prefix=template.graph_prefix,
+                         fixed=template.fixed))
         pieces.append((template.name, 0, length, template.output_contig, 0))
     names = defaultdict(list)
     for locus in loci:
@@ -204,7 +210,53 @@ def _replace(path, write):
             temporary.unlink()
 
 
-def write_loci(prefix, loci, pieces):
+def locus_records(loci, templates):
+    """LocalTemplate records of the loci that are not already a template.
+
+    A locus with a template's name and bases (a template that is exactly its
+    block, e.g. an imported alternative) stays in local_reference_templates.fa
+    only, so no name is in both files; the same name with other bases is an
+    error.
+    """
+    from local_reference_templates import LocalTemplate
+    sequences = {template.name: template.sequence for template in templates}
+    records = []
+    for locus in loci:
+        known = sequences.get(locus['name'])
+        if known is not None:
+            if known.upper() != locus['sequence'].upper():
+                raise ValueError(f"alternative locus {locus['name']} collides with a local "
+                                 "template of the same name and different bases")
+            continue
+        records.append(LocalTemplate(
+            name=locus['name'], graph_name=locus['graph'], graph_prefix=locus['graph_prefix'],
+            graph_path=locus['name'], source_haplotype=locus['haplotype'],
+            source_contig=locus['contig'], output_contig=locus['name'], start=0,
+            end=locus['length'], source_strand=locus['strand'], source_start=locus['start'],
+            source_end=locus['end'], sequence=locus['sequence'], fixed=locus['fixed']))
+    return records
+
+
+def lift_records(records, backbone_fasta, backbone, threads=1):
+    """Place each locus on the backbone as a whole, by its own sequence.
+
+    lift_local_templates leaves out non-imported records on excluded HG38
+    contigs; they are kept here, unplaced."""
+    import tempfile
+    from dataclasses import replace
+    from lift_local_templates import lift_templates
+    with tempfile.TemporaryDirectory(prefix='.alternative_loci_lift.') as workdir:
+        lifted = {record.name: record
+                  for record in lift_templates(records, {}, backbone_fasta, backbone, workdir, threads)}
+    return [lifted.get(record.name) or replace(
+                record, backbone=backbone, lift_status='unmapped', reference='.',
+                lift_note='not_lifted') for record in records]
+
+
+def write_loci(prefix, loci, pieces, records=()):
+    """PREFIX.tsv and PREFIX.pieces.tsv for every locus; PREFIX.fa(.fai) in
+    the local_reference_templates.fa format for the records given."""
+    from local_reference_templates import write_templates
     prefix = str(prefix)
     Path(prefix).parent.mkdir(parents=True, exist_ok=True)
 
@@ -218,24 +270,7 @@ def write_loci(prefix, loci, pieces):
         for piece in sorted(pieces):
             handle.write('\t'.join(map(str, piece)) + '\n')
 
-    index = []
-
-    def fasta(handle):
-        offset = 0
-        for locus in loci:
-            header = (f">{locus['name']} source={locus['haplotype']}:{locus['contig']}:"
-                      f"{locus['start']}-{locus['end']}{locus['strand']} "
-                      f"length={locus['length']} kind={locus['kind']}\n")
-            handle.write(header)
-            offset += len(header.encode())
-            sequence = locus['sequence']
-            handle.write(sequence + '\n')
-            index.append(f"{locus['name']}\t{len(sequence)}\t{offset}\t"
-                         f"{max(1, len(sequence))}\t{max(1, len(sequence) + 1)}\n")
-            offset += len(sequence) + 1
-
-    _replace(prefix + '.fa', fasta)
-    _replace(prefix + '.fa.fai', lambda handle: handle.write(''.join(index)))
+    write_templates(prefix + '.fa', list(records))
     _replace(prefix + '.tsv', table)
     _replace(prefix + '.pieces.tsv', piece_table)
 
@@ -282,7 +317,13 @@ def main(argv=None):
                              'record take its name')
     parser.add_argument('-o', '--prefix', default='',
                         help='output prefix (default: alternative_loci next to --templates)')
+    parser.add_argument('-r', '--lift-reference', default='',
+                        help='backbone FASTA to lift the loci onto (as lift_local_templates.py)')
+    parser.add_argument('--reference-haplotype', default='', help='backbone name for --lift-reference')
+    parser.add_argument('-j', '--threads', type=int, default=1)
     args = parser.parse_args(argv)
+    if bool(args.lift_reference) != bool(args.reference_haplotype):
+        parser.error('--lift-reference and --reference-haplotype go together')
     templates = read_templates(args.templates, load_sequences=True)
     blocks = (read_original_bed(args.original_intervals) if args.original_intervals
               else original_rows(args.summary))
@@ -291,7 +332,12 @@ def main(argv=None):
                               log=lambda text: print(text, file=sys.stderr),
                               originals=originals)
     prefix = args.prefix or str(Path(args.templates).parent / 'alternative_loci')
-    write_loci(prefix, loci, pieces)
+    records = locus_records(loci, templates)
+    if args.lift_reference and records:
+        records = lift_records(records, args.lift_reference, args.reference_haplotype, args.threads)
+    print(f'[alternative-loci] {len(records)} loci written to {prefix}.fa; '
+          f'{len(loci) - len(records)} are local templates already', file=sys.stderr)
+    write_loci(prefix, loci, pieces, records)
     return 0
 
 

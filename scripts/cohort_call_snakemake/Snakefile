@@ -372,6 +372,20 @@ ACTIVE_PARTITIONS = CHECKPOINTS / "Graphs.list"
 COMPLETE = CHECKPOINTS / "cohort_call.complete"
 EXTRACTION_COMPLETE = CHECKPOINTS / "sample_extraction.complete.json"
 LOCAL_TEMPLATES = CHECKPOINTS / "local_reference_templates.fa"
+# New outputs report reference-free calls on the run's alternative loci (the
+# graph's original blocks, merged when touching); outputs made before keep
+# local-template contigs. Loci that are not a template are in
+# alternative_loci.fa (same format, lifted); the others in LOCAL_TEMPLATES.
+ALTERNATIVE_LOCI = bool(VCF_RUN.get("alternative_loci", False))
+LOCI_PREFIX = CHECKPOINTS / "alternative_loci"
+LOCI_FASTA = Path(str(LOCI_PREFIX) + ".fa")
+LOCI_TABLES = [str(LOCI_PREFIX) + ".tsv", str(LOCI_PREFIX) + ".pieces.tsv"]
+ORIGINAL_INTERVALS = (
+    GRAPH_SUMMARY / "original_intervals.bed"
+    if (GRAPH_SUMMARY / "original_intervals.bed").is_file()
+    else GRAPH_SUMMARY / "local_graphs.tsv"
+)
+NOVEL_LOCI = GRAPH_SUMMARY / "novel_loci.fa"
 RAW_LOCAL_TEMPLATES = CHECKPOINTS / "local_reference_templates.unlifted.fa"
 MERGE_VCF_LIST = INPUTS / "mergevcf.list"
 COHORT_VCF = Path(RUN.get("cohort_vcf", str(OUT / "tmp/cohort_merge/cohort.sv.vcf")))
@@ -585,6 +599,36 @@ rule local_reference_templates:
         """
 
 
+if ALTERNATIVE_LOCI:
+    rule alternative_loci:
+        input:
+            templates=rules.local_reference_templates.output.fasta,
+            intervals=ancient(str(ORIGINAL_INTERVALS)),
+            novel=([ancient(str(NOVEL_LOCI))] if NOVEL_LOCI.is_file() else []),
+            reference=ancient(RUN["reference_fasta"]),
+            script=ancient(str(SCRIPT_DIR / "alternative_loci.py")),
+        output:
+            tables=LOCI_TABLES,
+            fasta=str(LOCI_FASTA),
+            fai=str(LOCI_FASTA) + ".fai",
+        threads: 1 if SLURM_ENABLED else SAMPLE_THREADS
+        resources:
+            io_jobs=1,
+            slurm_jobs=1 if SLURM_ENABLED else 0
+        params:
+            slurm=slurm_prefix("alternative-loci", LIFT_THREADS, once_memory(RUN["extraction_memory"])),
+            source=("-s" if str(ORIGINAL_INTERVALS).endswith(".tsv") else "-b"),
+            novel=(shlex.join(["-n", str(NOVEL_LOCI)]) if NOVEL_LOCI.is_file() else ""),
+        shell:
+            """
+            {params.slurm} {PYTHON:q} {input.script:q} \
+              -t {input.templates:q} {params.source} {input.intervals:q} {params.novel} \
+              -o {LOCI_PREFIX:q} -r {input.reference:q} --reference-haplotype {REFERENCE:q} \
+              -j {LIFT_THREADS}
+            {WAIT_NONEMPTY} {output.tables:q}
+            """
+
+
 rule genomelift_sample:
     input:
         stage_config=LIFTOVER_CONFIG_PATH,
@@ -742,6 +786,43 @@ rule fill_graphcigartoref_gaps_sample:
         """
 
 
+GRAPHREFTOVCF_SHELL = """
+        {params.slurm} {PYTHON:q} {input.script:q} \
+          --input {input.graphcigar:q} --ref {input.reference:q} \
+          --local-reference-templates {input.local_templates:q} \
+          --fasta-query {input.query_fasta:q} \
+          --coord-map {input.genomelift:q},{input.genomeliftfix:q} \
+          --output {output:q} \
+          --columns {wildcards.sample:q} --processes {SAMPLE_THREADS} \
+          --format-processes {FORMAT_PROCESSES} \
+          --edge-blackregion {EDGE_BLACKREGION} \
+          {params.error_bed} \
+          --pseudo-linear-assignments {input.pseudolinear:q} \
+          {params.locus_dup_as_insert} \
+          {CONFLICT_POLICY_OPTION} \
+          {VCF_REALIGNMENT_OPTION} \
+          {SEPARATE_ADJACENT_INDELS_OPTION} \
+          {params.sv_only} \
+          {params.sequence_options} \
+          --max-impute {VCF_MAX_IMPUTE}
+        {WAIT_NONEMPTY} {output:q}
+        """
+if ALTERNATIVE_LOCI:
+    # Call on local templates, then move reference-free calls onto the loci.
+    # The template VCF is named in the command, not as a rule parameter, so
+    # outputs made before keep an identical rule under any Snakemake version.
+    TEMPLATE_VCF = "{SAMPLES_ROOT}/{wildcards.sample}/{wildcards.sample}.templates.vcf"
+    GRAPHREFTOVCF_SHELL = GRAPHREFTOVCF_SHELL.replace(
+        "--output {output:q}", f"--output {TEMPLATE_VCF}",
+    ).replace(
+        "{WAIT_NONEMPTY} {output:q}",
+        f"{{WAIT_NONEMPTY}} {TEMPLATE_VCF}\n"
+        f"{{params.slurm}} {{PYTHON:q}} {{input.coordinates:q}} -i {TEMPLATE_VCF} "
+        "-l {LOCI_PREFIX:q} -o {output:q}\n"
+        "{WAIT_NONEMPTY} {output:q}",
+    )
+
+
 rule graphreftovcf_sample:
     input:
         stage_config=VCF_CONFIG_PATH,
@@ -757,6 +838,9 @@ rule graphreftovcf_sample:
         local_templates=rules.local_reference_templates.output.fasta,
         local_templates_fai=rules.local_reference_templates.output.fai,
         script=ancient(str(SCRIPT_DIR / "graphreftovcf_persample.py")),
+        loci=(LOCI_TABLES if ALTERNATIVE_LOCI else []),
+        coordinates=([ancient(str(SCRIPT_DIR / "alternative_coordinates.py"))]
+                     if ALTERNATIVE_LOCI else []),
     output:
         str(SAMPLES_ROOT / "{sample}" / "{sample}.vcf"),
     threads: 1 if SLURM_ENABLED else SAMPLE_THREADS
@@ -784,27 +868,7 @@ rule graphreftovcf_sample:
             RUN["vcf_memory"],
         ),
     shell:
-        """
-        {params.slurm} {PYTHON:q} {input.script:q} \
-          --input {input.graphcigar:q} --ref {input.reference:q} \
-          --local-reference-templates {input.local_templates:q} \
-          --fasta-query {input.query_fasta:q} \
-          --coord-map {input.genomelift:q},{input.genomeliftfix:q} \
-          --output {output:q} \
-          --columns {wildcards.sample:q} --processes {SAMPLE_THREADS} \
-          --format-processes {FORMAT_PROCESSES} \
-          --edge-blackregion {EDGE_BLACKREGION} \
-          {params.error_bed} \
-          --pseudo-linear-assignments {input.pseudolinear:q} \
-          {params.locus_dup_as_insert} \
-          {CONFLICT_POLICY_OPTION} \
-          {VCF_REALIGNMENT_OPTION} \
-          {SEPARATE_ADJACENT_INDELS_OPTION} \
-          {params.sv_only} \
-          {params.sequence_options} \
-          --max-impute {VCF_MAX_IMPUTE}
-        {WAIT_NONEMPTY} {output:q}
-        """
+        GRAPHREFTOVCF_SHELL
 
 
 rule merge_vcf_list:
@@ -847,6 +911,7 @@ if MERGE_MODE != "snp":
                     ancient(RUN["reference_fasta"]), ancient(RUN["reference_fai"]),
                     rules.local_reference_templates.output.fasta,
                     rules.local_reference_templates.output.fai,
+                    *([str(LOCI_FASTA), str(LOCI_FASTA) + ".fai"] if ALTERNATIVE_LOCI else []),
                 ] if MERGE_EXACT else []
             ),
         output:
@@ -864,6 +929,7 @@ if MERGE_MODE != "snp":
                 "--exact", str(NORMALIZED_QUERY if MERGE_EXACT == "auto" else MERGE_EXACT),
                 "--reference", RUN["reference_fasta"],
                 "--reference", str(LOCAL_TEMPLATES),
+                *(["--reference", str(LOCI_FASTA)] if ALTERNATIVE_LOCI else []),
             ]) if MERGE_EXACT else "",
         shell:
             """

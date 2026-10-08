@@ -75,8 +75,11 @@ def _selected(run, assembly_list=None, samples=None):
     return [run['reference'], *[name for name in requested if name != run['reference']]], assemblies
 
 
-def _run_caller(command, destination, log_path):
-    """Keep the previous VCF intact until its replacement succeeds."""
+def _run_caller(command, destination, log_path, loci_prefix=None):
+    """Keep the previous VCF intact until its replacement succeeds.
+
+    With loci_prefix (outputs on alternative loci), the call is written as
+    NAME.templates.vcf and moved onto the loci as NAME.vcf."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.recall-', dir=destination.parent) as temporary:
         temporary_vcf = Path(temporary) / destination.name
@@ -100,7 +103,15 @@ def _run_caller(command, destination, log_path):
                 raise RuntimeError(f'VCF recall failed for {destination.parent.name}; previous VCF preserved. See {log_path}')
         if not temporary_vcf.is_file() or not temporary_vcf.stat().st_size:
             raise RuntimeError(f'VCF recall produced no VCF: {destination}')
-        temporary_vcf.replace(destination)
+        if loci_prefix is not None:
+            from alternative_coordinates import convert
+            stem = destination.name[:-len('.vcf')]
+            converted = temporary_vcf.with_name(stem + '.loci.vcf')
+            convert(temporary_vcf, loci_prefix, converted, destination.with_name(stem + '.outside.vcf'))
+            temporary_vcf.replace(destination.with_name(stem + '.templates.vcf'))
+            converted.replace(destination)
+        else:
+            temporary_vcf.replace(destination)
         report = temporary_vcf.with_suffix('.inconsistencies.tsv')
         if report.is_file():
             report.replace(destination.with_suffix('.inconsistencies.tsv'))
@@ -160,6 +171,11 @@ def run(output, mode='svonly', *, graph=None, reference=None, assembly_list=None
               template, Path(str(template) + '.fai')]
     scripts = [ROOT / name for name in ('graphreftovcf_persample.py', 'graphreftovcf.py',
                'graph_cigar_payloads.py', 'alternative_intervals.py', 'local_reference_templates.py')]
+    # Outputs on alternative loci (a new output's VCF config) convert each call.
+    loci_prefix = output / 'checkpoints/alternative_loci' if vcf.get('alternative_loci') else None
+    if loci_prefix is not None:
+        shared += [Path(str(loci_prefix) + '.tsv'), Path(str(loci_prefix) + '.pieces.tsv')]
+        scripts.append(ROOT / 'alternative_coordinates.py')
     jobs = []
     missing = set()
     for name in selected:
@@ -213,7 +229,7 @@ def run(output, mode='svonly', *, graph=None, reference=None, assembly_list=None
         print('[cohort-recall] ' + shlex.join(command), flush=True)
         if not dry_run:
             log_path = output / 'logs/vcf_recall' / f'{name}.log'
-            _run_caller(command, destination, log_path)
+            _run_caller(command, destination, log_path, loci_prefix)
             _write_json(marker, dict(signature, outputs=_stamps([destination])))
     return merge.run(output, mode, paths=[job[3] for job in jobs], processes=merge_processes,
                      cutoff=cutoff, kmermatch=kmermatch, dry_run=dry_run,

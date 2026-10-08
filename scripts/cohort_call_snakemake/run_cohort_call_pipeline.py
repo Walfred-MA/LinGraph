@@ -827,9 +827,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "flank": 10000,
         },
     )
+    # New outputs report reference-free calls on alternative loci; an output
+    # made before keeps local-template contigs (its VCF config is unchanged,
+    # so nothing reruns).
+    previous_vcf_config = {}
+    try:
+        previous_vcf_config = json.loads(vcf_config_path.read_text(encoding="utf-8"))
+        alternative_loci = bool(previous_vcf_config.get("alternative_loci", False))
+    except FileNotFoundError:
+        alternative_loci = True
+    except json.JSONDecodeError:
+        alternative_loci = False
     write_stage_config(
         vcf_config_path,
         {
+            **({"alternative_loci": True} if alternative_loci else {}),
             "protocol": "cohort-call-vcf-v5-default-insertion-snps",
             "sv_only_size": args.sv_only_size,
             "sv_only_retention_cutoff": (

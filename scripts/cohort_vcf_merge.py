@@ -102,9 +102,12 @@ def exact_inputs(output, exact, references=()):
         run_config = output/'inputs/cohort_call.run.json'
         if run_config.is_file():
             references.append(json.loads(run_config.read_text())['reference_fasta'])
-        templates = output/'checkpoints/local_reference_templates.fa'
-        if templates.is_file():
-            references.append(str(templates))
+        # Reference-free calls are on alternative loci (or, in older runs,
+        # on local templates); either FASTA holds their sequences.
+        for templates in (output/'checkpoints/alternative_loci.fa',
+                          output/'checkpoints/local_reference_templates.fa'):
+            if templates.is_file():
+                references.append(str(templates))
     if not query_paths.is_file() or not references:
         raise ValueError(
             f'--exact needs a query-path list ({query_paths}) and reference '
