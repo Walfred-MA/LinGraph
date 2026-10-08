@@ -144,7 +144,7 @@ conda activate LinGraph
 
 Results (CHM13):
 
-| | h1, 0 bp | h2, 0 bp | Both, 0 bp | h1, 500 bp | h2, 500 bp | Both, 500 bp |
+| | h1, 0 bp | h2, 0 bp | Both, 0 bp | h1, default | h2, default | Both, default |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Child SVs | 14,977 | 15,482 | 30,459 | 14,977 | 15,482 | 30,459 |
 | Found in mother | 10,563 | 12,151 | 22,714 | 11,020 | 12,475 | 23,495 |
