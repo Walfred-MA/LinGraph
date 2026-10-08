@@ -895,6 +895,31 @@ At three levels:
 3. **Insertions**: called dynamically in each sample. Variants inside an
    inserted sequence are nested rows whose `CHROM` is the insertion's row ID.
 
+### Where do I find the alternative and novel sequences?
+
+Which sequences are alternative or novel depends on the linear reference: a
+sequence absent from CHM13 can be present in GRCh38. So each calling run
+writes the sequences for its own `-r` reference:
+
+| Run | Files |
+| --- | --- |
+| `graph` | `OUTPUT/checkpoints/local_reference_templates.fa` and `OUTPUT/checkpoints/alternative_loci.fa` |
+| `individual` | `OUTPUT/samples/NAME/local_reference_templates.fa` and `OUTPUT/samples/NAME/alternative_loci.fa` |
+
+These are the sequences that VCF rows not placed on the reference are reported
+on. Each record header also records where it lifts onto the reference
+(`reference=CONTIG:START-END:STRAND`), or `lift_status=unmapped` when it does
+not. Runs from before `alternative_loci.fa` was added have only
+`local_reference_templates.fa`.
+
+The graph itself keeps every local graph path that is not an exact slice of
+its construction reference in `GRAPH/summary/alternatives.fasta`. When a graph
+is built, `GRAPH/inputs/reference_alternatives.fa` holds the reference with
+the supplied alternatives, `GRAPH/novel_loci.fa` the discovered novel loci
+(with `--find-novel-loci`), and `GRAPH/inputs/reference_alternatives_novels.fa`
+all of them together. Supplied alternatives are tagged
+`sequence_role=imported_alternative` in their headers.
+
 ### How are duplicated genes represented?
 
 By a primary alignment, reported as an insertion, and an alternative alignment
