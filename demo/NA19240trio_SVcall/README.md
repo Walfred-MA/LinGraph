@@ -169,16 +169,15 @@ cat calls_chm13/samples/NA19240_h1/NA19240_h1.coverage.summary.tsv \
     calls_chm13/samples/NA19240_h2/NA19240_h2.coverage.summary.tsv
 ```
 
-| Scope | Category | NA19240_h1 bases | h1 unmasked | NA19240_h2 bases | h2 unmasked |
+| Scope | Category | NA19240_h1 (Mb) | h1 unmasked (Mb) | NA19240_h2 (Mb) | h2 unmasked (Mb) |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Reference | Not covered, total | 325,035,108 | 61,917,781 | 274,499,509 | 29,741,580 |
-| Reference | chrY | 61,185,773 | 14,303,723 | 61,047,784 | 14,223,817 |
-| Reference | Constitutive satellites | 0 | 0 | 0 | 0 |
-| Reference | Other | 263,849,335 | 47,614,058 | 213,451,725 | 15,517,763 |
-| Assembly | Not covered, total | 167,019,620 | 7,381,459 | 164,909,158 | 6,684,729 |
-| Assembly | N gaps | 1,681,720 | 53,324 | 2,663,556 | 49,612 |
-| Assembly | Scaffold edges | 24,082,705 | 3,244,112 | 28,846,022 | 3,344,457 |
-| Assembly | Other | 141,255,195 | 4,084,023 | 133,399,580 | 3,290,660 |
+| Reference | Not covered, total | 325.04 | 61.92 | 274.50 | 29.74 |
+| Reference | chrY | 61.19 | 14.30 | 61.05 | 14.22 |
+| Reference | Other | 263.85 | 47.61 | 213.45 | 15.52 |
+| Assembly | Not covered, total | 167.02 | 7.38 | 164.91 | 6.68 |
+| Assembly | N gaps | 1.68 | 0.05 | 2.66 | 0.05 |
+| Assembly | Scaffold edges | 24.08 | 3.24 | 28.85 | 3.34 |
+| Assembly | Other | 141.26 | 4.08 | 133.40 | 3.29 |
 
 NA19240 is female, so all of chrY is uncovered. Most other uncovered bases
 are soft-masked repeats (the difference between the two columns). Satellites
