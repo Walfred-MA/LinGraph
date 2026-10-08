@@ -1,7 +1,7 @@
 # LinGraph
 
 LinGraph is a variants-guided **pangenome graph builder** and an
-assembly-based structural variant (SV) caller. Use `singular` for independent VCF calling against an existing
+assembly-based structural variant (SV) caller. Use `individual` for independent VCF calling against an existing
 graph cache, or `graph` for a cohort run that calls variants together while
 building a pangenome graph. LinGraph records lossless variant sequences and assembly coordinates
 information in grVCF and can export cohort calls as a pangenome graph.
@@ -11,7 +11,7 @@ information in grVCF and can export cohort calls as a pangenome graph.
 1. [Workflow overview](#workflow-overview)
 2. [Installation and requirements](#installation-and-requirements)
 3. [Choose a run mode and prepare inputs](#choose-a-run-mode-and-prepare-inputs)
-4. [For singular mode: download and reconstruct Win50KGraph](#for-singular-mode-download-and-reconstruct-win50kgraph)
+4. [For individual mode: download and reconstruct Win50KGraph](#for-individual-mode-download-and-reconstruct-win50kgraph)
 5. [Call one or many samples independently](#call-one-or-many-samples-independently)
 6. [Build a new pangenome graph from a fresh cohort run](#build-a-new-pangenome-graph-from-a-fresh-cohort-run)
 7. [grVCF format and standard VCF conversion](#grvcf-format-and-standard-vcf-conversion)
@@ -25,10 +25,10 @@ information in grVCF and can export cohort calls as a pangenome graph.
 LinGraph partitions assemblies into loci, builds and aligns local graphs, and
 uses those alignments to call variants. Cohort calls retain sequence and graph
 relationships in grVCF and can be exported as a pangenome GFA. Novel-locus
-discovery is optional. For independent VCF calls, `singular` reuses a supplied
+discovery is optional. For independent VCF calls, `individual` reuses a supplied
 graph cache; a cohort `graph` run builds or resumes the graph from the cohort
 assemblies. The downloadable summary below supplies precomputed graph
-information for singular calling.
+information for individual calling.
 
 [Download the workflow figure (PDF)](figures/lingraph_workflow.pdf).
 
@@ -86,14 +86,14 @@ Choose the mode based on the result you need:
 
 | Mode | Use it for | Data needed and reuse |
 | --- | --- | --- |
-| `singular` | **Independent VCF calling**; one call per input haplotype, optionally merged afterward | A reconstructed graph cache and reference FASTA. Reuse a matching reference alignment cache when available. |
+| `individual` | **Independent VCF calling**; one call per input haplotype, optionally merged afterward | A reconstructed graph cache and reference FASTA. Reuse a matching reference alignment cache when available. |
 | `graph` (cohort mode) | **Call a cohort together while building or resuming its pangenome graph** | Cohort assembly list and reference. A fresh run builds the graph under `-G`; a completed graph can be resumed. |
 
-`singular` can process multiple samples in one command, but calls each
+`individual` can process multiple samples in one command, but calls each
 haplotype independently and writes a separate VCF. The `graph` command is the
 cohort workflow: it calls the cohort as part of building the graph.
 
-Recommended windows: for singular calls, reuse a graph cache built with
+Recommended windows: for individual calls, reuse a graph cache built with
 balanced blocks (the supplied Win50KGraph cache uses these). For cohort graph
 construction, use gene blocks; balanced blocks are an alternative when
 prioritizing SV calling. The supplied gene and balanced BEDs use CHM13
@@ -101,7 +101,7 @@ coordinates, so use the matching CHM13 reference.
 
 **Automatic blocks** are also available for cohort graph construction. Omit
 `-b` and `--bed-grouped` and LinGraph chooses windows from the construction
-inputs. Singular mode does not choose windows; it uses the ones in its graph
+inputs. Individual mode does not choose windows; it uses the ones in its graph
 cache. Add `--make-graph` to a cohort run when you also want the pangenome GFA
 file `cohort.gfa`.
 
@@ -176,13 +176,13 @@ Input rules:
 
 See [assembly preparation](tools/assembly_preparation.md) for more options.
 
-## For singular mode: download and reconstruct Win50KGraph
+## For individual mode: download and reconstruct Win50KGraph
 
 **`Win50KGraph.tar.gz`** is the precomputed LinGraph graph-summary package for
 the **balanced-block option**, recommended for individual sample SV calling.
 It reconstructs all local graphs used in variant calling, including repetitive
 regions. Download and extract it, reconstruct the graphs once, then reuse them
-with `singular` mode for new haplotype assemblies.
+with `individual` mode for new haplotype assemblies.
 
 **Figshare DOI:** [10.6084/m9.figshare.33930604](https://doi.org/10.6084/m9.figshare.33930604).
 Download **`Win50KGraph.tar.gz`** (about 2.43 GB) from the Figshare record.
@@ -242,7 +242,7 @@ the command with `--resume` to reuse completed reconstruction outputs.
 After preparing your query assemblies, call against CHM13:
 
 ```bash
-python3 scripts/LinGraph.py singular \
+python3 scripts/LinGraph.py individual \
   -I prepared_assemblies/query_paths.prepared.txt \
   -G Win50KGraph \
   -r /data/references/chm13.fa --reference-name CHM13_h1 \
@@ -260,10 +260,10 @@ that reference's alignments.
 
 ## Call one or many samples independently
 
-Use `singular` to call and annotate **one sample or a batch of samples
+Use `individual` to call and annotate **one sample or a batch of samples
 independently** against an **existing LinGraph graph**.
 Pass the graph root or its `summary/` directory with `-G`. To obtain a graph,
-[download and reconstruct Win50KGraph](#for-singular-mode-download-and-reconstruct-win50kgraph)
+[download and reconstruct Win50KGraph](#for-individual-mode-download-and-reconstruct-win50kgraph)
 or build one with [cohort mode](#build-a-new-pangenome-graph-from-a-fresh-cohort-run).
 
 The examples below use `cohort_graph` as that existing graph. Reference names
@@ -283,7 +283,7 @@ HG003_h2 /data/prepared/HG003.h2.prepared.fasta
 ```
 
 ```bash
-python3 scripts/LinGraph.py singular \
+python3 scripts/LinGraph.py individual \
   -I samples.list -G cohort_graph -r CHM13_h1 \
   -O sample_calls_chm13 -t 16
 ```
@@ -298,7 +298,7 @@ produces separate calls; add `--merge` to also merge them after calling.
 Call against CHM13:
 
 ```bash
-python3 scripts/LinGraph.py singular \
+python3 scripts/LinGraph.py individual \
   -I prepared_assemblies/query_paths.prepared.txt \
   -G cohort_graph -r CHM13_h1 -O sample_calls_chm13 -t 16
 ```
@@ -306,7 +306,7 @@ python3 scripts/LinGraph.py singular \
 Call the same assemblies against GRCh38:
 
 ```bash
-python3 scripts/LinGraph.py singular \
+python3 scripts/LinGraph.py individual \
   -I prepared_assemblies/query_paths.prepared.txt \
   -G cohort_graph -r HG38_h1 -O sample_calls_hg38 -t 16
 ```
@@ -315,7 +315,7 @@ Use an external reference FASTA, including a reference absent from the saved
 cohort:
 
 ```bash
-python3 scripts/LinGraph.py singular \
+python3 scripts/LinGraph.py individual \
   -I prepared_assemblies/query_paths.prepared.txt \
   -G cohort_graph -r /data/references/custom.fa \
   --reference-name CUSTOM_h1 -O sample_calls_custom -t 16
@@ -363,7 +363,7 @@ different HG19 already uses that name), and calls no samples. Rerun the same
 command to resume:
 
 ```bash
-python3 LinGraph/scripts/LinGraph.py singular \
+python3 LinGraph/scripts/LinGraph.py individual \
   -G Win50KGraph -r references/hg19/hg19_main.fa \
   --reference-only -O hg19_cache -t 64 > logs/hg19_cache.log 2>&1
 ```
@@ -376,7 +376,7 @@ cache in its own output folder. Then call against HG19 like any other reference;
 cache is found and reused automatically:
 
 ```bash
-python3 LinGraph/scripts/LinGraph.py singular \
+python3 LinGraph/scripts/LinGraph.py individual \
   -I prepared_assemblies/query_paths.prepared.txt \
   -G Win50KGraph -r references/hg19/hg19_main.fa \
   -O sample_calls_hg19 -t 64 > logs/calls_hg19.log 2>&1
@@ -394,7 +394,7 @@ and a **contig fingerprint**: the SHA-256 of sorted chromosome-name/length
 pairs from the `.fai`. The fingerprint ignores FASTA contents, file names,
 masking, wrapping, `.fai` row order, offsets and timestamps.
 
-`singular` finds its cache automatically:
+`individual` finds its cache automatically:
 
 1. It checks `GRAPH/references/NAME_rig`, then
    `GRAPH/references/NAME_<fingerprint>_rig` (the first 12 characters of the
@@ -457,13 +457,13 @@ individual `.vcf` files can retain smaller candidate events for merging.
 
 A compact summary contains `local_graphs.tsv` and `alternatives.fasta`.
 Reconstruct it with the package's source reference before selecting a different
-calling reference. See the [Win50KGraph instructions](#for-singular-mode-download-and-reconstruct-win50kgraph).
+calling reference. See the [Win50KGraph instructions](#for-individual-mode-download-and-reconstruct-win50kgraph).
 
 ## Build a new pangenome graph from a fresh cohort run
 
 **Cohort mode builds or resumes a pangenome graph from a cohort run.** The
 workflow calls variants across the assemblies as part of graph construction.
-Use this mode for a fresh graph build; use `singular` when you already have a
+Use this mode for a fresh graph build; use `individual` when you already have a
 graph cache and need individual VCFs. It supports thousands of haplotypes.
 
 The `graph` command builds/resumes local graphs and runs cohort variant calling
@@ -544,7 +544,7 @@ for variant calling and graph output:
 The selected `-O` directory receives per-assembly calls under
 `samples/NAME/` and the merged cohort SV, indel, and SNP grVCFs. Keep these
 grVCFs for downstream graph export. The `--all`, `--svonly`, `--svindel`, and
-`--snp` options are primarily for selecting VCF contents in singular runs;
+`--snp` options are primarily for selecting VCF contents in individual runs;
 they do not control graph construction.
 
 Keep `-G` and `-O` **separate and non-nested**. Repeat the same command to resume
@@ -840,7 +840,7 @@ not included.
 
 ```bash
 python3 scripts/LinGraph.py --help
-python3 scripts/LinGraph.py singular --help-all
+python3 scripts/LinGraph.py individual --help-all
 python3 scripts/LinGraph.py graph --help-all
 ```
 

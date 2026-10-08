@@ -126,7 +126,7 @@ like calling one haplotype). It is written to
 command to resume:
 
 ```bash
-python3 LinGraph/scripts/LinGraph.py singular \
+python3 LinGraph/scripts/LinGraph.py individual \
   -G Win50KGraph -r references/hg19/hg19_main.fa --reference-name HG19_h1 \
   --reference-only -O hg19_cache -t 64 > logs/hg19_cache.log 2>&1
 ```
@@ -136,11 +136,11 @@ python3 LinGraph/scripts/LinGraph.py singular \
 Call both haplotypes against HG19 (hours):
 
 ```bash
-python3 LinGraph/scripts/LinGraph.py singular \
+python3 LinGraph/scripts/LinGraph.py individual \
   -I assemblies/prepared/query_paths.prepared.txt \
   -G Win50KGraph \
   -r references/hg19/hg19_main.fa --reference-name HG19_h1 \
-  -O HG002_calls_hg19 -t 64 > logs/singular_hg19.log 2>&1
+  -O HG002_calls_hg19 -t 64 > logs/individual_hg19.log 2>&1
 ```
 
 The HG19 cache is found in `Win50KGraph/references/` automatically. Each

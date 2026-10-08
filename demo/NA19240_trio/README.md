@@ -4,7 +4,7 @@ This tutorial runs LinGraph on the YRI trio assembled by HGSVC3: NA19240
 (child), NA19238 (mother) and NA19239 (father), two haplotypes each. It shows
 two ways to use LinGraph:
 
-- **SV calling with a precomputed graph** (`singular`): call each haplotype
+- **SV calling with a precomputed graph** (`individual`): call each haplotype
   against Win50KGraph, on CHM13 or GRCh38, then check trio consistency.
 - **Building a new pangenome graph** (`graph`): build a trio graph on CHM13
   with gene-based windows and the bundled alternative sequences, call every
@@ -135,24 +135,24 @@ is `assemblies/prepared/query_paths.prepared.txt`.
 Call all six haplotypes against CHM13 (hours):
 
 ```bash
-python3 LinGraph/scripts/LinGraph.py singular \
+python3 LinGraph/scripts/LinGraph.py individual \
   -I assemblies/prepared/query_paths.prepared.txt \
   -G Win50KGraph \
   -r references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna --reference-name CHM13_h1 \
   --reference-caches Win50KGraph/references/CHM13_h1_rig \
-  -O calls_chm13 -t 64 --merge > logs/singular_chm13.log 2>&1
+  -O calls_chm13 -t 64 --merge > logs/individual_chm13.log 2>&1
 ```
 
 The same graph also calls on GRCh38; only the reference and its cache change.
 Use a separate output folder:
 
 ```bash
-python3 LinGraph/scripts/LinGraph.py singular \
+python3 LinGraph/scripts/LinGraph.py individual \
   -I assemblies/prepared/query_paths.prepared.txt \
   -G Win50KGraph \
   -r references/hg38/GRCh38_main.fa --reference-name HG38_h1 \
   --reference-caches Win50KGraph/references/HG38_h1_rig \
-  -O calls_hg38 -t 64 --merge > logs/singular_hg38.log 2>&1
+  -O calls_hg38 -t 64 --merge > logs/individual_hg38.log 2>&1
 ```
 
 Each haplotype is called independently into `calls_chm13/samples/NAME/NAME.vcf`

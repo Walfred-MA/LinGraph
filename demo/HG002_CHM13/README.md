@@ -115,14 +115,14 @@ Calling a haplotype has two parts:
 2. **Reference stages** (from `local_reference_templates` on): the
    alignments projected onto the chosen reference, then the VCF.
 
-`--reuse-alignments DIR` takes part 1 from an earlier `singular` output made
+`--reuse-alignments DIR` takes part 1 from an earlier `individual` output made
 with the same graph, here the HG19 example's `HG002_calls_hg19`. The files are
 hard-linked from `DIR/samples/NAME/`, so it is instant on the same file
 system. Check the plan first: the dry run should list `Would link …` lines
 for both haplotypes:
 
 ```bash
-python3 LinGraph/scripts/LinGraph.py singular \
+python3 LinGraph/scripts/LinGraph.py individual \
   -I assemblies/prepared/query_paths.prepared.txt \
   -G Win50KGraph \
   -r references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna --reference-name CHM13_h1 \
@@ -134,13 +134,13 @@ python3 LinGraph/scripts/LinGraph.py singular \
 Then run it:
 
 ```bash
-python3 LinGraph/scripts/LinGraph.py singular \
+python3 LinGraph/scripts/LinGraph.py individual \
   -I assemblies/prepared/query_paths.prepared.txt \
   -G Win50KGraph \
   -r references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna --reference-name CHM13_h1 \
   --reference-caches Win50KGraph/references/CHM13_h1_rig \
   --reuse-alignments HG002_calls_hg19 \
-  -O HG002_calls_chm13 -t 64 > logs/singular_chm13.log 2>&1
+  -O HG002_calls_chm13 -t 64 > logs/individual_chm13.log 2>&1
 ```
 
 - **Reference cache:** `--reference-caches` uses the CHM13 alignment shipped

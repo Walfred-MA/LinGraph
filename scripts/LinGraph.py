@@ -45,19 +45,19 @@ def parser(show_advanced=False):
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Run modes:
-  singular   Call each sample/haplotype independently; write individual VCFs
+  individual   Call each sample/haplotype independently; write individual VCFs
              against an existing graph cache. A reference cache can be reused.
   graph      Build/resume a pangenome graph from a cohort run; variants are
              called across the assemblies as part of graph construction.
 
-Common run options (place after graph or singular):
-  -G/--graph DIR          Graph save/resume directory; existing graph for singular
+Common run options (place after graph or individual):
+  -G/--graph DIR          Graph save/resume directory; existing graph for individual
   -O/--output DIR         Calling output directory
   -I/--input-list FILE    Assembly list: NAME FASTA per row
   -r/--reference NAME     Reference assembly name or FASTA
   -t/--threads INT        CPU budget (default: up to 16)
   --all / --svonly / --svindel / --snp
-                         VCF output selection, primarily for singular calls
+                         VCF output selection, primarily for individual calls
   --exact                Cohort merge using indexed assemblies (graph default)
   --merge-only           Merge existing per-sample VCFs
   --slurm                Submit work through SLURM
@@ -76,11 +76,11 @@ Graph-only options:
 
 Full options:
   python LinGraph.py graph --help-all
-  python LinGraph.py singular --help-all
+  python LinGraph.py individual --help-all
   python LinGraph.py prepare --help
 
 Examples:
-  python LinGraph.py singular -I samples.list -G graph_cache -O sample_calls
+  python LinGraph.py individual -I samples.list -G graph_cache -O sample_calls
   python LinGraph.py graph -I cohort.list -G cohort_graph -O cohort_calls --exact
   python LinGraph.py --unlock cohort_graph cohort_calls
 """)
@@ -90,7 +90,7 @@ Examples:
     modes = p.add_subparsers(dest="mode", title="commands")
     prepare = modes.add_parser('prepare', add_help=False, help='explicitly prepare assemblies; use prepare --help for all options')
     prepare.add_argument('arguments', nargs=argparse.REMAINDER)
-    for mode in ("graph", "singular"):
+    for mode in ("graph", "individual"):
         # Short help hides options inside mutually exclusive groups, which makes
         # Python < 3.12 argparse fail an assertion while wrapping the usage line.
         q = modes.add_parser(mode, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -103,8 +103,8 @@ Examples:
             epilog=("Examples:\n  python LinGraph.py graph -I cohort.list -G cohort_graph -O calls --exact\n"
                     "  python LinGraph.py graph -I cohort.list -r CHM13_h1 -G cohort_graph -O calls --exact --make-graph"
                     if mode == "graph" else
-                    "Examples:\n  python LinGraph.py singular -i query.fa --sample HG002_h1 -G graph -O calls\n"
-                    "  python LinGraph.py singular -I samples.list -G graph -r reference.fa -O calls --merge")
+                    "Examples:\n  python LinGraph.py individual -i query.fa --sample HG002_h1 -G graph -O calls\n"
+                    "  python LinGraph.py individual -I samples.list -G graph -r reference.fa -O calls --merge")
                     + "\n\nLists: NAME FASTA, one sample/haplotype per row; index: FASTA.fai.\n"
                     "Prepare assemblies separately with LinGraph.py prepare.\n"
                     "LinGraph checks the first sequence and adjacent index; with --force-prepare it\n"
@@ -117,7 +117,7 @@ Examples:
         q.add_argument("-O", "--output", "--output-folder", required=True, help="output directory for VCFs, logs, and run metadata")
         inputs = q.add_mutually_exclusive_group()
         inputs.add_argument("-I", "--input-list", help="NAME FASTA list; graph defaults to its saved cohort list")
-        if mode == "singular":
+        if mode == "individual":
             q.set_defaults(mc_graph=False, gfa_only=False, insertion_only=None, alternative=[])
             inputs.add_argument("-i", "--input", help="one query FASTA (requires --sample)")
             q.add_argument("--sample", help="query name, e.g. HG002_h1, for -i")
@@ -131,7 +131,7 @@ Examples:
                                 "(default: GRAPH/summary/novel_loci.fa when present)")
             q.add_argument("--reuse-alignments", metavar="DIR",
                            help="reuse each sample's graph alignment (hotspots, align.txt, segment summary, blocks) "
-                                "from an earlier singular output DIR made with the same graph, e.g. to call the same "
+                                "from an earlier individual output DIR made with the same graph, e.g. to call the same "
                                 "assemblies against another reference; no content validation")
             q.add_argument("--reference-only", action="store_true",
                            help="build or resume the reference cache for -r FASTA in GRAPH/references/NAME_rig "
@@ -158,7 +158,7 @@ Examples:
                                    help=("BLASTN first; Winnowmap for qualifying unfinished queries (graph default)"
                                          if show_advanced else argparse.SUPPRESS))
         alignment.add_argument("--rigorous", "--slow-rigorous", dest="alignment_mode", action="store_const", const="rigorous",
-                               help=("run BLASTN and Winnowmap for every query (always used by singular)"
+                               help=("run BLASTN and Winnowmap for every query (always used by individual)"
                                      if show_advanced else argparse.SUPPRESS))
         merge_modes = cohort_merge.add_modes(q)
         for action in merge_modes._group_actions:
@@ -170,7 +170,7 @@ Examples:
         if not show_advanced:
             for action in merge_modes._group_actions:
                 if (mode == "graph" and action.dest == "merge_mode") or (
-                    mode == "singular" and action.dest == "exact"
+                    mode == "individual" and action.dest == "exact"
                 ):
                     action.help = argparse.SUPPRESS
         stages = q.add_mutually_exclusive_group()
@@ -192,11 +192,11 @@ Examples:
             q.add_argument("--insertion-only", nargs="?", const=50, type=int, metavar="SIZE",
                            help="export only insertions in --make-graph, minimum size [50]")
         q.add_argument("-slurm", "--slurm", action="store_true",
-                       help="submit graph workflow stages as SLURM jobs; singular/partial runs use one allocation")
+                       help="submit graph workflow stages, or one job per individual haplotype, as SLURM jobs; partial runs use one allocation")
         q.add_argument("--slurm-args", default="", metavar="TEXT", help="quoted sbatch options, passed to each submitted job")
-        if mode == "graph":
-            q.add_argument("--slurm-jobs", type=int, default=None,
-                           help="maximum simultaneous workflow SLURM jobs (default: 20)")
+        q.add_argument("--slurm-jobs", type=int, default=None,
+                       help=("maximum simultaneous workflow SLURM jobs (default: 20)" if mode == "graph" else
+                             "maximum haplotypes called at once, one SLURM allocation each (default: 20)"))
         q.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
                        help="validate inputs and show commands without running or writing files")
         q.add_argument("--help-all", action="help", help="show help including additional settings")
@@ -642,7 +642,7 @@ def reference(args, cohort, samples):
         if not SAMPLE.fullmatch(name):
             raise ValueError("Supply --reference-name SAMPLE_h1 for this reference FASTA")
         if (name in known and known[name] != fasta
-                and (args.mode != 'singular' or name in dict(samples))):
+                and (args.mode != 'individual' or name in dict(samples))):
             raise ValueError(f"Reference name {name} already identifies another FASTA")
         return name, fasta
     defaults = cohort or (samples if args.mode == "graph" else [])
@@ -828,7 +828,7 @@ def find_reference_cache(root, refname, mode, lengths_hash):
     return None
 
 
-def singular_reference(args, runner, graph, ref, graphroot, listing, index,
+def individual_reference(args, runner, graph, ref, graphroot, listing, index,
                        graph_dependencies, ordered_names, searcher):
     """Find, reuse or build the reference cache.
 
@@ -1025,7 +1025,7 @@ def reuse_stage_outputs(source, output, label, stage, runner, graph_inputs, dry_
     return True
 
 
-def singular_mode(args, runner, graph, output, samples, ref, cohort):
+def individual_mode(args, runner, graph, output, samples, ref, cohort):
     refname, reffa = ref
     package = graph if (graph / "local_graphs.tsv").is_file() else graph / "summary"
     graphroot = graph / "Graphs" if (graph / "Graphs").is_dir() else graph
@@ -1079,7 +1079,7 @@ def singular_mode(args, runner, graph, output, samples, ref, cohort):
     graph_dependencies = [listing, template_listing, index, graphroot / "graphs.complete"]
     legacy_graph_dependencies = partition_dependency_paths(graphroot, names)
     searcher = sample_pipeline.prefer_local_executable("KmerSearcher", ROOT)
-    align, blocks = singular_reference(
+    align, blocks = individual_reference(
         args, runner, graph, ref, graphroot, listing, index, graph_dependencies,
         names, searcher,
     )
@@ -1198,7 +1198,7 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     command += cli_options.forward(args, 'gfa')
     inputs = [*vcf_inputs, query_list, fixed, templates, *([loci] if loci.is_file() else []),
               *query_sources.values()]
-    if args.mode == 'singular':
+    if args.mode == 'individual':
         for value in args.alternative:
             fasta = absolute(value)
             command += ['-a', fasta]
@@ -1425,7 +1425,7 @@ def workflow_slurm_options(args, workflow):
     return options
 
 
-def submit(args, argv):
+def submit(args, argv, label=None):
     output = absolute(args.output)
     work = output / "lingraph"
     # Exact option tokens are removed; values and paths are never shell-expanded.
@@ -1441,10 +1441,11 @@ def submit(args, argv):
             continue
         child.append(token)
     command = [sys.executable, str(ROOT / "LinGraph.py"), *child]
-    script = work / "run.slurm.sh"
+    script = work / (f"run.{label}.slurm.sh" if label else "run.slurm.sh")
     content = "#!/bin/bash\nset -euo pipefail\ncd " + shlex.quote(str(Path.cwd())) + "\nexec " + shlex.join(command) + "\n"
     write_text(script, content, args.dry_run)
-    submit_command = ["sbatch", "--wait", "--parsable", "--job-name=LinGraph", "--nodes=1", "--ntasks=1",
+    submit_command = ["sbatch", "--wait", "--parsable", f"--job-name=LinGraph{'-' + label if label else ''}",
+                      "--nodes=1", "--ntasks=1",
                       f"--cpus-per-task={args.threads}", f"--mem={args.slurm_memory or '64G'}", f"--time={args.slurm_time}",
                       "--output=" + str(work / "slurm-%j.log")]
     if args.slurm_account:
@@ -1461,6 +1462,49 @@ def submit(args, argv):
     return subprocess.call(submit_command)
 
 
+def needs_reconstruction(graph):
+    """Whether individual mode will first reconstruct this graph package."""
+    package = graph if (graph / "local_graphs.tsv").is_file() else graph / "summary"
+    graphroot = graph / "Graphs" if (graph / "Graphs").is_dir() else graph
+    return (not graph_list_path(graphroot).is_file() and (package / "local_graphs.tsv").is_file()
+            and (graphroot == graph or not (package / "Graphs.list").is_file()))
+
+
+def submit_per_sample(args, argv, samples, graph):
+    """Individual calling with SLURM: one allocation per haplotype, at most
+    --slurm-jobs at a time, each writing its own samples/NAME/ in the same
+    output; then, with --merge, one allocation that reuses them and merges."""
+    from concurrent.futures import ThreadPoolExecutor
+    base, tokens = [], iter(argv)
+    for token in tokens:
+        if token in {"-I", "--input-list"}:
+            next(tokens)
+            continue
+        if token.startswith("--input-list="):
+            continue
+        base.append(token)
+
+    def call(item):
+        name, fasta = item
+        return submit(args, [*base, "-i", str(fasta), "--sample", name], label=name)
+
+    pending = list(samples)
+    if needs_reconstruction(graph):
+        # The graph is rebuilt once, by the first haplotype's job.
+        first = pending.pop(0)
+        if call(first):
+            raise RuntimeError(f"individual calling failed for {first[0]}; see {absolute(args.output)}/lingraph/slurm-*.log")
+    with ThreadPoolExecutor(max_workers=max(1, args.slurm_jobs or 20)) as pool:
+        codes = list(pool.map(call, pending))
+    failed = [name for (name, _fasta), code in zip(pending, codes) if code]
+    if failed:
+        raise RuntimeError("individual calling failed for " + ", ".join(failed)
+                           + f"; rerun to resume; see {absolute(args.output)}/lingraph/slurm-*.log")
+    if args.merge or args.merge_mode is not None:
+        return submit(args, argv, label="merge")
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == 'prepare':
@@ -1469,10 +1513,10 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.unlock is not None:
         if args.mode is not None:
-            p.error("--unlock is a standalone command; omit graph/singular and run options")
+            p.error("--unlock is a standalone command; omit graph/individual and run options")
         return unlock_workflows(args.unlock, args.dry_run)
     if args.mode is None:
-        p.error("choose graph or singular, or use --unlock")
+        p.error("choose graph or individual, or use --unlock")
     if args.mode == 'prepare':
         p.error('put preparation options after prepare: LinGraph.py prepare --help')
     if getattr(args, 'dag_dry_run', False):
@@ -1497,7 +1541,7 @@ def main(argv=None):
         p.error("--slurm-jobs must be positive")
     partial = args.merge_only or getattr(args, 'recall_only', False) or args.gfa_only
     if partial and getattr(args, 'reference_caches', None):
-        p.error('--reference-caches applies to singular calling, not merge/export-only runs')
+        p.error('--reference-caches applies to individual calling, not merge/export-only runs')
     if getattr(args, 'static_block', False) and (
         args.find_novel_loci is not None or getattr(args, 'annotate_novels', False)
     ):
@@ -1561,18 +1605,18 @@ def main(argv=None):
             return 0
     if args.gfa_only and args.slurm:
         return submit(args, argv)
-    if args.mode == "singular" and args.reuse_alignments and not absolute(args.reuse_alignments).is_dir():
+    if args.mode == "individual" and args.reuse_alignments and not absolute(args.reuse_alignments).is_dir():
         p.error(f"--reuse-alignments folder not found: {args.reuse_alignments}")
-    if args.mode == "singular" and args.reference_only:
+    if args.mode == "individual" and args.reference_only:
         if args.input or args.input_list:
             p.error("--reference-only builds a reference cache; omit -i/-I")
         if not args.reference:
             p.error("--reference-only requires -r reference.fa")
-    if args.mode == "singular":
+    if args.mode == "individual":
         if not (args.input or args.input_list or args.reference_only) and not partial:
-            p.error("singular calling requires -i/--input or -I/--input-list")
+            p.error("individual calling requires -i/--input or -I/--input-list")
         if not graph.is_dir():
-            p.error("singular mode requires an existing graph directory or compact summary directory")
+            p.error("individual mode requires an existing graph directory or compact summary directory")
         if bool(args.input) != bool(args.sample):
             p.error("-i and --sample must be used together")
         if args.sample and not SAMPLE.fullmatch(args.sample):
@@ -1592,27 +1636,27 @@ def main(argv=None):
         saved = absolute(args.graph_assemblies)
         if not saved.is_file():
             p.error(f"Graph assembly list not found: {saved}")
-    # Saved build-cohort paths are provenance in singular mode. A distributed
+    # Saved build-cohort paths are provenance in individual mode. A distributed
     # summary must work after those source assemblies have been removed.
     cohort = read_samples(saved, legacy=True, validate=False) if saved.is_file() else []
     # Copies prepared by an earlier --force-prepare run are deleted when it
     # finishes; its saved lists then point at their inputs again.
     cohort = restore_prepared_inputs(cohort, read_prepared_map(
         prepared_map_path(output), saved.parent / "prepared_inputs.tsv"))
-    if args.mode != 'singular':
+    if args.mode != 'individual':
         for _name, fasta in cohort:
             check_fasta(fasta)
     if args.input_list:
         samples = read_samples(absolute(args.input_list))
-    elif args.mode == "singular" and args.input:
+    elif args.mode == "individual" and args.input:
         fasta = absolute(args.input)
         check_fasta(fasta)
         samples = [(args.sample, fasta)]
-    elif args.mode == "singular" and args.reference_only:
+    elif args.mode == "individual" and args.reference_only:
         samples = []
     else:
         samples = cohort
-    if not samples and not (args.mode == "singular" and args.reference_only):
+    if not samples and not (args.mode == "individual" and args.reference_only):
         p.error("Supply -I cohort.list to build or resume this graph")
     ref = reference(args, cohort, samples)
     checked_samples = samples
@@ -1661,11 +1705,11 @@ def main(argv=None):
             f"{output / PREPARED_FOLDER}. Warning: --force-prepare duplicates every one of "
             "those assemblies on disk (whole FASTAs plus indexes) and can fill the drive; "
             "the copies are removed when the run finishes.")
-    # A SLURM singular run prepares inside its job (the job reruns LinGraph).
-    prepared = ({} if not pending or (args.slurm and args.mode == "singular")
+    # A SLURM individual run prepares inside its job (the job reruns LinGraph).
+    prepared = ({} if not pending or (args.slurm and args.mode == "individual")
                 else prepare_assemblies(args, output, pending,
                                         graph if args.mode == "graph" else None))
-    if pending and args.dry_run and not (args.slurm and args.mode == "singular"):
+    if pending and args.dry_run and not (args.slurm and args.mode == "individual"):
         say("Plan stops here: the rest of the plan needs the prepared copies listed above.")
         return 0
     if prepared:
@@ -1680,7 +1724,9 @@ def main(argv=None):
         if not Path(str(fasta) + ".fai").is_file():
             raise ValueError(f"Missing adjacent index {fasta}.fai; index the alternative FASTA separately before running LinGraph")
     say(f"Preparation checks passed for {len(checked)} assemblies (first sequence, adjacent index and contig-name collisions)")
-    if args.slurm and args.mode == "singular":
+    if args.slurm and args.mode == "individual":
+        if len(samples) > 1:
+            return submit_per_sample(args, argv, samples, graph)
         return submit(args, argv)
     runner = Runner(args)
     if not args.dry_run:
@@ -1696,7 +1742,7 @@ def main(argv=None):
     elif args.mode == "graph":
         vcfs = graph_mode(args, runner, graph, output, samples, ref)
     else:
-        vcfs = singular_mode(args, runner, graph, output, samples, ref, cohort)
+        vcfs = individual_mode(args, runner, graph, output, samples, ref, cohort)
     if args.mc_graph:
         mc_graph(args, runner, graph, output, cohort, samples, ref)
     if getattr(args, 'dag_dry_run', False):
@@ -1704,10 +1750,17 @@ def main(argv=None):
     else:
         say("Plan complete; no commands were executed." if args.dry_run else "Complete.")
         if (output / PREPARED_FOLDER).is_dir() and not args.dry_run:
-            # The prepared copies serve this run only; a failed run keeps them
-            # so its resume reuses them.
-            garbage.discard(output / PREPARED_FOLDER, ignore_errors=True)
-            say(f"Removed prepared assemblies: {output / PREPARED_FOLDER}")
+            # The prepared copies serve this run only (a failed run keeps them
+            # so its resume reuses them). Only this run's assemblies: parallel
+            # haplotype jobs share the output folder.
+            for name in sorted({name for name, _fasta in [*checked_samples, ref]}):
+                if (output / PREPARED_FOLDER / name).is_dir():
+                    garbage.discard(output / PREPARED_FOLDER / name, ignore_errors=True)
+                    say(f"Removed prepared assembly: {output / PREPARED_FOLDER / name}")
+            try:
+                (output / PREPARED_FOLDER).rmdir()
+            except OSError:
+                pass
     for path in vcfs:
         say(f"Sample VCF: {path}")
     if (args.mode == "graph" or partial or len(vcfs) > 1) and (
@@ -1717,7 +1770,7 @@ def main(argv=None):
     if args.mc_graph:
         say(f"GFA: {output / 'cohort.gfa'} (final graph: plus {output / 'gaf/added_links.gfa'})")
         say(f"GAF: {output}/gaf/batch_NNN/SAMPLE.gaf")
-    if args.mode == "singular" and not args.reference_only:
+    if args.mode == "individual" and not args.reference_only:
         say(f"Coverage: {output}/samples/NAME/NAME.coverage.summary.tsv (plus missing-region BEDs)")
     return 0
 

@@ -38,7 +38,7 @@ The command writes uncompressed prepared FASTAs, their `.fai` indexes, and
 graph pipeline's `-q` input.
 
 The tool writes separate copies and refuses to overwrite an input FASTA.
-Use the generated list with `LinGraph.py graph -I` or `LinGraph.py singular -I`.
+Use the generated list with `LinGraph.py graph -I` or `LinGraph.py individual -I`.
 The calling pipelines only check input format; they never mask, rename, or
 index the supplied assemblies automatically. `LinGraph.py prepare` remains
 an explicit shortcut to this standalone tool.

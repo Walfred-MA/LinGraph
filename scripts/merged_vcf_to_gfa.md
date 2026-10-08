@@ -212,7 +212,7 @@ included-root interval/strand translations. Local flanks may extend past a
 trimmed catalog record into its full included root.
 
 `LinGraph.py --make-graph` passes the selected/default backbone, lifted template
-catalog, query assembly list, and `--processes` in graph and singular modes.
+catalog, query assembly list, and `--processes` in graph and individual modes.
 With `-G graph/summary`, the default catalog is located in the parent graph
 directory. Template selection/lift checkpoints record backbone identity; the
 cohort DAG also tracks lifted templates as inputs to the calling stages.

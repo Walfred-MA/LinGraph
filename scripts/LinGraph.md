@@ -4,11 +4,11 @@ Use `scripts/LinGraph.py` as the public command-line entry point for assembly
 preparation, graph construction, variant calling, merging, and GFA export.
 Run the examples from the repository root.
 Local execution is the default. Top-level `-h` explains the two run types:
-`singular` for independent per-haplotype VCFs against an existing graph, and
+`individual` for independent per-haplotype VCFs against an existing graph, and
 `graph` to build or resume a pangenome graph from a cohort run. The cohort's
 variants are called as part of graph construction. Put
 run options after `graph` or
-`singular`; use that command's `--help-all` for the complete calling, merging,
+`individual`; use that command's `--help-all` for the complete calling, merging,
 construction, SLURM, and GFA tuning options.
 Users do not need to invoke the backend scripts directly.
 
@@ -16,7 +16,7 @@ Users do not need to invoke the backend scripts directly.
 python3 scripts/LinGraph.py --help
 python3 scripts/LinGraph.py graph --help
 python3 scripts/LinGraph.py graph --help-all
-python3 scripts/LinGraph.py singular --help-all
+python3 scripts/LinGraph.py individual --help-all
 python3 scripts/LinGraph.py prepare --help
 ```
 
@@ -24,7 +24,7 @@ python3 scripts/LinGraph.py prepare --help
 
 | Task | Options |
 | --- | --- |
-| Singular VCF selection | `--all`, `--svonly`, `--svindel`, `--snp`, `--svcutoff` |
+| Individual VCF selection | `--all`, `--svonly`, `--svindel`, `--snp`, `--svcutoff` |
 | Cohort merge | `--exact` (default for cohort graph runs) |
 | Partial runs | `--recall-only`, `--merge-only`, `--gfa-only`, `--vcf-list` |
 | GFA export | `--make-graph`, `--insertion-only [SIZE]`, `--gfa-mode`, `--max-node-length`, anchor and size filters |
@@ -33,7 +33,7 @@ python3 scripts/LinGraph.py prepare --help
 | Calling and merging | `--samples`, worker counts, per-stage memory, realignment, provenance tags, template fallback, nested insertion and merge thresholds |
 | Construction | `--static-block`, partition batches, novelty discovery, alignment timeout, payloads, and per-partition workers |
 
-Use `graph --help-all` or `singular --help-all` for the complete options for that
+Use `graph --help-all` or `individual --help-all` for the complete options for that
 mode. `--alternative` is a construction FASTA; `--alternative-bed` overrides
 the cohort caller's original-template intervals. Settings that cannot apply to
 a partial run are rejected. `--sequence-similarity` is retained for compatibility;
@@ -49,7 +49,7 @@ each block, this option skips minset discovery and local template refinement;
 the original template coordinates, orientation, and sequence are retained.
 Sample alignment, variant calling, and merging still run. Cohort graph runs
 use `--exact` for merged call inputs; VCF selection options are documented with
-singular calling.
+individual calling.
 
 ```bash
 python scripts/LinGraph.py graph --graph graph -I NA19240trios.txt \
@@ -171,7 +171,7 @@ Use `--exact` for the cohort merge (the default). It writes
 SVs against the indexed assemblies. Add `--make-graph` to also export
 `cohort.gfa`; it does not change the merge mode. The alternative merge modes
 (`--all`, `--svonly`, `--svindel`, and `--snp`) are available for specialized
-cohort output, but are generally used to select contents for singular VCF
+cohort output, but are generally used to select contents for individual VCF
 calling.
 
 Use `--recall-only --exact` to require existing alignments and regenerate the
@@ -266,7 +266,7 @@ LinGraph writes the query assembly list and passes the requested worker count.
 See [merged_vcf_to_gfa.md](merged_vcf_to_gfa.md) for coordinates and VG checks.
 
 The finalized valid partition list is `GRAPH/Graphs.list`. Cohort calling does
-not require a final KmerSearcher cache. Singular calling searches the original
+not require a final KmerSearcher cache. Individual calling searches the original
 `PARTITION.fasta` templates through `GRAPH/Graphs.template.list` and its
 `GRAPH/Graphs.template.list.bin` index; graph alignment still uses the refined
 `PARTITION.FA` files. Refined graph sequences are never substituted for the
@@ -275,13 +275,13 @@ original hotspot templates. Reconstruction creates the templates by default, wit
 graph-path reference. When a calling subset/order differs from an existing
 build-time template list, a separate `.selected.template.list[.bin]` preserves
 that original list and keeps hotspot indices aligned with the calling list.
-Legacy `Graphs.list.bin` files are not used for hotspot discovery. Singular
+Legacy `Graphs.list.bin` files are not used for hotspot discovery. Individual
 startup uses the supplied graph and template index directly: it does not scan
 partition `.FA`/`.fasta` files or validate/rebuild the k-mer index. Index creation
 belongs to graph reconstruction or an explicit `graph_list_cache.py` run.
 For a custom subset passed as `-L selected.list`, supply the matching
 `selected.template.list` and `selected.template.list.bin` in the same partition
-order. No separate dummy-query index-building stage runs during singular startup.
+order. No separate dummy-query index-building stage runs during individual startup.
 KmerSearcher retains its normal missing/legacy-cache handling when it actually
 searches for hotspots.
 
@@ -309,13 +309,13 @@ The graph alignment list is also copied to
 reusing a completed graph. Entries may be bare names (`group1`) or paths
 (`group1/group1.FA`, including absolute paths). Readers take the final path
 component and strip a recognized suffix; dots inside names are preserved.
-For an existing `Graphs/` directory, singular mode can use the summary copy if
+For an existing `Graphs/` directory, individual mode can use the summary copy if
 the graph-root list is absent. It does not discover partitions by scanning their
 FASTA files.
 
-## Singular mode
+## Individual mode
 
-**Singular mode calls samples independently and accepts one or many samples
+**Individual mode calls samples independently and accepts one or many samples
 in one run.** Each haplotype assembly gets its own VCF and coverage report,
 using the same existing graph and reference alignments. `-i` supplies one
 haplotype FASTA; `-I` supplies a list of haplotypes from one or multiple samples.
@@ -323,7 +323,7 @@ haplotype FASTA; `-I` supplies a list of haplotypes from one or multiple samples
 One assembly:
 
 ```bash
-python3 scripts/LinGraph.py singular \
+python3 scripts/LinGraph.py individual \
   -i /assemblies/prepared/HG003.h1.fa --sample HG003_h1 \
   -G cohort_graph -O query_calls
 ```
@@ -331,18 +331,18 @@ python3 scripts/LinGraph.py singular \
 Several assemblies, called independently:
 
 ```bash
-python3 scripts/LinGraph.py singular -I prepared_queries.list \
+python3 scripts/LinGraph.py individual -I prepared_queries.list \
   -G cohort_graph -O query_calls
 ```
 
-Singular mode requires an existing graph. It aligns the reference once and
+Individual mode requires an existing graph. It aligns the reference once and
 reuses that alignment for the queries. It produces one VCF and coverage report
 per input assembly. With only one sample (from `-i` or a one-entry `-I` list),
 calling skips cohort merging, including when `--all` or `--merge` is supplied;
 the result is `OUTPUT/samples/NAME/NAME.vcf`. With multiple samples, add `--merge`
 to also merge the independent calls. Explicit variant-selection options
 (`--all`, `--svonly`, `--svindel`, or `--snp`) also enable merging with multiple
-inputs. Without those options, only separate calls are produced. Singular mode does not
+inputs. Without those options, only separate calls are produced. Individual mode does not
 export GFA, regardless of the number of samples; `--make-graph`,
 `--gfa-only`, and GFA export settings are available only in graph mode.
 Explicit `--merge-only` runs still merge existing VCFs.
@@ -361,7 +361,7 @@ output directory. Existing graphs are used as supplied, without checking for or
 repairing missing individual FASTAs:
 
 ```bash
-python3 scripts/LinGraph.py singular -I prepared_queries.list \
+python3 scripts/LinGraph.py individual -I prepared_queries.list \
   -G graph_summary -r /assemblies/prepared/chm13.fa \
   -O query_calls --all
 ```
@@ -407,7 +407,7 @@ GFA conversion includes SNPs, indels, and SVs by default. Add
 ```text
 OUTPUT/
   samples/NAME/NAME.vcf
-  samples/NAME/NAME.coverage.summary.tsv        # singular mode
+  samples/NAME/NAME.coverage.summary.tsv        # individual mode
   samples/NAME/NAME.coverage.missing_reference.bed
   samples/NAME/NAME.coverage.missing_query.bed
   cohort.snp.vcf                             # --exact (default), --all, or --snp
@@ -423,10 +423,10 @@ OUTPUT/
 ```
 
 Keep `-G` and `-O` separate and non-nested. Repeat the same command after a
-failure. Graph/cohort workflows retain their Snakemake checkpoints. Singular
+failure. Graph/cohort workflows retain their Snakemake checkpoints. Individual
 stages reuse successful outputs only when their recorded commands, input
 sizes/timestamps, and output sizes/timestamps still match. Only VCFs from the
-current input list enter the singular merge; old samples in `-O` are excluded.
+current input list enter the individual merge; old samples in `-O` are excluded.
 
 After an interrupted run has stopped, clear stale workflow locks with:
 
@@ -489,7 +489,7 @@ Jobs that run once per run, whatever the cohort size, request `-t` CPUs (and use
 that many workers) and `--slurm-memory` when it is given: cohort extraction, local
 template discovery and lifting, the SV and small-variant merge scans and concats,
 publish, novel-locus discovery, GFA export, the GAF index, shard plan and shard
-finish, and the one allocation of singular and partial runs. Without
+finish, each individual haplotype, and the one allocation of partial runs. Without
 `--slurm-memory` each keeps its own default (merge scans, concats and publish
 64G below 100 sample VCFs, 128G from 100 on; extraction and local templates `--extraction-memory` 64G, novel-locus
 discovery 128G, GFA export and GAF index 64G, GAF shard plan and finish 16G).
@@ -498,13 +498,18 @@ Per-sample, per-batch, per-chromosome and per-chunk jobs keep their own sizes an
 controls (`--graphcigar-memory`, `--vcf-memory`, `--merge-memory` for the chromosome
 stage, ...; see `--help-all`).
 
-Singular and partial runs (`--merge-only`, `--recall-only`, `--gfa-only`) use one
-allocation and also accept `--slurm-args`. `--slurm-jobs` applies to full graph
-workflows and is rejected for partial runs. Their launch script and
-`slurm-JOBID.log` are under `OUTPUT/lingraph`. Activate the required environment
+Individual mode submits one job per haplotype, at most `--slurm-jobs` (default
+20) at a time, like the per-sample jobs of graph mode; each writes its own
+`samples/NAME/`. With `--merge`, one more job then merges them. A graph package
+that still needs reconstruction is rebuilt by the first haplotype's job before
+the others start; simultaneous jobs share one reference-cache build.
+Partial runs (`--merge-only`, `--recall-only`, `--gfa-only`) use one
+allocation and also accept `--slurm-args`; `--slurm-jobs` is rejected for them.
+Launch scripts (`run[.NAME].slurm.sh`) and `slurm-JOBID.log` are under
+`OUTPUT/lingraph`. Activate the required environment
 before launching; binaries and input paths must be available on compute nodes.
 
 Graph mode uses the existing Snakemake **6.15.1** environment and genomics
 executables documented in [the graph workflow guide](graph_build_snakemake/README.md).
-Singular mode uses the existing KmerSearcher, graph alignment, matching,
+Individual mode uses the existing KmerSearcher, graph alignment, matching,
 liftover, and VCF programs. The interface does not install dependencies.
