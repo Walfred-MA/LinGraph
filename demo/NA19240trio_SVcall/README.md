@@ -169,7 +169,7 @@ cat calls_chm13/samples/NA19240_h1/NA19240_h1.coverage.summary.tsv \
     calls_chm13/samples/NA19240_h2/NA19240_h2.coverage.summary.tsv
 ```
 
-| Scope | Category | NA19240_h1 (Mb) | h1 unmasked (Mb) | NA19240_h2 (Mb) | h2 unmasked (Mb) |
+| Scope | Category | NA19240_h1 total (Mb) | NA19240_h1 unmasked (Mb) | NA19240_h2 total (Mb) | NA19240_h2 unmasked (Mb) |
 | --- | --- | ---: | ---: | ---: | ---: |
 | Reference | Not covered, total | 325.04 | 61.92 | 274.50 | 29.74 |
 | Reference | chrY | 61.19 | 14.30 | 61.05 | 14.22 |

@@ -24,7 +24,8 @@ checked like top-level rows and marked nested.
 Writes one TSV line per row a child haplotype carries (all rows with
 --all-rows) to stdout and a summary by class and variant kind to stderr,
 with consistent (carried by either parent), inconsistent (by neither) and
-inconsistent_percent = 100 * inconsistent / (consistent + inconsistent),
+inconsistency_rate = inconsistent / (consistent + inconsistent) and
+consistency_percent = 100 * consistent / (consistent + inconsistent),
 whatever the phasing.
 
 usage: python trio_line_check.py cohort.sv.vcf [cohort.indel.vcf cohort.snp.vcf] \\
@@ -164,17 +165,18 @@ def main():
                     ]) + '\n')
 
     err = sys.stderr
-    err.write('kind\thaplotype\trows\tconsistent\tinconsistent\ttotal\tinconsistent_percent\n')
+    err.write('kind\thaplotype\trows\tconsistent\tinconsistent\ttotal\tinconsistency_rate\tconsistency_percent\n')
     for group in sorted(rows):
         for hap in ('h1', 'h2'):
             # Either parent: Strand-seq-phased hap1/hap2 are not parent-of-origin.
             in_parents = summary[(group, hap, 'inherited')] + summary[(group, hap, 'other_parent')]
             child_only = summary[(group, hap, 'child_only')]
             total = in_parents + child_only
-            percent = f'{100 * child_only / total:.2f}' if total else 'NA'
-            err.write(f'{group}\t{hap}\t{rows[group]}\t{in_parents}\t{child_only}\t{total}\t{percent}\n')
+            rate = f'{child_only / total:.4f}' if total else 'NA'
+            percent = f'{100 * in_parents / total:.2f}' if total else 'NA'
+            err.write(f'{group}\t{hap}\t{rows[group]}\t{in_parents}\t{child_only}\t{total}\t{rate}\t{percent}\n')
     err.write('consistent: carried by either parent; inconsistent: by neither (a parent callable); '
-              'inconsistent_percent = 100 * inconsistent / total\n')
+              'inconsistency_rate = inconsistent / total; consistency_percent = 100 * consistent / total\n')
 
 if __name__ == '__main__':
     main()

@@ -178,28 +178,28 @@ python LinGraph/benchmark/trio_line_check.py \
 cat trio_calls/trio_lines.summary.tsv
 ```
 
-| Variant | Child haplotype | Records | Consistent | Inconsistent | Total | Inconsistent (%) |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| SV deletion | h1 | 23,896 | 8,772 | 162 | 8,934 | 1.81% |
-| SV deletion | h2 | 23,896 | 9,001 | 172 | 9,173 | 1.88% |
-| SV insertion | h1 | 25,768 | 8,824 | 214 | 9,038 | 2.37% |
-| SV insertion | h2 | 25,768 | 9,172 | 245 | 9,417 | 2.60% |
-| Small deletion | h1 | 1,028,849 | 392,478 | 8,085 | 400,563 | 2.02% |
-| Small deletion | h2 | 1,028,849 | 399,156 | 8,107 | 407,263 | 1.99% |
-| Small insertion | h1 | 992,929 | 379,000 | 8,301 | 387,301 | 2.14% |
-| Small insertion | h2 | 992,929 | 385,161 | 8,072 | 393,233 | 2.05% |
-| SNP | h1 | 7,318,593 | 3,309,027 | 17,184 | 3,326,211 | 0.52% |
-| SNP | h2 | 7,318,593 | 3,359,346 | 12,557 | 3,371,903 | 0.37% |
-| SV deletion (nested) | h1 | 835 | 197 | 22 | 219 | 10.05% |
-| SV deletion (nested) | h2 | 835 | 184 | 9 | 193 | 4.66% |
-| SV insertion (nested) | h1 | 152 | 37 | 5 | 42 | 11.90% |
-| SV insertion (nested) | h2 | 152 | 40 | 1 | 41 | 2.44% |
-| Small deletion (nested) | h1 | 19,546 | 4,107 | 909 | 5,016 | 18.12% |
-| Small deletion (nested) | h2 | 19,546 | 3,991 | 755 | 4,746 | 15.91% |
-| Small insertion (nested) | h1 | 4,427 | 1,080 | 169 | 1,249 | 13.53% |
-| Small insertion (nested) | h2 | 4,427 | 1,008 | 70 | 1,078 | 6.49% |
-| SNP (nested) | h1 | 33,392 | 10,120 | 307 | 10,427 | 2.94% |
-| SNP (nested) | h2 | 33,392 | 9,807 | 141 | 9,948 | 1.42% |
+| Variant | Child haplotype | Records | Consistent | Inconsistent | Total | Inconsistency rate | Trio consistency (%) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SV deletion | h1 | 23,896 | 8,772 | 162 | 8,934 | 0.0181 | 98.19% |
+| SV deletion | h2 | 23,896 | 9,001 | 172 | 9,173 | 0.0188 | 98.12% |
+| SV insertion | h1 | 25,768 | 8,824 | 214 | 9,038 | 0.0237 | 97.63% |
+| SV insertion | h2 | 25,768 | 9,172 | 245 | 9,417 | 0.0260 | 97.40% |
+| Small deletion | h1 | 1,028,849 | 392,478 | 8,085 | 400,563 | 0.0202 | 97.98% |
+| Small deletion | h2 | 1,028,849 | 399,156 | 8,107 | 407,263 | 0.0199 | 98.01% |
+| Small insertion | h1 | 992,929 | 379,000 | 8,301 | 387,301 | 0.0214 | 97.86% |
+| Small insertion | h2 | 992,929 | 385,161 | 8,072 | 393,233 | 0.0205 | 97.95% |
+| SNP | h1 | 7,318,593 | 3,309,027 | 17,184 | 3,326,211 | 0.0052 | 99.48% |
+| SNP | h2 | 7,318,593 | 3,359,346 | 12,557 | 3,371,903 | 0.0037 | 99.63% |
+| SV deletion (nested) | h1 | 835 | 197 | 22 | 219 | 0.1005 | 89.95% |
+| SV deletion (nested) | h2 | 835 | 184 | 9 | 193 | 0.0466 | 95.34% |
+| SV insertion (nested) | h1 | 152 | 37 | 5 | 42 | 0.1190 | 88.10% |
+| SV insertion (nested) | h2 | 152 | 40 | 1 | 41 | 0.0244 | 97.56% |
+| Small deletion (nested) | h1 | 19,546 | 4,107 | 909 | 5,016 | 0.1812 | 81.88% |
+| Small deletion (nested) | h2 | 19,546 | 3,991 | 755 | 4,746 | 0.1591 | 84.09% |
+| Small insertion (nested) | h1 | 4,427 | 1,080 | 169 | 1,249 | 0.1353 | 86.47% |
+| Small insertion (nested) | h2 | 4,427 | 1,008 | 70 | 1,078 | 0.0649 | 93.51% |
+| SNP (nested) | h1 | 33,392 | 10,120 | 307 | 10,427 | 0.0294 | 97.06% |
+| SNP (nested) | h2 | 33,392 | 9,807 | 141 | 9,948 | 0.0142 | 98.58% |
 
 SVs are at least 50 bp. *Total* counts the child-carried records with a
 callable parent; *Consistent* records are also carried by a parent,
