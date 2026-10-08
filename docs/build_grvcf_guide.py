@@ -248,7 +248,7 @@ table(["Situation", "Representation"], [
 ], [68, 106])
 h2("Validation has two independent questions")
 table(["Question", "Current checker output"], [
-    ["Can the represented mapped assembly regions be reconstructed?", "scripts/tools/check_merge_lossless.py reports lossless=yes when its region reconstruction checks pass."],
+    ["Can the represented mapped assembly regions be reconstructed?", "tools/check_merge_lossless.py reports lossless=yes when its region reconstruction checks pass."],
     ["Does each carrier of each row agree with that row's allele and breakpoint?", "The same checker reports unified=yes; mismatches are written to line_check.tsv, including nonzero TEMPLATEOFFSET."],
 ], [82, 92])
 p("A passing check applies to the files, assemblies, reference catalogs, and mapped regions supplied. It does not assert that unmapped bases or filtered-away variants are represented. The per-sample checker supports plain SEQ; retain encoded sequence catalogs when using other sequence modes.", "SmallGr")
@@ -264,7 +264,7 @@ h2("Merge individual grVCFs")
 code("# CIGAR mode (default)\npython tools/merge_grvcfs.py -I vcfs.list -O merged_cigar -t 16\n\n# Recursive / exact mode: indexed assemblies and reference are required\npython tools/merge_grvcfs.py -I vcfs.list -O merged_exact -t 16 \\\n  --exact query_paths.txt --reference-fasta reference.fa")
 p("The cohort merge writes cohort.sv.vcf, cohort.indel.vcf, cohort.snp.vcf, and cohort.samples.headers.gz. Read ##graphvcfmergeVersion=cigar|exact from each merged VCF. A direct LinGraph graph run also uses --exact for its default merged cohort calls.", "SmallGr")
 h2("Check losslessness and shared-row identity")
-code("python scripts/tools/check_merge_lossless.py \\\n  -v merged_exact/cohort.sv.vcf merged_exact/cohort.indel.vcf \\\n     merged_exact/cohort.snp.vcf \\\n  -s samples/*/*.vcf -r reference.fa -q query_paths.txt -o checks")
+code("python tools/check_merge_lossless.py \\\n  -v merged_exact/cohort.sv.vcf merged_exact/cohort.indel.vcf \\\n     merged_exact/cohort.snp.vcf \\\n  -s samples/*/*.vcf -r reference.fa -q query_paths.txt -o checks")
 p("Inspect checks/summary.tsv for lossless and unified. The sample VCFs supply their mapping lines; the query FASTAs supply the expected assembly bases. Add -r for each local reference template FASTA used by the merge.", "SmallGr")
 h2("Split or change representations")
 code("python tools/convert_merged_grvcf.py split \\\n  -v merged_exact/cohort.sv.vcf merged_exact/cohort.indel.vcf \\\n     merged_exact/cohort.snp.vcf -r reference.fa -o individual\n\npython tools/convert_merged_grvcf.py to-exact \\\n  -v merged_cigar/cohort.sv.vcf merged_cigar/cohort.indel.vcf \\\n     merged_cigar/cohort.snp.vcf -r reference.fa -q query_paths.txt \\\n  --reference-fasta reference.fa -O merged_exact")
@@ -283,10 +283,10 @@ code("python tools/grvcf_to_vcf.py \\\n  -i merged_exact/cohort.sv.vcf -o cohort
 p("This is a <b>representative-allele projection</b>. The current streaming exporter removes nested rows and POS=0 records, keeps GT and a small INFO subset, and converts an &lt;INS&gt; allele with plain INFO/SEQ bases to explicit REF/ALT. It does not reconstruct each carrier's complete allele, normalize against a reference, or emit an unplaced sidecar. Graph-encoded insertion SEQ stays symbolic. Keep the original grVCFs for lossless work and graph building.", "SmallGr")
 h2("Files and implementation to consult")
 table(["Purpose", "Repository source"], [
-    ["Caller schema and per-sample sequence encoding", "scripts/graphreftovcf.py; scripts/tools/check_vcf_lossless.py"],
+    ["Caller schema and per-sample sequence encoding", "scripts/graphreftovcf.py; tools/check_vcf_lossless.py"],
     ["Cohort CIGAR / exact layout, nested rows", "scripts/graphvcfmerge.py; scripts/graphvcfmerge_snp_compact.py"],
     ["Merge and convert cohorts", "tools/merge_grvcfs.py; tools/convert_merged_grvcf.py"],
-    ["Reconstruction, graph, standard export", "scripts/tools/check_merge_lossless.py; scripts/merged_vcf_to_gfa.py; tools/grvcf_to_vcf.py"],
+    ["Reconstruction, graph, standard export", "tools/check_merge_lossless.py; scripts/merged_vcf_to_gfa.py; tools/grvcf_to_vcf.py"],
 ], [63, 111], compact=True)
 p("These are LinGraph grVCF conventions, not an independent VCF standard. Read the file's own header as its field schema and retain the producer version and reference identity when sharing data.", "SmallGr")
 

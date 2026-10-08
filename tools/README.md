@@ -109,7 +109,7 @@ merge the split files and the new samples' grVCFs with `merge_grvcfs.py`.
   its insertion SNPs. From an exact merge, a row, its `_F` pieces and the
   sample's SNPs between them become one call again; `_S` rows stay separate.
 - Rebuilt samples reconstruct their assemblies exactly
-  (`scripts/tools/check_vcf_lossless.py`). Split rows keep their merged row
+  (`tools/check_vcf_lossless.py`). Split rows keep their merged row
   IDs, so merging them again keeps the row names.
 - An exact merge keeps no sample breakpoint inside repeated bases. A rebuilt
   insertion takes the equivalent placement that best matches its row's

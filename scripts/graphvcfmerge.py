@@ -4720,6 +4720,64 @@ def _fast_online_candidates(
         yield distance_pick
 
 
+def _fast_online_first_pass(
+    groups: list,
+    member_index: int,
+    members: list,
+    sequences: Sequence[str],
+    load_rank: Dict[int, int],
+    size_threshold: float,
+    sequence_threshold: float,
+    alignment_service,
+) -> Optional[int]:
+    """Slot of the first group a fast-mode probe accepts, or None.
+
+    Same candidates and decisions as probing each group's
+    ``_fast_online_candidates`` in slot order, one alignment at a time, up to
+    the first passing group. Groups are independent until then, so the probes
+    of a window of later groups (doubling from one probe up to four per pool
+    worker) are submitted together; a group's next candidate is aligned only
+    after its previous one failed, and results past the first pass are unused.
+    """
+    sequence = sequences[member_index]
+    limit = max(1, 4 * int(alignment_service.pool.workers))
+    width = 1
+    start = 0
+    while start < len(groups):
+        pending = []
+        while start < len(groups) and len(pending) < width:
+            probes = _fast_online_candidates(
+                groups[start], member_index, members, load_rank,
+                size_threshold,
+            )
+            candidate = next(probes, None)
+            if candidate is not None:
+                pending.append((start, probes, candidate))
+            start += 1
+        width = min(limit, 2 * width)
+        first = None
+        while pending:
+            results = alignment_service.align_pairs(
+                (sequence, sequences[candidate])
+                for _slot, _probes, candidate in pending
+            )
+            retry = []
+            for (slot, probes, _candidate), (similarity, body) in zip(
+                pending, results,
+            ):
+                if similarity >= sequence_threshold and body is not None:
+                    first = slot
+                    break
+                candidate = next(probes, None)
+                if candidate is not None:
+                    retry.append((slot, probes, candidate))
+            # Every retried slot precedes the current first pass.
+            pending = retry
+        if first is not None:
+            return first
+    return None
+
+
 def _nearest_online_subclusters(
     members: list,
     sequences: Sequence[str],
@@ -4757,6 +4815,8 @@ def _nearest_online_subclusters(
         return _fast_pair_alignment(first, second, cache, alignment_core)
 
     fast_mode = bool(context.get("legacy_fast", True))
+    # Pre-success probes go to the shared pool in batches (same decisions).
+    batched = fast_mode and alignment_service is not None
     kmer_index = (
         None if fast_mode
         else _Kmer21Index(context.get("kmer21_library"))
@@ -4772,6 +4832,10 @@ def _nearest_online_subclusters(
             passed: List[dict] = []
             bridge_choices = None
             bridge_alignments = None
+            first_pass = None if not batched else _fast_online_first_pass(
+                groups, member_index, members, sequences, load_rank,
+                size_threshold, sequence_threshold, alignment_service,
+            )
             for slot, group in enumerate(groups):
                 if passed:
                     if bridge_choices is None:
@@ -4801,6 +4865,10 @@ def _nearest_online_subclusters(
                     similarity, body = (bridge_alignments[slot] if bridge_alignments is not None
                                         else pair_alignment(sequence, sequences[candidate], aligner_cache, core))
                     if similarity >= sequence_threshold and body is not None:
+                        passed.append(group)
+                    continue
+                if batched:
+                    if slot == first_pass:
                         passed.append(group)
                     continue
                 if fast_mode:

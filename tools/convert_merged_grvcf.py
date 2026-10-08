@@ -54,7 +54,7 @@ TOOLS = Path(__file__).resolve().parent
 SCRIPTS = (TOOLS.parent / 'scripts' if (TOOLS.parent / 'scripts' / 'cohort_vcf_merge.py').is_file()
            else TOOLS.parent)
 sys.path.insert(0, str(SCRIPTS))
-sys.path.insert(0, str(SCRIPTS / 'tools'))
+sys.path.insert(0, str(TOOLS))
 
 from allele_edges import edge_owned  # noqa: E402
 from check_vcf_lossless import FastaIndex, _open, orient, parse_coord, vcf_unescape  # noqa: E402
@@ -240,7 +240,7 @@ def collect(vcfs, reference, wanted, samples):
 
 
 class Rebuild:
-    """A sample's alleles from its merged rows (cf. scripts/tools/check_merge_lossless.py,
+    """A sample's alleles from its merged rows (cf. tools/check_merge_lossless.py,
     with each observation's own breakpoint and size in the CIGAR version)."""
 
     def __init__(self, sample, exact, stats):

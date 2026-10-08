@@ -9,7 +9,7 @@ import sys
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOLS, CHECKER = ROOT / 'tools', ROOT / 'scripts' / 'tools' / 'check_vcf_lossless.py'
+TOOLS, CHECKER = ROOT / 'tools', ROOT / 'tools' / 'check_vcf_lossless.py'
 SV = ('GT:TYPE:SIZE:EXTENDGRAPHCIGAR:ASSEMBLYCONTIG:QUERYCOORD:TEMPLATEOFFSET:'
       'LIFTCATEGORY:ALLELENAME:LABEL_H')
 SNPF = 'GT:TYPE:SIZE:BASE:ASSEMBLYCONTIG:QUERYCOORD:ALLELENAME:LABEL_H'
