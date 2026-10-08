@@ -13,8 +13,8 @@ It produces exactly the same GFA as the original set-based builder:
 * Links are integer pairs (``id * 2 + orientation``), deduplicated with
   their minimum source rank by sorting, instead of a dict of tuples.
 
-Leaves are still computed by the resolver, one path at a time, but in forked
-worker processes that exit after each batch (so pages they copy are freed).
+Source interval walks are resolved once in dependency order before forking.
+Workers slice those shared walks, reusing each path core for its link walk.
 """
 from array import array
 import gc
@@ -53,7 +53,7 @@ def source_order(roots, events, resolver, header_lengths, stable):
 def _leaf_batch(bounds):
     """Leaves of specs[lo:hi] as flat arrays (link leaves, then path leaves)."""
     low, high = bounds
-    specs, roots, resolver, anchor, ids, path_leaves, link_leaves, ranks = _STATE
+    specs, roots, resolver, anchor, ids, path_leaves, link_leaves, ranks, paired_leaves = _STATE
     source, start, end, orient = array('q'), array('q'), array('q'), array('b')
     link_counts, path_counts, spec_ranks = array('q'), array('q'), array('q')
 
@@ -69,8 +69,11 @@ def _leaf_batch(bounds):
         return len(leaves)
 
     for spec in specs[low:high]:
-        link = link_leaves(spec, roots, resolver, anchor)
-        path = path_leaves(spec, roots, resolver, anchor)
+        if paired_leaves is None:
+            link = link_leaves(spec, roots, resolver, anchor)
+            path = path_leaves(spec, roots, resolver, anchor)
+        else:
+            path, link = paired_leaves(spec, roots, resolver, anchor)
         link_counts.append(add(link))
         path_counts.append(-1 if path == link else add(path))
         spec_ranks.append(ranks[spec.source] if ranks is not None else 0)
@@ -81,11 +84,13 @@ def _leaf_batch(bounds):
 
 
 def collect_leaves(specs, roots, resolver, anchor, ids, path_leaves, link_leaves,
-                   processes, log):
+                   processes, log, paired_leaves=None):
     """Compute every spec's leaves, in parallel when fork is available."""
     global _STATE
+    if hasattr(resolver, 'prepare_sources'):
+        resolver.prepare_sources(anchor, log)
     ranks = getattr(resolver, 'ranks', None)
-    _STATE = specs, roots, resolver, anchor, ids, path_leaves, link_leaves, ranks
+    _STATE = specs, roots, resolver, anchor, ids, path_leaves, link_leaves, ranks, paired_leaves
     count = len(specs)
     batch = max(256, math.ceil(count / max(1, processes * 16)))
     bounds = [(low, min(count, low + batch)) for low in range(0, count, batch)]
@@ -144,16 +149,26 @@ def _keys(source, point):
 
 def boundaries(leaves, stable, max_node_length):
     """Sorted unique cut keys from all leaves (plus node chopping in rGFA)."""
-    parts = [_keys(leaves.source, leaves.start), _keys(leaves.source, leaves.end)]
+    starts, ends = _keys(leaves.source, leaves.start), _keys(leaves.source, leaves.end)
+    parts = [starts, ends]
     if stable:
-        counts = np.maximum(0, (leaves.end - leaves.start - 1) // max_node_length)
-        total = int(counts.sum())
-        if total:
+        rows = np.flatnonzero(leaves.end - leaves.start > max_node_length)
+        if len(rows):
+            # Copies can visit a long source thousands of times. Chop each
+            # source/start only once, through its furthest requested end.
+            # Shorter ends remain in `parts`, preserving every original cut.
+            # This avoids allocating one chromosome's cuts per visiting path.
+            order = rows[np.argsort(starts[rows], kind='stable')]
+            first = np.r_[0, np.flatnonzero(starts[order][1:] != starts[order][:-1]) + 1]
+            begin = starts[order[first]]
+            stop = np.maximum.reduceat(ends[order], first)
+            counts = (stop - begin - 1) // max_node_length
+            total = int(counts.sum())
             row = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
             first = np.zeros(len(counts), np.int64)
             np.cumsum(counts[:-1], out=first[1:])
             step = np.arange(total, dtype=np.int64) - first[row] + 1
-            parts.append(_keys(leaves.source[row], leaves.start[row] + step * max_node_length))
+            parts.append(begin[row] + step * max_node_length)
     return np.unique(np.concatenate(parts))
 
 

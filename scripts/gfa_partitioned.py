@@ -41,7 +41,7 @@ import gfa_topology as topology
 from gfa_interval_pipeline import (
     CHUNK, Event, Hit, PathSpec, QueryCandidates, Root, Run, _copy_parts,
     _drop_unverified, _extract_queries, _flatten, _index_roots, _link_leaves,
-    _path_leaves, _prepare_intervals, _reachable_events, _report_unresolved,
+    _path_leaves, _path_and_link_leaves, _prepare_intervals, _reachable_events, _report_unresolved,
     _valid_name, _write_links, _write_metadata, _write_parts, _write_segments,
     _write_source_sidecars, _write_variant_index)
 from gfa_interval_metadata import TEMPLATE_PATH
@@ -315,6 +315,7 @@ def _partition_pass(args, number, select, context, work, log):
         hits = {}
         resolver = StableResolver(events, roots, header_lengths, hits, reachable,
                                   args.nested_pos_base, source_aliases=source_aliases)
+        resolver.index_variants()
         init_order = list(resolver.order)
         # Ranks are assigned in init order before any drop removes some.
         base_rank = resolver.ranks[init_order[0]] if init_order else 0
@@ -374,7 +375,8 @@ def _partition_pass(args, number, select, context, work, log):
         ids = dict(context['root_ids'])
         ids.update((name, root_count + offset) for offset, name in enumerate(init_order))
         leaves = topology.collect_leaves(specs, roots, resolver, args.anchor, ids,
-                                         _path_leaves, _link_leaves, args.processes, log)
+                                         _path_leaves, _link_leaves, args.processes, log,
+                                         paired_leaves=_path_and_link_leaves)
         ids = None
         keys = topology.boundaries(leaves, True, args.max_node_length)
         split = np.searchsorted(keys, root_count << topology.POINT_BITS)
@@ -623,7 +625,8 @@ def _number(args, folders, context, root_resolver, log):
              for root in sorted((root for root in roots.values() if root.emit),
                                 key=lambda value: value.order)]
     leaves = topology.collect_leaves(specs, roots, root_resolver, args.anchor, root_ids,
-                                     _path_leaves, _link_leaves, args.processes, log)
+                                     _path_leaves, _link_leaves, args.processes, log,
+                                     paired_leaves=_path_and_link_leaves)
     key_parts = [topology.boundaries(leaves, True, args.max_node_length)]
     forbidden = _digits(roots)
     hashes = [hash(name) for name in roots]

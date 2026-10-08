@@ -19,6 +19,8 @@ allele with nested rows gets a walk too.
 """
 from array import array
 from collections import defaultdict
+from itertools import groupby
+from operator import itemgetter
 import re
 import time
 
@@ -45,21 +47,28 @@ def _involved(events, resolver, repeated=()):
 
     ``repeated``: insertions with two alleles of one sample, which can
     follow themselves at their breakpoint."""
-    spans = {name: resolver.breakpoints(name) for name in resolver.order}
-    starts, ends = defaultdict(list), defaultdict(list)
-    children = defaultdict(list)
-    for name, (start, end) in spans.items():
-        chrom = events[name].chrom
-        starts[chrom, start].append(name)
-        ends[chrom, end].append(name)
-        children[chrom].append(name)
+    coordinates = resolver.index_variants()
+    spans, children = coordinates.spans, coordinates.by_parent
     seeds = set()
-    for key, enders in ends.items():
-        starters = starts.get(key)
-        # Rows ending where rows start (a lone point row only abuts itself).
-        if starters and (len(enders) > 1 or len(starters) > 1 or enders[0] != starters[0]):
-            seeds.update(enders)
-            seeds.update(starters)
+    for rows in children.values():
+        # Merge sorted boundaries, rather than allocating two dictionaries of
+        # lists keyed by every chromosome/position in a SNP cohort.
+        starts = groupby(rows, key=itemgetter(0))
+        ends = groupby(sorted(rows, key=itemgetter(1)), key=itemgetter(1))
+        first, last = next(starts, None), next(ends, None)
+        while first is not None and last is not None:
+            if first[0] < last[0]:
+                first = next(starts, None)
+            elif last[0] < first[0]:
+                last = next(ends, None)
+            else:
+                starters = [row[2] for row in first[1]]
+                enders = [row[2] for row in last[1]]
+                # A lone zero-length insertion only abuts itself.
+                if len(enders) > 1 or len(starters) > 1 or enders[0] != starters[0]:
+                    seeds.update(enders)
+                    seeds.update(starters)
+                first, last = next(starts, None), next(ends, None)
     for name, (start, end) in spans.items():
         if name in repeated and start == end:
             seeds.add(name)
@@ -71,7 +80,8 @@ def _involved(events, resolver, repeated=()):
         name = pending.pop()
         if name not in involved:
             involved.add(name)
-            pending.extend(children.get(_allele_parent(events[name], resolver.roots), ()))
+            pending.extend(row[2] for row in children.get(
+                _allele_parent(events[name], resolver.roots), ()))
     return involved, spans
 
 

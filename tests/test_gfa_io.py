@@ -170,7 +170,11 @@ def test_converter_outputs_match_with_preload_workers_and_partitions(tmp_path):
     svs = tmp_path/'sv.vcf'
     svs.write_text(header +
         f'alt\t100\tI_1\tN\t<INS>\t.\tPASS\tSVTYPE=INS;SVLEN=30;END=100;SEQ={"C"*30}\t'
-        f'{SV_FORMAT_LEGACY}\t1:INS:30:>30=:ctg:600-630+:allele:0H\n')
+        f'{SV_FORMAT_LEGACY}\t1:INS:30:>30=:ctg:600-630+:allele:0H\n' +
+        'chr1\t500\tI_2\tN\t<INS>\t.\tPASS\tSVTYPE=INS;SVLEN=30;END=500;SEQ=>I_1:30=\t'
+        f'{SV_FORMAT_LEGACY}\t1:INS:30:>30=:ctg:600-630+:allele:0H\n' +
+        'I_2\t5\tI_3\tN\t<INS>\t.\tPASS\tSVTYPE=INS;SVLEN=10;END=5;SEQ=>I_1:4H10=\t'
+        f'{SV_FORMAT_LEGACY}\t1:INS:10:>10=:ctg:604-614+:allele:0H\n')
     script = Path(pipeline.__file__).with_name('merged_vcf_to_gfa.py')
     common = [sys.executable, str(script), '-v', str(svs), str(snps), '-q', str(queries),
               '-r', reference, '--local-reference-templates', template,

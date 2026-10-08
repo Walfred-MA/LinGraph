@@ -376,10 +376,28 @@ both graph size and memory relative to the legacy local graph.
 Topology (`gfa_topology.py`) is built from integer arrays rather than Python
 sets and tuples: each cut point is one int64 key (source ID in segment order,
 then coordinate), segments are pairs of consecutive keys, and links are
-deduplicated with their minimum rank by sorting. Path leaves are resolved,
-and S/P lines written, by `--processes` forked workers that each exit after
-one batch; the parent concatenates the blocks in order, so the GFA is
-byte-identical for any worker count. Log lines `Topology: ...` report the
+deduplicated with their minimum rank by sorting. The interval planner
+(`gfa_interval_nodes.py`) prepares shared source intervals before topology:
+
+1. Index `(start, end, variant ID, type)` by chromosome or parent insertion
+   and sort each list. SNPs use `[POS-1, POS)`; insertion anchors have equal
+   start and end. This index also supplies adjacency checks for carrier links.
+2. Resolve composite variant paths in parent/copy dependency order. Each
+   path refers to verified query intervals or reference/alternative intervals;
+   nested `=` runs reuse already resolved sources. Complete forward copies
+   share one interval table. Simple literal variants need no additional table.
+3. Slice these shared tables with binary searches when building paths. Cached
+   parent boundary flanks avoid repeated walks through nested ancestors. Each
+   path's core is resolved once for both its P line and its link walk.
+   Node chopping is computed once per source/start through the furthest used
+   end, rather than generating the same cuts for every copy of that interval.
+
+This retains run boundaries, node cuts, and the existing segment numbering;
+it does not create duplicate sequence strings for copied alleles. Workers
+inherit the interval tables through fork, and the parent concatenates S/P
+blocks in their established order. Normal and partitioned output use the same
+planner. The `Intervals: ...` log reports dependency depth and preparation time.
+Log lines `Topology: ...` report the
 time of each stage. Progress is written to stderr (the Slurm `.err` file),
 including catalog/dependency resolution, metadata writing, and carrier junctions.
 

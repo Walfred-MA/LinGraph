@@ -584,6 +584,8 @@ def _drop_unverified(events, resolver, intervals, dropped, unresolved, aliases, 
             if parent is not None:
                 reasons[name] = f'depends_on_dropped: {aliases.get(parent, parent)}'
         resolver.order = [name for name in order if name not in reasons]
+        resolver.variant_intervals = None
+        resolver.source_intervals = None
         for name in reasons:
             resolver.ranks.pop(name, None)
     else:
@@ -701,6 +703,24 @@ def _link_leaves(spec, roots, resolver, anchor):
         # Even --anchor 0 must attach the allele to its parent graph.
         return resolver.local_path(spec.source, spec.start, spec.end, max(1, anchor))
     return _path_leaves(spec, roots, resolver, anchor)
+
+
+def _path_and_link_leaves(spec, roots, resolver, anchor):
+    """Resolve the core once and reuse it when attaching the parent flanks."""
+    path = _path_leaves(spec, roots, resolver, anchor)
+    if not hasattr(resolver, 'ranks') or spec.kind in ('junction', 'deletion'):
+        return path, path
+    attached = (spec.kind in ('insertion', 'snp', 'substitution') or
+                (spec.source in roots and roots[spec.source].lift))
+    if not attached:
+        return path, path
+    if spec.kind not in ('reference', 'alternative', 'novel', 'duplication',
+                         'insertion', 'snp', 'substitution'):
+        return path, _link_leaves(spec, roots, resolver, anchor)
+    flank = max(1, anchor)
+    link = (resolver._flank(spec.source, spec.start, flank, 'left') + path +
+            resolver._flank(spec.source, spec.end, flank, 'right'))
+    return path, link
 
 
 class _OpenFiles:
@@ -1042,6 +1062,9 @@ def _run(args, candidates, bed, log):
         add_duplication_paths(events, roots, dup_alignments, source_aliases, Run, Root, log)
         resolver = StableResolver(events, roots, header_lengths, hits, reachable,
                                   args.nested_pos_base, source_aliases=source_aliases)
+        coordinates = resolver.index_variants()
+        log(f'Indexed variant coordinates on {len(coordinates.by_parent)} chromosomes/insertion parents')
+        del coordinates
         stable_names = [aliases.get(name, name) for name in resolver.order] + list(roots)
         if len(stable_names) != len(set(stable_names)):
             raise ValueError('insertion aliases collide with another insertion or FASTA root')
@@ -1124,7 +1147,8 @@ def _run(args, candidates, bed, log):
         ids, source_names, is_query = topology.source_order(
             roots, events, resolver, header_lengths, stable)
         leaves = topology.collect_leaves(specs, roots, resolver, args.anchor, ids,
-                                         _path_leaves, _link_leaves, args.processes, log)
+                                         _path_leaves, _link_leaves, args.processes, log,
+                                         paired_leaves=_path_and_link_leaves)
         del ids
         log(f'Topology: {len(leaves.source)} leaves for {len(specs)} paths in '
             f'{time.monotonic() - started:.1f}s')

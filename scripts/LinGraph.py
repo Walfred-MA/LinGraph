@@ -1556,7 +1556,12 @@ def main(argv=None):
         settings = cli_options.values(args, 'call' if args.mode == 'graph' else 'sample')
         if args.mode == 'graph':
             settings.update(cli_options.values(args, 'build'))
-        allowed = set(cli_options.values(args, 'merge')) if not args.gfa_only else set()
+        # LinGraph's own --no-merge-realignment flag is always present; only
+        # an explicit one is a setting, and it belongs to merging.
+        if not settings.get('no_merge_realignment'):
+            settings.pop('no_merge_realignment', None)
+        allowed = (set(cli_options.values(args, 'merge')) | {'no_merge_realignment'}
+                   if not args.gfa_only else set())
         if getattr(args, 'recall_only', False):
             allowed |= RECALL_SETTINGS | {'samples'}
         unused = sorted(set(settings) - allowed)

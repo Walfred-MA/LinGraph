@@ -11,6 +11,8 @@ class StableResolver(Resolver):
         super().__init__(events, roots, header_lengths, hits)
         self.source_aliases = source_aliases or {}
         self.nested_pos_base = nested_pos_base
+        self.variant_intervals = None
+        self.source_intervals = None
         # Link-only walks through carriers' abutting alleles (gfa_junctions).
         self.junctions = []
         self.ranks = {name: 0 if root.kind == 'reference' else 1
@@ -20,11 +22,12 @@ class StableResolver(Resolver):
         for name in self.order:
             self.ranks[name] = next_rank
             next_rank += 1
-            self.breakpoints(name)
             for run in events[name].runs:
                 if run.target:
                     self.target_interval(run.target, run.rstart, run.rend,
                                          run.orientation)
+        # Normalize and validate coordinates once; later stages use this index.
+        self.index_variants()
 
     def _dependency_order(self, reachable):
         """Order parents before children, independently of VCF record order."""
@@ -67,6 +70,25 @@ class StableResolver(Resolver):
         return ordered
 
     def breakpoints(self, name):
+        if self.variant_intervals is not None:
+            span = self.variant_intervals.spans.get(name)
+            if span is not None:
+                return span
+        return self._breakpoints(name)
+
+    def index_variants(self):
+        if self.variant_intervals is None:
+            from gfa_interval_nodes import VariantIntervals
+            self.variant_intervals = VariantIntervals(self)
+        return self.variant_intervals
+
+    def prepare_sources(self, anchor, log):
+        """Resolve sources once before forked workers ask for path intervals."""
+        if self.source_intervals is None:
+            from gfa_interval_nodes import SourceIntervals
+            self.source_intervals = SourceIntervals(self, anchor, log)
+
+    def _breakpoints(self, name):
         event = self.events[name]
         if getattr(event, 'kind', 'insertion') == 'snp':
             start, end = event.pos - 1, event.pos
@@ -112,6 +134,8 @@ class StableResolver(Resolver):
         return start, end
 
     def expand(self, name, start, end, orientation='+', stack=()):
+        if self.source_intervals is not None:
+            return self.source_intervals.expand(name, start, end, orientation)
         if name not in self.events:
             if name not in self.roots:
                 raise ValueError(f'graph target {name!r} has no FASTA sequence')
@@ -131,6 +155,8 @@ class StableResolver(Resolver):
 
     def _flank(self, name, boundary, size, side):
         """Walk beyond an insertion end through that insertion's parent."""
+        if self.source_intervals is not None:
+            return self.source_intervals.flank(name, boundary, size, side)
         length = self.target_length(name)
         if not 0 <= boundary <= length:
             raise ValueError(f'{name}: flank boundary {boundary} is out of bounds')
