@@ -1,15 +1,13 @@
-# Getting started: HG002 on CHM13 and HG19
+# Getting started: HG002 on HG19
 
 This tutorial calls SVs on both haplotypes of the GIAB/T2T HG002 Q100
-assembly with the precomputed Win50KGraph, on two references:
+assembly with the precomputed Win50KGraph, on HG19 (UCSC GRCh37). Win50KGraph
+ships no HG19 reference cache, so the tutorial builds one first. It then
+renames the calls' contigs back to `chr1` … `chrY` and benchmarks them against
+GIAB's NIST SV v0.6 Tier 1 call set.
 
-- **CHM13**, with the reference cache shipped in Win50KGraph.
-- **HG19** (UCSC GRCh37), building its reference cache first and reusing the
-  CHM13 run's graph alignments.
-
-It then renames the HG19 contigs back to `chr1` … `chrY` and benchmarks the
-calls against GIAB: NIST SV v0.6 Tier 1 on HG19 and the Q100 v5.0q structural
-variants on CHM13.
+To call the same haplotypes on CHM13 afterwards without aligning them to the
+graph again, continue with the [CHM13 example](../HG002_CHM13/README.md).
 
 Run every command from one demo folder. Plan for about **200 GB** of disk.
 Long commands write their progress to `logs/`; follow one with
@@ -41,8 +39,8 @@ available), installs the dependencies and compiles the native tools into
 
 LinGraph needs references as uncompressed, indexed FASTAs.
 
-- **CHM13**: NCBI RefSeq T2T-CHM13v2.0, 24 chromosomes (`NC_060925.1` …),
-  the sequences of the Win50KGraph CHM13 cache.
+- **CHM13**: NCBI RefSeq T2T-CHM13v2.0, 24 chromosomes (`NC_060925.1` …).
+  Win50KGraph is reconstructed on it (step 3).
 - **HG19**: UCSC hg19, main chromosomes only (chr1–22, X, Y). A reference
   other than CHM13 or GRCh38 uses the `NAME#1#` contig prefix, so
   `--contignamefix` renames `chr1` to `HG19#1#chr1`.
@@ -119,29 +117,11 @@ WindowMasker and renames each contig with its haplotype prefix, e.g.
 `chr1_PATERNAL` to `HG002#1#chr1_PATERNAL`. The calling input list is
 `assemblies/prepared/query_paths.prepared.txt`.
 
-## 5. Call SVs on CHM13
+## 5. Build the HG19 reference cache
 
-Call both haplotypes against CHM13 (hours):
-
-```bash
-python3 LinGraph/scripts/LinGraph.py singular \
-  -I assemblies/prepared/query_paths.prepared.txt \
-  -G Win50KGraph \
-  -r references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna --reference-name CHM13_h1 \
-  --reference-caches Win50KGraph/references/CHM13_h1_rig \
-  -O HG002_calls_chm13 -t 64 > logs/singular_chm13.log 2>&1
-```
-
-Each haplotype is called on its own into
-`HG002_calls_chm13/samples/HG002_hN/HG002_hN.vcf`, with a coverage report
-`HG002_hN.coverage.summary.tsv` next to it. `--reference-caches` reuses the
-CHM13 alignment shipped with the package. Calls are on CHM13's NCBI names
-(`NC_060925.1` …), the names the CHM13 truth set gets in step 8.
-
-## 6. Call SVs on HG19
-
-Win50KGraph ships caches for CHM13 and GRCh38 only. Build the HG19 cache once
-(hours, like calling one haplotype); it is written to
+Calling needs the reference aligned to every local graph. Win50KGraph ships
+these caches for CHM13 and GRCh38 only, so build the HG19 cache once (hours,
+like calling one haplotype). It is written to
 `Win50KGraph/references/HG19_h1_rig`, and no sample is called. Repeat the
 command to resume:
 
@@ -151,25 +131,26 @@ python3 LinGraph/scripts/LinGraph.py singular \
   --reference-only -O hg19_cache -t 64 > logs/hg19_cache.log 2>&1
 ```
 
-Then call both haplotypes on HG19. The graph alignment of each haplotype does
-not depend on the reference, so `--reuse-alignments` links it from the CHM13
-run and only the reference-specific stages run:
+## 6. Call SVs on HG19
+
+Call both haplotypes against HG19 (hours):
 
 ```bash
 python3 LinGraph/scripts/LinGraph.py singular \
   -I assemblies/prepared/query_paths.prepared.txt \
   -G Win50KGraph \
   -r references/hg19/hg19_main.fa --reference-name HG19_h1 \
-  --reuse-alignments HG002_calls_chm13 \
   -O HG002_calls_hg19 -t 64 > logs/singular_hg19.log 2>&1
 ```
 
-The HG19 cache is found in `Win50KGraph/references/` automatically. Without
-`--reuse-alignments`, the haplotypes are aligned to the graph again (hours).
+The HG19 cache is found in `Win50KGraph/references/` automatically. Each
+haplotype is called on its own into
+`HG002_calls_hg19/samples/HG002_hN/HG002_hN.vcf`, with a coverage report
+`HG002_hN.coverage.summary.tsv` next to it.
 
-## 7. Rename the HG19 contigs to chr1 … chrY
+## 7. Rename the contigs to chr1 … chrY
 
-HG19 calls are on the prepared names (`HG19#1#chr1`). GIAB uses plain names,
+The calls are on the prepared names (`HG19#1#chr1`). GIAB uses plain names,
 so rename the finished VCFs with `tools/vcf_chromfix.py`:
 
 ```bash
@@ -184,7 +165,7 @@ done
 records and in LinGraph's headers. Keep the original files as input to
 LinGraph's own tools; they match the prepared FASTA names.
 
-## 8. Benchmark against GIAB
+## 8. Benchmark against GIAB NIST SV v0.6 Tier 1
 
 The benchmark needs truvari and bcftools. Install them in their own
 environment:
@@ -193,13 +174,6 @@ environment:
 conda create -y -n truvari -c conda-forge -c bioconda truvari bcftools htslib > logs/truvari_env.log 2>&1
 conda activate truvari
 ```
-
-`tools/BCFtoolMergeTwoHaplotypes.sh` turns the two haplotype VCFs into one
-site-only VCF, `HG002.LinGraph.vcf.gz`: each is sorted and stripped of
-genotypes, then they are combined with exact duplicates removed. It writes
-into the current folder, so each reference gets its own benchmark folder.
-
-### HG19: GIAB NIST SV v0.6 Tier 1
 
 Download the GIAB SV call set and its confident regions. They use `1` … `22`,
 `X`, `Y`; rename them to `chr1` …:
@@ -221,7 +195,10 @@ tabix -f -p vcf HG002_SVs_Tier1_v0.6.hg19.vcf.gz
 awk 'BEGIN{OFS="\t"} {$1="chr"$1; print}' HG002_SVs_Tier1_v0.6.bed > HG002_SVs_Tier1_v0.6.hg19.bed
 ```
 
-Combine the haplotypes and benchmark:
+`tools/BCFtoolMergeTwoHaplotypes.sh` turns the two haplotype VCFs into one
+site-only VCF, `HG002.LinGraph.vcf.gz`, in the current folder: each is sorted
+and stripped of genotypes, then they are combined with exact duplicates
+removed. Combine the haplotypes and benchmark:
 
 ```bash
 bash ../LinGraph/tools/BCFtoolMergeTwoHaplotypes.sh \
@@ -238,69 +215,16 @@ truvari bench \
 
 cat truvari_HG002_hg19/summary.json
 cd ..
-```
-
-### CHM13: GIAB Q100 v5.0q, non-difficult regions
-
-Download the Q100 v5.0q structural-variant benchmark on CHM13v2.0, and rename
-its chromosomes to CHM13's NCBI names to match the calls. Check its names
-first with `bcftools view -h HG002_CHM13v2.0_v5.0q_stvar.vcf.gz | grep -m3 '^##contig'`;
-the table below maps `chr1` … `chrY`:
-
-```bash
-mkdir bench_chm13 && cd bench_chm13
-Q100=https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/AshkenazimTrio/HG002_NA24385_son/v5.0q
-wget $Q100/HG002_CHM13v2.0_v5.0q_stvar.vcf.gz
-wget $Q100/HG002_CHM13v2.0_v5.0q_stvar.vcf.gz.tbi
-
-for i in $(seq 1 22); do echo -e "chr$i\tNC_0$((60924 + i)).1"; done > chr_to_nc.txt
-echo -e "chrX\tNC_060947.1" >> chr_to_nc.txt
-echo -e "chrY\tNC_060948.1" >> chr_to_nc.txt
-
-bcftools annotate --rename-chrs chr_to_nc.txt \
-  HG002_CHM13v2.0_v5.0q_stvar.vcf.gz -Oz -o HG002_CHM13v2.0_v5.0q_stvar.NC.vcf.gz
-tabix -f -p vcf HG002_CHM13v2.0_v5.0q_stvar.NC.vcf.gz
-```
-
-The non-difficult regions on CHM13, already with NCBI names, ship with
-LinGraph:
-
-```bash
-tar -xJf ../LinGraph/benchmark/HG002_Q100.nondifficult.NC.bed.tar.xz
-```
-
-Combine the haplotypes and benchmark:
-
-```bash
-bash ../LinGraph/tools/BCFtoolMergeTwoHaplotypes.sh \
-  ../HG002_calls_chm13/samples/HG002_h1/HG002_h1.vcf \
-  ../HG002_calls_chm13/samples/HG002_h2/HG002_h2.vcf
-
-truvari bench \
-  -b HG002_CHM13v2.0_v5.0q_stvar.NC.vcf.gz \
-  -c HG002.LinGraph.vcf.gz \
-  -f ../references/chm13/GCF_009914755.1_T2T-CHM13v2.0_genomic.fna \
-  --includebed HG002_Q100.nondifficult.NC.bed \
-  -r 2000 -C 5000 --pick multi \
-  -o truvari_HG002_nondifficult
-
-cat truvari_HG002_nondifficult/summary.json
-cd ..
 conda activate LinGraph
 ```
-
-`benchmark/BenchGIAB.sh` runs the same CHM13 benchmark and also reports it
-without GIAB's most extreme truth variants.
 
 ## 9. Count SVs and check coverage
 
 Count SVs of at least 50 bp per haplotype:
 
 ```bash
-for ref in hg19 chm13; do
-  for h in h1 h2; do
-    bash LinGraph/tools/count_sv.sh HG002_calls_$ref/samples/HG002_$h/HG002_$h.vcf
-  done
+for h in h1 h2; do
+  bash LinGraph/tools/count_sv.sh HG002_calls_hg19/samples/HG002_$h/HG002_$h.vcf
 done
 ```
 
@@ -326,34 +250,28 @@ also leaves out N gaps and scaffold edges.
 
 Results from running this tutorial:
 
-| Reference | Haplotype | Precision vs GIAB | Recall vs GIAB | Unannotated assembly bases (excl. constitutive heterochromatin) | Unannotated reference bases (excl. constitutive heterochromatin) | SVs ≥ 50 bp |
-| --- | --- | --- | --- | --- | --- | --- |
-| HG19 | h1 (pat) | 0.938 | 0.978 | 13,152,202 | 99,590,004 | 17,176 |
-| HG19 | h2 (mat) | 0.938 | 0.978 | 12,245,193 | 25,756,452 | 17,906 |
-| CHM13 | h1 (pat) | 0.986 | 0.966 | 4,303,423 | 126,791,810 | 14,230 |
-| CHM13 | h2 (mat) | 0.986 | 0.966 | 4,207,899 | 52,815,189 | 14,727 |
+| Haplotype | Precision vs GIAB | Recall vs GIAB | Unannotated assembly bases (excl. constitutive heterochromatin) | Unannotated reference bases (excl. constitutive heterochromatin) | SVs ≥ 50 bp |
+| --- | --- | --- | --- | --- | --- |
+| h1 (pat) | 0.938 | 0.978 | 13,152,202 | 99,590,004 | 17,176 |
+| h2 (mat) | 0.938 | 0.978 | 12,245,193 | 25,756,452 | 17,906 |
 
 - **Precision and recall** are for the diploid call set (h1 and h2
-  combined), so both haplotypes share them.
-  - HG19 against NIST SV v0.6 Tier 1: 9,432 truth SVs matched, 653 false
-    positives, 209 false negatives (F1 0.958).
-  - CHM13 against Q100 v5.0q in non-difficult regions: 2,906 truth SVs
-    matched, 39 false positives, 103 false negatives (F1 0.976).
+  combined), so both haplotypes share them: 9,432 GIAB SVs matched, 653 false
+  positives, 209 false negatives (F1 0.958).
 - **GIAB is not error-free.** The v0.6 HG19 set is reported to contain about
-  5% errors, so the HG19 numbers are a lower bound on accuracy: some "false
-  positives" and "false negatives" are errors in the truth set. The newer Q100
-  benchmark on CHM13 gives higher agreement.
+  5% errors, so these numbers are a lower bound on accuracy: some "false
+  positives" and "false negatives" are errors in the truth set. On CHM13 the
+  newer Q100 benchmark gives higher agreement (see the
+  [CHM13 example](../HG002_CHM13/README.md)).
 - **Unannotated bases** are `unmasked_bases` in the coverage reports, which
   leave out constitutive heterochromatin and other soft-masked repeats.
-  - Assembly: the `query other` row (e.g. `query other 193 153097044
-    4207899 ...` gives 4,207,899), which also leaves out N gaps and scaffold
-    edges. About 4 Mb of each haplotype is placed nowhere on CHM13, about
-    12–13 Mb on HG19.
+  - Assembly: the `query other` row (e.g. `query other 251 216086951
+    13152202 ...` gives 13,152,202), which also leaves out N gaps and
+    scaffold edges.
   - Reference: the `reference total_unannotated` row. It includes whole
     chromosomes a haplotype lacks: h1 is paternal (chrY, no chrX) and h2
     maternal (chrX, no chrY), which accounts for most of the difference
     between them.
-- **SV counts** are higher on HG19 than on CHM13, almost entirely insertions
-  (h1: 9,347 insertion-only on HG19 versus 6,136 on CHM13; deletions are
-  similar), likely sequence that GRCh37 lacks or represents with a minor
-  allele.
+- **SV counts** are higher than on CHM13, almost entirely insertions (h1:
+  9,347 insertion-only on HG19 versus 6,136 on CHM13; deletions are similar),
+  likely sequence that GRCh37 lacks or represents with a minor allele.

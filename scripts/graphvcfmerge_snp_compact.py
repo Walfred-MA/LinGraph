@@ -9,7 +9,6 @@ strings are retained during chromosome sorting.
 from __future__ import annotations
 
 from collections import defaultdict
-from contextlib import nullcontext
 import hashlib
 import heapq
 import io
@@ -278,6 +277,7 @@ def manifest_from_sources(results, root, directory, manifest_output=None, insert
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     samples, metadata, chroms, sources, definitions = [], [], {}, [], {}
+    seen = set()
     for result in results:
         samples.extend(sample for sample in result['samples'] if sample not in samples)
         chroms.update(result['chroms'])
@@ -291,7 +291,8 @@ def manifest_from_sources(results, root, directory, manifest_output=None, insert
                         raise ValueError(f'conflicting contig lengths for {name!r}')
                     continue
                 definitions[name] = length
-            if line not in metadata:
+            if line not in seen:
+                seen.add(line)
                 metadata.append(line)
     order = vcf._contig_order(metadata)
     chroms = dict(sorted(chroms.items(), key=lambda item: (order.get(item[1], len(order)), item[1])))
@@ -755,9 +756,12 @@ def finish_chrom_insertions(root, part_paths, samples, label, index=None):
     loci = total = 0
     items = sorted((owned[key], key) for key in found)
     batch_size = 1 if index is None else DIRECT_READ_BATCH
+    # One open per bundle for the whole chromosome, not an open and lock per
+    # insertion (a lock costs milliseconds on network storage): the entries
+    # found above are committed, and committed entries never change.
     with atomic_output(part_path) as handle, atomic_output(contigs_path) as contigs, \
-            (insertion_store.DirectReader() if index is not None else nullcontext()) as reader:
-        read_many = insertion_store.read_many if reader is None else reader.read_many
+            insertion_store.DirectReader() as reader:
+        read_many = reader.read_many
         for start in range(0, len(items), batch_size):
             batch = items[start:start + batch_size]
             entries = read_many([found[key] for _name, key in batch])
@@ -846,17 +850,30 @@ def apply_realignment(path, ordered, queries, alleles, kind='SNP', data=None):
         if query[3] == kind and query[4] == '1':
             by_query[(query[0], query[1], query[2])].add(number)
     keep = np.ones(len(ordered), dtype=bool)
-    for sample, pos, alt, contig, qpos, strand in data['drops']:
-        ids = by_query.get((sample, contig, strand), set())
-        first = np.searchsorted(ordered['pos'], pos, side='left')
-        last = np.searchsorted(ordered['pos'], pos, side='right')
-        rows = [row for row in range(first, last)
-                if keep[row] and int(ordered['query'][row]) in ids
-                and int(ordered['query_pos'][row]) == qpos
-                and int(ordered['bases'][row]) & 15 == BASE_INDEX[alt.upper()]]
-        if not rows:
-            raise ValueError(f'realignment drop not found: {sample} {data["chrom"]}:{pos} {alt} {contig}:{qpos}{strand}')
-        keep[rows] = False
+    if data['drops']:
+        # Contiguous columns, searched with uint32 values: a structured field
+        # (or a Python int) makes numpy copy the whole column on every search,
+        # which at hundreds of millions of observations takes hours.
+        positions = np.ascontiguousarray(ordered['pos'])
+        query_column, query_positions = ordered['query'], ordered['query_pos']
+        base_column = ordered['bases']
+        id_arrays = {}
+        for sample, pos, alt, contig, qpos, strand in data['drops']:
+            ids = id_arrays.get((sample, contig, strand))
+            if ids is None:
+                ids = id_arrays[(sample, contig, strand)] = np.array(
+                    sorted(by_query.get((sample, contig, strand), ())), dtype='<u4')
+            first = int(np.searchsorted(positions, np.uint32(pos), side='left'))
+            last = int(np.searchsorted(positions, np.uint32(pos), side='right'))
+            hits = (keep[first:last]
+                    & (query_positions[first:last] == qpos)
+                    & ((base_column[first:last] & 15) == BASE_INDEX.get(alt.upper(), -1))
+                    & np.isin(query_column[first:last], ids))
+            rows = first + np.flatnonzero(hits)
+            if not len(rows):
+                raise ValueError(f'realignment drop not found: {sample} {data["chrom"]}:{pos} {alt} {contig}:{qpos}{strand}')
+            keep[rows] = False
+        del positions
     added = np.empty(len(data['adds']), dtype=DTYPE)
     query_index = {tuple(query): number for number, query in enumerate(queries)}
     allele = alleles.index('.') if '.' in alleles else None
@@ -869,8 +886,14 @@ def apply_realignment(path, ordered, queries, alleles, kind='SNP', data=None):
             queries.append(query)
             query_index[query] = len(queries) - 1
         added[row] = (u32(pos), pack_bases(ref, alt), u32(qpos), query_index[query], allele, 0)
-    result = np.concatenate([ordered[keep], added])
-    result.sort(kind='mergesort', order=DTYPE.names)
+    # The kept rows stay sorted; the few added rows are slotted in by
+    # (pos, bases), the only order write_locus relies on (it groups rows of a
+    # site and is indifferent to their order within it).
+    result = ordered[keep]
+    if len(added):
+        added.sort(order=DTYPE.names)
+        site = lambda rows: (rows['pos'].astype(np.uint64) << 8) | rows['bases']  # noqa: E731
+        result = np.insert(result, np.searchsorted(site(result), site(added), side='right'), added)
     print(f'[merge:snp] {data["chrom"]}: realignment dropped {int((~keep).sum())} and added '
           f'{len(added)} SNP observation(s)', file=sys.stderr, flush=True)
     return result
@@ -901,15 +924,31 @@ def _emit_chrom(manifest, key, processes, root=None):
     return key
 
 
+_COLUMNS = [None, None]    # [samples list, its columns]: one cohort per process
+
+
+def _sample_columns(samples):
+    """{sample: [columns]}, built once per samples list (one per insertion
+    path otherwise: O(insertions x samples))."""
+    if _COLUMNS[0] is not samples:
+        columns = defaultdict(list)
+        for column, sample in enumerate(samples):
+            columns[sample].append(column)
+        _COLUMNS[:] = [samples, columns]
+    return _COLUMNS[1]
+
+
 def write_locus(handle, chrom, ordered, query_list, allele_list, label_groups, coverage, samples, *, progress=False):
     """Emit sorted SNP observations with identical semantics for either merge stage."""
+    if not len(ordered):
+        # No sites: skip the per-sample setup (insertion paths without SNPs
+        # are many, and each would cost O(samples)).
+        return 0
     coverage = {sample: vcf._merge_intervals(values) for sample, values in coverage.items()}
     missing_field = vcf._state_sample_field('.', vcf.SNP_FORMAT)
     reference_field = vcf._state_sample_field('0', vcf.SNP_FORMAT)
     chrom_token = vcf._safe_variant_token(chrom)
-    columns = defaultdict(list)
-    for column, sample in enumerate(samples):
-        columns[sample].append(column)
+    columns = _sample_columns(samples)
     # Sites come in position order, so each sample's default genotype (reference
     # while covered, else missing) is swept forward instead of bisected per site.
     # A sample's current interval is the last one starting at or before

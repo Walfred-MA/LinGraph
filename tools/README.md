@@ -216,4 +216,5 @@ and `HG002.LinGraph.vcf.gz` (with indexes). Needs bcftools and tabix:
 bash tools/BCFtoolMergeTwoHaplotypes.sh HG002_h1.vcf HG002_h2.vcf
 ```
 
-See [the HG002 demo](../demo/HG002/README.md) for the full benchmark.
+See the HG002 demos on [HG19](../demo/HG002_HG19/README.md) and
+[CHM13](../demo/HG002_CHM13/README.md) for full benchmarks.

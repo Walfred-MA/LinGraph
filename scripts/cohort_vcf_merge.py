@@ -144,13 +144,15 @@ def combine(paths, output):
     """Union compatible headers/samples and coordinate-sort VCF records on disk."""
     paths = [str(path) for path in paths]
     samples, metadata, seen, file_samples, definitions = [], [], set(), [], {}
+    known = set()
     for path in paths:
         meta, names = sv.collect_vcf_header_info(path)
         if not names or len(names) != len(set(names)):
             raise ValueError(f'{path}: expected unique VCF sample columns')
         file_samples.append(names)
         for name in names:
-            if name not in samples:
+            if name not in known:
+                known.add(name)
                 samples.append(name)
         for line in meta:
             if line.startswith('##source=merge_locus_vcfs_'):

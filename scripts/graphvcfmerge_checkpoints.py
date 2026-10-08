@@ -160,21 +160,25 @@ def outputs(root, chrom, emit_small=False, insertion_snps=None):
     return result
 
 
-def output_stamps(paths, insertion_snps=None):
+def output_stamps(paths, insertion_snps=None, keys=None):
+    """Stamps of a chromosome's outputs and of its insertions' SNP entries.
+    KEYS: the insertion owner keys, when known (unchanged parts); otherwise
+    they are read from the INS rows of the parts."""
     stamps = {path.name: file_stamp(path) for path in paths}
     if not insertion_snps:
         return stamps
     from graphvcfmerge_snp_compact import chrom_key, legacy_insertion_source
     import graphvcfmerge_insertion_store as store
-    keys = set()
-    for part in paths:
-        if not str(part).endswith('.part'):
-            continue
-        with part.open() as handle:
-            for raw in handle:
-                fields = raw.rstrip('\n').split('\t', 8)
-                if len(fields) >= 8 and 'SVTYPE=INS' in fields[7].split(';'):
-                    keys.add(chrom_key(insertion_snp_owner(fields[2], fields[7])))
+    if keys is None:
+        keys = set()
+        for part in paths:
+            if not str(part).endswith('.part'):
+                continue
+            with part.open() as handle:
+                for raw in handle:
+                    fields = raw.rstrip('\n').split('\t', 8)
+                    if len(fields) >= 8 and 'SVTYPE=INS' in fields[7].split(';'):
+                        keys.add(chrom_key(insertion_snp_owner(fields[2], fields[7])))
     bundled = store.find_many(insertion_snps, keys)
     realignments = store.find_many(Path(insertion_snps) / 'realign', keys)
     for key in sorted(keys):
@@ -227,9 +231,23 @@ def is_done(root, chrom, context, adopt_manual=True):
     # compared either way.
     recorded = {key: stamp for key, stamp in (value.get("outputs") or {}).items()
                 if not key.endswith("records.bin")}
-    if recorded != output_stamps(paths, context.get("insertion_snps")):
+    if recorded != output_stamps(paths, context.get("insertion_snps"),
+                                 _recorded_keys(recorded, paths)):
         raise ValueError(f"completed outputs changed after marking: {marker}")
     return True
+
+
+def _recorded_keys(recorded, paths):
+    """The insertion keys a marker recorded, when its part files are
+    unchanged (same size and mtime) and it names no legacy spool: the parts
+    then hold the same INS rows, so they need not be read again (they hold
+    every sample's column). None: read the parts."""
+    names = {path.name for path in paths}
+    if any(recorded.get(path.name) != file_stamp(path) for path in paths):
+        return None
+    if any(not key.startswith(("insertion:", "realign:")) for key in recorded if key not in names):
+        return None
+    return {key[len("insertion:"):] for key in recorded if key.startswith("insertion:")}
 
 
 def prepare(root, chrom, context):

@@ -15,7 +15,6 @@ import functools
 import hashlib
 import math
 import os
-import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -270,15 +269,16 @@ def _direct_task(args):
                 continue
             if max(len(query), len(template)) > SHORT_SEQUENCE_LIMIT:
                 raise ValueError("Direct comparison exceeds short sequence limit")
-            body = merger._fast_python_global_cigar(query, template)
-            merger._fast_validate_alignment_body(
-                body, len(query), len(template),
-                context=f"short KmerMatch member {index}",
-            )
-            distance = sum(int(n) for n, op in re.findall(r"(\d+)([=XID])", body)
-                           if op != "=")
+            # The traceback's X/I/D total is the Levenshtein distance: score
+            # with it first and trace back only the members that pass.
+            distance = merger._levenshtein_distance(query, template)
             similarity = 1.0 - distance / float(len(query) + len(template))
             if similarity >= cutoff:
+                body = merger._fast_python_global_cigar(query, template)
+                merger._fast_validate_alignment_body(
+                    body, len(query), len(template),
+                    context=f"short KmerMatch member {index}",
+                )
                 passed.append((index, body))
     return passed
 
@@ -296,16 +296,9 @@ def _direct_pair_task(args):
                 continue
             if max(len(query), len(reference)) > SHORT_SEQUENCE_LIMIT:
                 raise ValueError("Direct paired comparison exceeds short sequence limit")
-            body = merger._fast_python_global_cigar(query, reference)
-            merger._fast_validate_alignment_body(
-                body, len(query), len(reference),
-                context=f"short fallback member {query_index}",
-            )
-            distance = sum(
-                int(length)
-                for length, operation in re.findall(r"(\d+)([=XID])", body)
-                if operation != "="
-            )
+            # Only the score is used: the Levenshtein distance (edlib), which
+            # equals the X/I/D total of the full Python traceback.
+            distance = merger._levenshtein_distance(query, reference)
             similarity = 1.0 - distance / float(len(query) + len(reference))
             scores.append((query_index, reference_index, similarity))
     return scores

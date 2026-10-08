@@ -3719,14 +3719,24 @@ def _fast_load_chrom_columns(
     return matrix, ranges
 
 
+_FAST_ROW_FILE_TABLE: tuple = (None, None, None)
+
+
 def _fast_row_files(row_indexes, ranges):
-    """File index per row index (int64 array), from the section table."""
-    starts = np.asarray(
-        [start for start, _file_index in ranges], dtype=np.int64,
-    )
-    files = np.asarray(
-        [file_index for _start, file_index in ranges], dtype=np.int64,
-    )
+    """File index per row index (int64 array), from the section table.
+
+    The table's arrays are kept for the last ranges object seen: callers
+    pass the same one for every cluster of a task."""
+    global _FAST_ROW_FILE_TABLE
+    cached_ranges, starts, files = _FAST_ROW_FILE_TABLE
+    if cached_ranges is not ranges:
+        starts = np.asarray(
+            [start for start, _file_index in ranges], dtype=np.int64,
+        )
+        files = np.asarray(
+            [file_index for _start, file_index in ranges], dtype=np.int64,
+        )
+        _FAST_ROW_FILE_TABLE = (ranges, starts, files)
     return files[np.maximum(
         0, np.searchsorted(starts, row_indexes, side="right") - 1,
     )]
@@ -3765,7 +3775,12 @@ def _fast_link_rows(
     older same-root active with the same gate signature (equal size for
     INS, equal pos/end/size for DEL) is retired - every future pair
     would evaluate identically against the newer, closer entry - which
-    keeps mega-hotspots near-linear.
+    keeps mega-hotspots near-linear.  Each band keeps rows below
+    exact_below apart: a row below it finds its only possible partners
+    there (same POS, END and size) by lookup.  A band known to hold a
+    single cluster is skipped whole when that cluster is already the new
+    event's, and left at its first link otherwise; skipped pairs are all
+    same-root.
     """
     count = len(pos)
     if not count:
@@ -3780,9 +3795,23 @@ def _fast_link_rows(
             index = parent[index]
         return index
 
-    bands: Dict[int, List[int]] = defaultdict(list)
-    band_prune: Dict[int, int] = defaultdict(int)
+    # 2 * band (+1 for rows below exact_below) -> [rows in input order,
+    # pruned prefix length, a row of the one cluster holding every live row
+    # of the band or None when unknown].  Clusters only grow, so the last
+    # stays true until a row of another cluster is appended to the band.
+    # It is only tracked for bands of more than 16 live rows; shorter ones
+    # are cheaper to rescan.
+    bands: Dict[int, list] = {}
     last_by_key: Dict[int, dict] = defaultdict(dict)
+    # Rows below exact_below at the current POS by (POS, END, size): the
+    # only rows a row below the cutoff can link to without the SV gates.
+    exact_rows: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+    exact_pos = None
+    # Bands are monotone in size: no row below the cutoff sits above this.
+    small_top = (
+        _fast_size_band(exact_below - 1, size_similarity)
+        if exact_below > 0 else -2
+    )
     progress = time.monotonic()
     for index in range(count):
         if label and index and index % 2_000_000 == 0:
@@ -3798,12 +3827,55 @@ def _fast_link_rows(
         here_end = end[index]
         here_size = size[index]
         here_band = _fast_size_band(here_size, size_similarity)
+        here_small = here_size < exact_below
         root_here = find_root(index)
-        for band_key in (here_band - 1, here_band, here_band + 1):
-            active = bands.get(band_key)
-            if not active:
+        here_key = 2 * here_band
+        if here_small:
+            here_key += 1
+            if here_pos != exact_pos:
+                exact_rows.clear()
+                exact_pos = here_pos
+            here_exact = (here_pos, here_end, here_size)
+            same = exact_rows.get(here_exact)
+            if same:
+                # Live equal rows: they pass the interval gates (same
+                # interval) and the size gate exactly when this row passes
+                # it alone.
+                same = exact_rows[here_exact] = [
+                    previous for previous in same
+                    if not dead[previous]
+                    and (is_insertion or end[previous] + distance >= here_pos)
+                ]
+                if here_size / float(max(1, here_size)) >= size_similarity:
+                    for previous in same:
+                        root_previous = find_root(previous)
+                        if root_previous != root_here:
+                            parent[max(root_here, root_previous)] = min(
+                                root_here, root_previous,
+                            )
+                            root_here = min(root_here, root_previous)
+            # Rows below the cutoff in other bands differ in size.
+            scan = (here_key - 3, here_key - 1, here_key + 1)
+        elif here_band - 1 > small_top:
+            scan = (here_key - 2, here_key, here_key + 2)
+        else:
+            scan = (
+                here_key - 2, here_key, here_key + 2,
+                here_key - 1, here_key + 1, here_key + 3,
+            )
+        unlinked = []
+        for band_key in scan:
+            state = bands.get(band_key)
+            if state is None:
                 continue
-            prune_from = band_prune[band_key]
+            active, prune_from, one = state
+            if one is not None and find_root(one) == root_here:
+                # Every live row is already in this cluster.  Pruning only
+                # drops rows for good, so it can wait for the next scan.
+                continue
+            # A row leaves the band for good once dead or out of reach (POS
+            # only grows).  The prefix is dropped here; a DEL row past it is
+            # skipped below and dropped at the next scan of the whole band.
             if is_insertion:
                 while prune_from < len(active) and (
                     dead[active[prune_from]]
@@ -3812,21 +3884,25 @@ def _fast_link_rows(
                     ) + distance < here_pos
                 ):
                     prune_from += 1
-                if prune_from > 4096:
-                    del active[:prune_from]
-                    prune_from = 0
-                band_prune[band_key] = prune_from
             else:
-                active = [
-                    previous for previous in active[prune_from:]
-                    if not dead[previous]
-                    and end[previous] + distance >= here_pos
-                ]
-                bands[band_key] = active
-                band_prune[band_key] = 0
+                while prune_from < len(active) and (
+                    dead[active[prune_from]]
+                    or end[active[prune_from]] + distance < here_pos
+                ):
+                    prune_from += 1
+            if prune_from > 4096:
+                del active[:prune_from]
                 prune_from = 0
+            state[1] = prune_from
+            if prune_from == len(active):
+                continue
+            failed = []
+            stale = 0
             for previous in active[prune_from:]:
-                if dead[previous]:
+                if dead[previous] or (
+                    not is_insertion and end[previous] + distance < here_pos
+                ):
+                    stale += 1
                     continue
                 root_previous = find_root(previous)
                 if root_previous == root_here:
@@ -3836,10 +3912,12 @@ def _fast_link_rows(
                     here_size != p_size or here_pos != pos[previous]
                     or here_end != end[previous]
                 ):
+                    failed.append(previous)
                     continue
                 smaller = here_size if here_size < p_size else p_size
                 larger = here_size if here_size > p_size else p_size
                 if smaller / float(max(1, larger)) < size_similarity:
+                    failed.append(previous)
                     continue
                 if is_insertion:
                     # Insertion-like rows can replace a non-empty reference
@@ -3850,6 +3928,7 @@ def _fast_link_rows(
                         here_pos - max(pos[previous], end[previous])
                         > distance
                     ):
+                        failed.append(previous)
                         continue
                 else:
                     p_pos = pos[previous]
@@ -3860,12 +3939,42 @@ def _fast_link_rows(
                         max(p_pos + 1, p_end + 1),
                     )
                     if left >= right:
+                        failed.append(previous)
                         continue
                 parent[max(root_here, root_previous)] = min(
                     root_here, root_previous,
                 )
                 root_here = min(root_here, root_previous)
-        bands[here_band].append(index)
+                if one is not None:
+                    # One cluster: every remaining row is now same-root.
+                    break
+            else:
+                if stale and not is_insertion:
+                    state[0] = [
+                        previous for previous in active[prune_from:]
+                        if not dead[previous]
+                        and end[previous] + distance >= here_pos
+                    ]
+                    state[1] = 0
+            if one is None and len(active) - prune_from > 16:
+                unlinked.append((state, failed))
+        # A scanned band whose rows all ended up in this row's cluster
+        # (linked, same-root, or joined later through another row) is one
+        # cluster from here on.
+        for state, failed in unlinked:
+            if not failed or all(
+                find_root(previous) == root_here for previous in failed
+            ):
+                state[2] = index
+        state = bands.get(here_key)
+        if state is None:
+            bands[here_key] = [[index], 0, None]
+        else:
+            if state[2] is not None and find_root(state[2]) != root_here:
+                state[2] = None
+            state[0].append(index)
+        if here_small:
+            exact_rows[here_exact].append(index)
         key = here_size if is_insertion else (here_pos, here_end, here_size)
         band_last = last_by_key[here_band]
         previous_same = band_last.get(key)
@@ -6608,6 +6717,11 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
             for rep_start, rep_end, number, pick, chosen in items[
                     bisect.bisect_left(starts, span[0] - merge_distance):
                     bisect.bisect_right(starts, span[0] + merge_distance)]:
+                # Only a group with the same span is ever chosen below (an
+                # unshifted option sorts first), so skip the others before
+                # computing their similarity.
+                if (rep_start, rep_end) != span:
+                    continue
                 # A superseded representative's group has no row.
                 if pick in state["superseded"]:
                     continue
@@ -7366,11 +7480,33 @@ def _fast_rep_token_task(
     ]
 
 
+def _fast_uncertain_index(entries: list) -> Dict[int, list]:
+    """Bucket uncertain (pos, end, size, sample) entries for
+    _fast_uncertain_samples: by size class (bit length of the size), then by
+    span class (a power of two above the entry's reach right of POS), each
+    bucket POS-sorted.  A bucket's span bounds how far left of a group a
+    matching entry can start, so one huge event no longer widens the scan of
+    every later group, and size classes the ratio gate rejects are skipped."""
+    buckets: Dict[int, Dict[int, Tuple[list, list]]] = defaultdict(dict)
+    for entry in sorted(entries, key=lambda e: (e[0], e[1])):
+        span = 1 << (max(entry[0], entry[1]) - entry[0]).bit_length()
+        positions, bucket = buckets[max(0, entry[2]).bit_length()].setdefault(
+            span, ([], []),
+        )
+        positions.append(entry[0])
+        bucket.append(entry)
+    return {
+        size_class: [
+            (span, positions, bucket_entries)
+            for span, (positions, bucket_entries) in by_span.items()
+        ]
+        for size_class, by_span in buckets.items()
+    }
+
+
 def _fast_uncertain_samples(
     members: list,
-    uncertain: list,
-    u_positions: List[int],
-    u_prefix_extent: List[int],
+    uncertain_index: Dict[int, list],
     merge_distance: int,
     size_similarity: float,
     is_insertion: bool,
@@ -7380,50 +7516,80 @@ def _fast_uncertain_samples(
     reference-interval-gap and size gates alone (no sequence comparison).  Members
     and uncertain entries are (pos, end, size, sample) tuples. When the
     larger of the two is below exact_below (merged exactly) an event matches
-    only the same POS, END and size."""
-    if not uncertain:
+    only the same POS, END and size.  uncertain_index comes from
+    _fast_uncertain_index; the buckets and member-size windows only skip
+    pairs the gates below would reject."""
+    if not uncertain_index:
         return ()
     distance = max(0, int(merge_distance))
     min_pos = min(member[0] for member in members)
     upper = max(
         max(member[0] + 1, member[1] + 1) for member in members
     ) + distance
+    by_size = sorted(members, key=lambda member: member[2])
+    sizes = [member[2] for member in by_size]
+    # With 0 < threshold <= 1 a passing pair has both sizes >= 1 and
+    # threshold * larger <= smaller; the +-1 margins absorb float rounding.
+    sized = 0.0 < size_similarity <= 1.0
+    if sized:
+        if sizes[-1] < 1:
+            return ()
+        smallest = sizes[bisect.bisect_left(sizes, 1)]
+        size_classes = range(
+            max(1, int(size_similarity * smallest) - 1).bit_length(),
+            (int(sizes[-1] / size_similarity) + 1).bit_length() + 1,
+        )
+    else:
+        size_classes = sorted(uncertain_index)
     matched: set = set()
-    for index in range(
-        bisect.bisect_left(u_positions, upper) - 1, -1, -1,
-    ):
-        if u_prefix_extent[index] + distance + 1 <= min_pos:
-            break
-        c_pos, c_end, c_size, c_sample = uncertain[index]
-        if c_sample in matched:
-            continue
-        for member in members:
-            if max(c_size, member[2]) < exact_below and (
-                (c_pos, c_end, c_size) != (member[0], member[1], member[2])
+    for size_class in size_classes:
+        for span, positions, bucket in uncertain_index.get(size_class, ()):
+            for index in range(
+                bisect.bisect_left(positions, min_pos - distance - span),
+                bisect.bisect_left(positions, upper),
             ):
-                continue
-            smaller = c_size if c_size < member[2] else member[2]
-            larger = c_size if c_size > member[2] else member[2]
-            if smaller / float(max(1, larger)) < size_similarity:
-                continue
-            if is_insertion:
-                c_right = max(c_pos, c_end)
-                member_right = max(member[0], member[1])
-                interval_gap = max(
-                    c_pos, member[0],
-                ) - min(c_right, member_right)
-                if max(0, interval_gap) > distance:
+                c_pos, c_end, c_size, c_sample = bucket[index]
+                if c_sample in matched:
                     continue
-            else:
-                left = max(c_pos - distance, member[0])
-                right = min(
-                    max(c_pos + 1, c_end + 1) + distance,
-                    max(member[0] + 1, member[1] + 1),
-                )
-                if left >= right:
+                if max(c_pos, c_end) + distance + 1 <= min_pos:
                     continue
-            matched.add(c_sample)
-            break
+                if sized:
+                    candidates = by_size[
+                        bisect.bisect_left(
+                            sizes, int(size_similarity * c_size) - 1,
+                        ):bisect.bisect_right(
+                            sizes, int(c_size / size_similarity) + 1,
+                        )
+                    ]
+                else:
+                    candidates = by_size
+                for member in candidates:
+                    if max(c_size, member[2]) < exact_below and (
+                        (c_pos, c_end, c_size) != (member[0], member[1], member[2])
+                    ):
+                        continue
+                    smaller = c_size if c_size < member[2] else member[2]
+                    larger = c_size if c_size > member[2] else member[2]
+                    if smaller / float(max(1, larger)) < size_similarity:
+                        continue
+                    if is_insertion:
+                        c_right = max(c_pos, c_end)
+                        member_right = max(member[0], member[1])
+                        interval_gap = max(
+                            c_pos, member[0],
+                        ) - min(c_right, member_right)
+                        if max(0, interval_gap) > distance:
+                            continue
+                    else:
+                        left = max(c_pos - distance, member[0])
+                        right = min(
+                            max(c_pos + 1, c_end + 1) + distance,
+                            max(member[0] + 1, member[1] + 1),
+                        )
+                        if left >= right:
+                            continue
+                    matched.add(c_sample)
+                    break
     return tuple(sorted(matched))
 
 
@@ -7946,17 +8112,24 @@ def _exact_window_snps(records_dir, chrom, file_index, contig, w0, w1):
             with open(sidecar) as handle:
                 info = json.load(handle)
             _EXACT_SNP_CACHE[key] = (np.load(npy, mmap_mode="r"), info,
-                                     {name: number for number, name in enumerate(info["chroms"])})
+                                     {name: number for number, name in enumerate(info["chroms"])},
+                                     {})
     if _EXACT_SNP_CACHE[key] is None:
         return []
-    whole, info, chrom_numbers = _EXACT_SNP_CACHE[key]
+    whole, info, chrom_numbers, positions = _EXACT_SNP_CACHE[key]
     number = chrom_numbers.get(chrom)
     if number is None:
         return []
     table = whole[info["offsets"][number]:info["offsets"][number + 1]]
     contigs = info["contigs"]
-    first = int(np.searchsorted(table["pos"], w0, side="left"))
-    last = int(np.searchsorted(table["pos"], w1, side="left"))
+    # One contiguous copy per input and chromosome, searched with uint32
+    # values: a structured field (or a Python int) makes numpy copy the
+    # whole column on every call.
+    if number not in positions:
+        positions[number] = np.ascontiguousarray(table["pos"])
+    column = positions[number]
+    first = int(np.searchsorted(column, np.uint32(min(max(w0, 0), 2**32 - 1)), side="left"))
+    last = int(np.searchsorted(column, np.uint32(min(max(w1, 0), 2**32 - 1)), side="left"))
     return [
         types.SimpleNamespace(
             svtype="SNP", pos=int(row["pos"]), end=int(row["pos"]) + 1, size=1,
@@ -8808,6 +8981,7 @@ def _exact_place_leftovers(groups, plan, leftovers, reasons):
             separated[key].append((slot, samples))
 
     rows: Dict[tuple, list] = {}
+    row_samples: Dict[tuple, set] = {}    # key -> samples of rows[key]
     for owner, observation in sorted(
             leftovers, key=lambda item: (item[1].pos, item[1].end, item[1].svtype,
                                          item[1].sample_index, item[1].qry_start)):
@@ -8837,12 +9011,13 @@ def _exact_place_leftovers(groups, plan, leftovers, reasons):
         if placed:
             continue
         key = (observation.svtype, start, end, bases.upper())
-        if key in rows and observation.sample_index not in {
-                item.sample_index for item in rows[key]}:
+        if key in rows and observation.sample_index not in row_samples[key]:
             rows[key].append(observation)
+            row_samples[key].add(observation.sample_index)
             reasons["leftover_sv_shared_row"] += 1
             continue
         rows[key] = [observation]
+        row_samples[key] = {observation.sample_index}
         plan.setdefault(owner, {}).setdefault("__flank__", []).append(rows[key])
         reasons["leftover_sv_row"] += 1
 
@@ -9011,14 +9186,7 @@ def _fast_emit_refined(
             )
             for row in range(u_matrix.shape[0])
         ]
-        entries.sort(key=lambda e: (e[0], e[1]))
-        positions = [e[0] for e in entries]
-        prefix = []
-        running = -1
-        for e in entries:
-            running = max(running, e[0], e[1])
-            prefix.append(running)
-        windows[key] = (entries, positions, prefix)
+        windows[key] = _fast_uncertain_index(entries)
     used_variant_ids: Dict[str, int] = defaultdict(int)
     skipped_small = 0
     safe = _safe_locus_key(chrom)
@@ -9098,9 +9266,8 @@ def _fast_emit_refined(
                     f"{rep[0]}_{emit_index + 1}"
                 )
             row_id = _unique_variant_id(used_variant_ids, base_id)
-            u_entries, u_positions, u_prefix = windows[svtype]
             uncertain_samples = _fast_uncertain_samples(
-                members, u_entries, u_positions, u_prefix,
+                members, windows[svtype],
                 merge_distance, size_similarity, svtype == "INS",
                 exact_below=minsvsize,
             )

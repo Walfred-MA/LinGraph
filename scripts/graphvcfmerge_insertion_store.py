@@ -399,13 +399,17 @@ def read_many(sources, *, with_records=True):
 class DirectReader:
     """Lock-free reads of committed entries at known offsets.
 
-    Only for stores no worker writes any more (a backfill after its SV merge):
-    each bundle is opened once and every batch is read in file order."""
+    Each bundle is opened once and every batch is read in file order. Safe
+    while other workers append: committed entries never change (writers only
+    append, and trim an unfinished tail after the last commit), every read
+    checks the entry's footer and checksum, and offsets found before a bundle
+    is opened lie within its size."""
 
     def __init__(self):
         self._handles = {}
 
     def __enter__(self):
+        flush()    # as read_many: this thread's buffered puts first
         return self
 
     def __exit__(self, *_exc):
