@@ -74,7 +74,7 @@ def kind_of(info, min_sv):
     length = _SVLEN.search(info)
     size = abs(int(length.group(1))) if length else 0
     kind = svtype.group(1)
-    return (f'{kind}_SV' if size >= min_sv else f'{kind}_small'), size
+    return (f'{kind}_SV' if size >= min_sv else f'{kind}_indel'), size
 
 
 def classify(carries, expected, other):
