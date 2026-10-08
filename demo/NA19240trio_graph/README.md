@@ -178,7 +178,7 @@ python LinGraph/benchmark/trio_line_check.py \
 cat trio_calls/trio_lines.summary.tsv
 ```
 
-| Variant | Child haplotype | Records | Found in parents | Child only | Total | Child only (%) |
+| Variant | Child haplotype | Records | Consistent | Inconsistent | Total | Inconsistent (%) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | SV deletion | h1 | 23,896 | 8,772 | 162 | 8,934 | 1.81% |
 | SV deletion | h2 | 23,896 | 9,001 | 172 | 9,173 | 1.88% |
@@ -202,10 +202,11 @@ cat trio_calls/trio_lines.summary.tsv
 | SNP (nested) | h2 | 33,392 | 9,807 | 141 | 9,948 | 1.42% |
 
 SVs are at least 50 bp. *Total* counts the child-carried records with a
-callable parent; *Child only* are those carried by neither parent.
+callable parent; *Consistent* records are also carried by a parent,
+*Inconsistent* ones by neither parent.
 The check is per record: a parent's allele merged into a neighbouring record
 (for example a variant inside an insertion that was merged into another
-parent record) counts as child-only, which is why nested records score lower.
+parent record) counts as inconsistent, which is why nested records score lower.
 HGSVC3's hap1/hap2 come from Strand-seq phasing and are not parent-of-origin
 labels, so either parent is accepted for each child haplotype.
 `trio_lines.tsv` lists each record with the six genotypes.

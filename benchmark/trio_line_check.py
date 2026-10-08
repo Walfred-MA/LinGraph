@@ -23,8 +23,9 @@ checked like top-level rows and marked nested.
 
 Writes one TSV line per row a child haplotype carries (all rows with
 --all-rows) to stdout and a summary by class and variant kind to stderr,
-with child_only_percent = 100 * child_only / (in_parents + child_only):
-child alleles found in neither parent, whatever the phasing.
+with consistent (carried by either parent), inconsistent (by neither) and
+inconsistent_percent = 100 * inconsistent / (consistent + inconsistent),
+whatever the phasing.
 
 usage: python trio_line_check.py cohort.sv.vcf [cohort.indel.vcf cohort.snp.vcf] \\
            --child NA19240 --mother NA19238 --father NA19239 > lines.tsv
@@ -163,7 +164,7 @@ def main():
                     ]) + '\n')
 
     err = sys.stderr
-    err.write('kind\thaplotype\trows\tin_parents\tchild_only\ttotal\tchild_only_percent\n')
+    err.write('kind\thaplotype\trows\tconsistent\tinconsistent\ttotal\tinconsistent_percent\n')
     for group in sorted(rows):
         for hap in ('h1', 'h2'):
             # Either parent: Strand-seq-phased hap1/hap2 are not parent-of-origin.
@@ -172,8 +173,8 @@ def main():
             total = in_parents + child_only
             percent = f'{100 * child_only / total:.2f}' if total else 'NA'
             err.write(f'{group}\t{hap}\t{rows[group]}\t{in_parents}\t{child_only}\t{total}\t{percent}\n')
-    err.write('in_parents: carried by either parent; child_only: by neither (a parent callable); '
-              'child_only_percent = 100 * child_only / total\n')
+    err.write('consistent: carried by either parent; inconsistent: by neither (a parent callable); '
+              'inconsistent_percent = 100 * inconsistent / total\n')
 
 if __name__ == '__main__':
     main()
