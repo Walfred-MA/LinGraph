@@ -150,8 +150,10 @@ Examples:
                            help=argparse.SUPPRESS)
         q.add_argument("--force-prepare", action="store_true",
                        help="prepare fixed copies of assemblies that are not ready in "
-                            f"OUTPUT/{PREPARED_FOLDER} (in parallel, sharing -t; removed when "
-                            "the run finishes) instead of stopping; duplicates those assemblies on disk")
+                            f"OUTPUT/{PREPARED_FOLDER} (in parallel, sharing -t; with --slurm one job "
+                            "per assembly with -t CPUs and --slurm-memory (default 2G per CPU), --slurm-jobs "
+                            "at once; removed when the run "
+                            "finishes) instead of stopping; duplicates those assemblies on disk")
         alignment = q.add_mutually_exclusive_group()
         if mode == "graph":
             alignment.add_argument("--fast", "--fast-mode", dest="alignment_mode", action="store_const", const="fast",
@@ -438,13 +440,29 @@ def prepare_assemblies(args, output, pending, graph=None):
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module  # its dataclasses look their module up there
         spec.loader.exec_module(module)
-    jobs, threads = module.share_threads(len(todo), None, args.threads)
+    slurm = getattr(args, "slurm", False)
+    if slurm:
+        # One SLURM job per assembly, with -t CPUs, at most --slurm-jobs at once.
+        jobs, threads = max(1, min(len(todo), getattr(args, "slurm_jobs", None) or 20)), args.threads
+    else:
+        jobs, threads = module.share_threads(len(todo), None, args.threads)
     if todo:
-        say(f"Preparing {len(todo)} assemblies: {jobs} at once, {threads} WindowMasker process(es) each")
+        say(f"Preparing {len(todo)} assemblies: {jobs} at once"
+            + (" as SLURM jobs" if slurm else "") + f", {threads} WindowMasker process(es) each")
     commands = []
     for name, fasta, target, *_rest in todo:
         command = [sys.executable, str(tool), "-i", str(fasta), "--name", name,
                    "-O", str(target), "--contignamefix", "-t", str(threads)]
+        if slurm:
+            wrapper = [sys.executable, str(ROOT / "graph_build_snakemake/workflow/scripts/pipeline_inputs.py"),
+                       "run-slurm", "--cpus", str(args.threads), "--memory", args.slurm_memory or f"{2 * args.threads}G",
+                       "--job-name", f"LinGraph-prepare-{name}", "--log-dir", str(output / "lingraph" / "slurm_logs"),
+                       "--time", args.slurm_time]
+            for option, value in (("--account", args.slurm_account), ("--partition", args.slurm_partition)):
+                if value:
+                    wrapper += [option, value]
+            wrapper += ["--sbatch-arg=" + value for value in shlex.split(args.slurm_args)]
+            command = wrapper + ["--", *command]
         say("Prepare: " + shlex.join(command))
         commands.append(command)
     codes = []
