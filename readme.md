@@ -687,8 +687,7 @@ details.
 | `OUT/samples/NAME/NAME.coverage.missing_reference.bed`, `NAME.coverage.missing_query.bed` | individual | Uncovered reference and assembly intervals |
 | `OUT/cohort.sv.vcf`, `cohort.indel.vcf`, `cohort.snp.vcf` | graph; individual with `--merge` | Merged cohort calls (grVCF) |
 | `OUT/cohort.gfa` | graph with `--make-graph` | Pangenome graph (rGFA) |
-| `OUT/gaf/batch_NNN/SAMPLE.gaf` | graph with `--make-graph` | Each sample's paths through the graph |
-| `OUT/gaf/added_links.gfa` | graph with `--make-graph` | Extra links the sample paths need; the final graph is `cohort.gfa` plus these links |
+| `OUT/gaf/SAMPLE.gaf` | graph with `--make-graph` | Each sample's paths through the graph (`OUT/gaf/gaf_stats.tsv` summarizes them) |
 | `OUT/checkpoints/local_reference_templates.fa`, `alternative_loci.fa` | graph | [Alternative and novel sequences](#where-do-i-find-the-alternative-and-novel-sequences) for this reference (individual mode writes them under `samples/NAME/`) |
 | `OUT/lingraph/` | both | Run record (`run.json`), logs, and checkpoints |
 
@@ -877,8 +876,9 @@ using the output. The legacy `-r` option is accepted but ignored; `-a` and
 
 ## Build a pangenome GFA from grVCF
 
-Graph export uses the **original merged grVCFs**, their graph annotations, and
-the matching assembly sequences to build `cohort.gfa`. Converting copies to
+Graph export uses the **original merged grVCFs** and their graph annotations to
+build `cohort.gfa`; the bases come from the grVCFs and the reference, template,
+and catalog FASTAs, never from the assemblies. Converting copies to
 standard VCF removes information needed here, so keep the grVCFs.
 
 ### Export through LinGraph
@@ -893,15 +893,20 @@ python scripts/LinGraph.py graph -G cohort_graph -O cohort_calls \
 
 The output is **`cohort_calls/cohort.gfa`**, plus the per-sample GAFs under
 `cohort_calls/gaf/`. Use the same graph, reference, and merged VCFs as the
-calling run, and keep the original assembly FASTAs, indexes, and saved template
-files available. To do everything in one run instead, add `--make-graph` to
-the [build command](#3-run-the-build).
+calling run, and keep the saved template files and the graph's catalog FASTAs
+(with their `.fai` indexes) available. The export runs the C++ tool
+`GrvcfGraph` (built by `install.py`), which writes the GFA and every sample's
+GAF in one assembly-free pass; `--svonly` merges are not supported. To do
+everything in one run instead, add `--make-graph` to the
+[build command](#3-run-the-build).
 
 The default export is **rGFA**, a GFA with stable sequence coordinates. It
 contains the reference backbone and branches for the SNPs, indels, and SVs; its
-named paths describe source sequences and variant alleles.
+named paths are the source sequences, and the `SN`/`SO` tags of each variant's
+segments name its allele.
 
-- `--insertion-only 50` exports only insertions of at least 50 bp.
+- `--gaf-threads N` sets how many samples are walked at once for the GAFs
+  (default: `-t`); each holds about 400 bytes per carried allele.
 - `--max-node-length` sets the maximum segment length (default 1,024 bases).
 - An explicit `-r` makes that haplotype the backbone. Without `-r`, export uses
   `GRAPH/inputs/reference_alternatives_novels.fa`, the combined catalog of
@@ -971,7 +976,8 @@ aligners.
 
 If inputs are not in this format, LinGraph stops and prints a preparation
 command for each one. With `--force-prepare`, it instead prepares copies in
-`OUTPUT/PreparedAssemblies/` and deletes them when the run finishes. This needs
+`OUTPUT/PreparedAssemblies/` (in parallel, sharing `-t`) and deletes them when
+the run finishes. This needs
 temporary disk space for a full copy of each prepared assembly. It is fine for
 a few samples; for a large cohort, prepare the assemblies beforehand.
 

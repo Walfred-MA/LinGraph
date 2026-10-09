@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Exact, chromosome-wise cohort merge for graphreftovcf SNPs and small indels.
 
-Scan each input once into compact shards. Each chromosome worker loads all its
-observations into RAM, sorts with Polars, and unions identical coordinates and
-alleles. No alignment, distance clustering, or disk-backed sort rounds.
+Scan each input once. The C++ worker sorts compact observations within a RAM
+budget and unions identical coordinates and alleles. Oversized chromosomes
+spill sorted runs to scratch. No alignment or distance clustering is performed.
 """
 from __future__ import annotations
 
@@ -70,6 +70,9 @@ def _kind_and_key(row, cutoff):
 
 def _scan_one(task):
     index, path, directory, cutoff, snp_only = task
+    import graphvcfmerge_native as native
+    if native.enabled():
+        return native.scan_one(index, [path], directory, cutoff, compact=False)
     directory = Path(directory) / str(index)
     directory.mkdir()
     handles, chroms, meta, samples = OrderedDict(), {}, [], []
@@ -149,8 +152,12 @@ def scan(paths, shards_dir, cutoff=20, processes=1, snp_only=False, manifest_out
     else:
         results = [_scan_one(task) for task in tasks]
     samples, metadata, seen, chroms, definitions = [], [], set(), {}, {}
+    sample_set = set()
     for result in results:
-        samples.extend(name for name in result['samples'] if name not in samples)
+        for name in result['samples']:
+            if name not in sample_set:
+                samples.append(name)
+                sample_set.add(name)
         chroms.update(result['chroms'])
         for line in result['meta']:
             if line.startswith('##contig=<'):
@@ -192,7 +199,7 @@ def part_path(manifest, key, kind):
     return Path(manifest['directory']) / 'parts' / (key + '.' + kind + '.part')
 
 
-def merge_chrom(shards_dir, chrom, processes=1):
+def merge_chrom(shards_dir, chrom, processes=1, memory_divisor=1):
     manifest = load_manifest(shards_dir)
     if manifest.get("protocol") in (2, 3, 4):
         from graphvcfmerge_snp_compact import merge_chrom as compact_chrom
@@ -201,6 +208,9 @@ def merge_chrom(shards_dir, chrom, processes=1):
         (key for key, name in manifest['chroms'].items() if name == chrom), None)
     if key is None:
         raise ValueError(f'unknown chromosome {chrom!r}')
+    import graphvcfmerge_native as native
+    if native.enabled():
+        return native.small_chrom(manifest, key, memory_divisor)
     chrom = manifest['chroms'][key]
     sites, coverage = {}, defaultdict(list)
     for source in manifest['files']:
@@ -314,8 +324,9 @@ def merge(paths, snp_output, indel_output=None, *, cutoff=20, processes=1, tmpdi
             for _, key in tasks:
                 merge_chrom(root, key, processes)
         elif processes > 1 and len(tasks) > 1:
-            with vcf.mp_context().Pool(min(processes, len(tasks))) as pool:
-                pool.map(_chrom_task, tasks)
+            workers = min(processes, len(tasks))
+            with vcf.mp_context().Pool(workers) as pool:
+                pool.map(_chrom_task, [(root, key, 1, workers) for _, key in tasks])
         else:
             for task in tasks:
                 _chrom_task(task)
@@ -481,6 +492,9 @@ def main(argv=None):
     parser.add_argument('--svcutoff', type=int, default=20, help='small indels have MAXSIZE < cutoff [20]')
     parser.add_argument('-t', '--processes', type=int, default=1,
                         help='scan workers or chromosome loading/sorting threads [1]')
+    parser.add_argument('--small-ram-gb', type=float,
+                        help='small-variant RAM budget in GiB; default 64 below 100 samples, '
+                             '128 through 2,000, then scales to 512 at 10,000')
     parser.add_argument('--stage', choices=('scan', 'prepare', 'chrom', 'concat', 'fold'))
     parser.add_argument('--shards-dir')
     parser.add_argument('--manifest-output', help='scan: durable copy of the chromosome manifest')
@@ -493,6 +507,10 @@ def main(argv=None):
                              '--candidate-min-size equal to --svcutoff) to the .indel.vcf and '
                              'sort, without merging rows; with --stage fold, only do this')
     args = parser.parse_args(argv)
+    if args.small_ram_gb is not None:
+        import graphvcfmerge_native as native
+        os.environ['GRAPHVCFMERGE_RAM_GB'] = str(args.small_ram_gb)
+        native.memory_bytes(0)
     if args.fold_small and args.snp_only:
         parser.error('--fold-small needs the indel output; drop --snp-only')
     if args.stage == 'fold':

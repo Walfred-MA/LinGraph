@@ -68,6 +68,7 @@ Common run options (place after graph or individual):
 Graph-only options:
   --make-graph           Also export cohort.gfa and per-sample GAFs
   --gfa-only             Export existing merged VCFs
+  --gaf-threads N        Samples walked at once for the GAFs (default: -t)
   --static-block         Keep initial templates; skip additional novel loci
   --recall-only          Recall and merge from saved calling alignments
   --slurm-jobs INT       Maximum simultaneous SLURM jobs (default: 20)
@@ -145,6 +146,9 @@ Examples:
         if mode == "graph":
             q.add_argument("--make-graph", dest="mc_graph", action="store_true",
                            help="convert merged VCF to cohort.gfa")
+            q.add_argument("--gaf-threads", type=int, metavar="N",
+                           help="samples walked at once for the per-sample GAFs, each holding about "
+                                "400 bytes per carried allele (default: -t)")
             # Former names, still accepted.
             q.add_argument("--MC-graph", "--mc-graph", dest="mc_graph", action="store_true",
                            help=argparse.SUPPRESS)
@@ -1217,25 +1221,36 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     catalog = graph_root / "summary" / "alternatives.fasta"
     if not catalog.is_file() and (graph / "alternatives.fasta").is_file():
         catalog = graph / "alternatives.fasta"
-    query_sources = dict(cohort)
-    query_sources.update(samples)
-    query_sources[ref[0]] = ref[1]
-    query_list = runner.work / "mc-query_paths.list"
-    write_text(query_list, "".join(f"{name}\t{path}\n" for name, path in query_sources.items()), args.dry_run)
     merge_mode = cohort_merge.resolve_mode(args)
     vcf_inputs = cohort_merge.output_paths(output, merge_mode)
-    command = ["-v", *vcf_inputs, "-q", query_list,
-               "--graph-folder", graph_root, "--reference-haplotype", ref[0],
-               *template_options, "-o", output / "cohort.gfa",
-               "--gfa-mode", "rgfa", "--processes", args.threads,
-               "--svonly" if merge_mode == 'svonly' else "--all", "--svcutoff", args.svcutoff]
-    if args.reference:
-        command += ['-r', fixed]
-    if args.insertion_only is not None:
-        command += ['--insertion-only', args.insertion_only]
-    command += cli_options.forward(args, 'gfa')
-    inputs = [*vcf_inputs, query_list, fixed, templates, *([loci] if loci.is_file() else []),
-              *query_sources.values()]
+    # The C++ exporter (GrvcfGraph) writes the GFA and every sample's GAF in one
+    # assembly-free run: bases come from the merged grVCFs and the FASTAs above.
+    if merge_mode == 'svonly' or args.insertion_only is not None:
+        raise ValueError("--make-graph/--gfa-only export every merged row; --svonly merges "
+                         "and --insertion-only are not supported by the C++ exporter")
+    # The newest build: install.py's copy or the one compiled in src/.
+    tool = max((path for path in (ROOT / "GrvcfGraph", ROOT / "src" / "GrvcfGraph" / "GrvcfGraph")
+                if path.is_file() and os.access(path, os.X_OK)), key=lambda path: path.stat().st_mtime, default=None)
+    source = ROOT / "src" / "GrvcfGraph" / "GrvcfGraph.cpp"
+    if tool is None and not args.dry_run:
+        raise ValueError(f"GrvcfGraph is not built: run python install.py, or compile {source}")
+    if tool is not None and source.is_file() and source.stat().st_mtime > tool.stat().st_mtime and not args.dry_run:
+        raise ValueError(f"{tool} is older than {source}; rebuild it: python install.py, or "
+                         f"c++ -O3 -march=x86-64 -mtune=generic -std=c++17 -pthread -o {tool} {source}")
+    tool = tool or ROOT / "GrvcfGraph"
+    settings = cli_options.values(args, 'gfa')
+    unsupported = sorted(set(settings) - {'max_node_length'})
+    if unsupported:
+        raise ValueError("GFA settings not supported by the C++ exporter: "
+                         + ", ".join("--" + name.replace("_", "-") for name in unsupported))
+    gaf = output / "gaf"
+    command = [tool, "-v", *vcf_inputs, "-r", fixed, "--reference-haplotype", ref[0],
+               *template_options, "-o", output / "cohort.gfa", "--gaf", gaf, "-t", args.threads]
+    if 'max_node_length' in settings:
+        command += ["--max-node-length", settings['max_node_length']]
+    if getattr(args, 'gaf_threads', None):
+        command += ["--gaf-threads", args.gaf_threads]
+    inputs = [*vcf_inputs, fixed, templates, *([loci] if loci.is_file() else []), tool]
     if args.mode == 'individual':
         for value in args.alternative:
             fasta = absolute(value)
@@ -1244,12 +1259,21 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     if catalog.is_file() or args.mode == "graph":
         command += ["--local-path-fasta", catalog]
         inputs.append(catalog)
-    inputs += [Path(str(path) + ".fai") for path in (fixed, templates, *query_sources.values(), catalog)]
-    inputs += [ROOT / name for name in ("gfa_interval_pipeline.py", "gfa_interval_metadata.py",
-               "gfa_query_anchors.py", "gfa_stable_coords.py", "gfa_source_catalog.py",
-               "gfa_catalog_paths.py", "gfa_duplications.py", "gfa_topology.py",
-               "gfa_partitioned.py", "gfa_junctions.py", "minsetref_core.py", "minsetref_segments.py",
-               "assembly_contigs.py")]
+    inputs += [Path(str(path) + ".fai") for path in (fixed, templates, catalog)]
+    # Each sample's ##pseudoLinearMapping lines: the merge's one headers file
+    # (all samples), else the per-sample VCFs' headers (merges without it).
+    headers = output / cohort_merge.SAMPLE_HEADERS
+    if headers.is_file():
+        mapping = [headers]
+    else:
+        try:
+            mapping = cohort_merge.input_paths(output, absolute(args.vcf_list) if args.vcf_list else None)
+        except FileNotFoundError:
+            if not args.dry_run:
+                raise
+            mapping = []
+    command += ["-s", *mapping]
+    inputs += mapping
     if args.slurm:
         wrapper = [sys.executable, ROOT / 'graph_build_snakemake/workflow/scripts/pipeline_inputs.py',
                    'run-slurm', '--cpus', args.threads, '--memory', args.slurm_memory or '64G',
@@ -1259,175 +1283,9 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
             if value:
                 wrapper += [option, value]
         wrapper += ['--sbatch-arg=' + value for value in shlex.split(args.slurm_args)]
-        # Stage name kept from the former --MC-graph: it names checkpoints/MC-graph.json.
-        runner.run('MC-graph', [*wrapper, '--', sys.executable, ROOT / 'merged_vcf_to_gfa.py', *command],
-                   inputs=inputs, outputs=[output / 'cohort.gfa'])
-    else:
-        runner.script("MC-graph", "merged_vcf_to_gfa.py", command,
-                      inputs=inputs, outputs=[output / "cohort.gfa"])
-    sample_gafs(args, runner, output, query_list, vcf_inputs)
-
-
-GAF_BATCH = 16  # sample VCFs per gfa_sample_gaf.py job (one worker each)
-GAF_SHARD_RECORDS = 20_000_000  # records (29 bytes each) buffered by a shard chunk job
-GAF_CHUNK_BYTES = 32 << 30      # largest merged-VCF chunk per shard job (split near chromosomes)
-
-
-def sample_gafs(args, runner, output, query_list, vcf_inputs):
-    """Per-sample GAFs on cohort.gfa, in batches; links the batches add are combined."""
-    try:
-        sample_vcfs = cohort_merge.input_paths(output, absolute(args.vcf_list) if args.vcf_list else None)
-    except FileNotFoundError:
-        if not args.dry_run:
-            raise
-        say(f"GAF: per-sample VCFs not found yet in {output}; batches are planned after calling")
-        return
-    gfa = output / "cohort.gfa"
-    sidecars = [Path(str(gfa) + suffix) for suffix in (".variants.tsv", ".anchors.bed.local-paths.tsv")]
-    index = output / "gaf" / "index"
-
-    def command_for(job, cpus, arguments, memory='64G'):
-        if not args.slurm:
-            return [sys.executable, *arguments]
-        wrapper = [sys.executable, ROOT / 'graph_build_snakemake/workflow/scripts/pipeline_inputs.py',
-                   'run-slurm', '--cpus', cpus, '--memory', args.slurm_memory or memory,
-                   '--job-name', job, '--log-dir', runner.work / 'slurm_logs', '--time', args.slurm_time]
-        for option, value in (('--account', args.slurm_account), ('--partition', args.slurm_partition)):
-            if value:
-                wrapper += [option, value]
-        wrapper += ['--sbatch-arg=' + value for value in shlex.split(args.slurm_args)]
-        return [*wrapper, '--', sys.executable, *arguments]
-
-    # The graph tables the walks read, built once and memory-mapped by every batch.
-    runner.run("GAF-index", command_for('LinGraph-GAF-index', args.threads, [ROOT / "gfa_gaf_index.py", "-g", gfa, "-o", index]),
-               inputs=[gfa, sidecars[0]], outputs=[index / "index.json"])
-    # The merged VCFs are streamed once into per-sample shards for all batches:
-    # chunks near chromosome changes (one job each), then contigs numbered over them.
-    shards = output / "gaf" / "shards"
-    shard_command = [ROOT / "gfa_sample_gaf.py", "-g", gfa, "--index", index, "-v", *vcf_inputs,
-                     "-s", *sample_vcfs, "-o", shards]
-    shard_inputs = [gfa, *sidecars, index / "index.json", ROOT / "gfa_gaf_index.py", *vcf_inputs, *sample_vcfs]
-    runner.run("GAF-shard-plan", command_for('LinGraph-GAF-shard-plan', args.threads, [
-        *shard_command, "--plan-shards", "--shard-chunk-bytes", GAF_CHUNK_BYTES, "-t", args.threads], '16G'),
-        inputs=shard_inputs, outputs=[shards / "plan.json"])
-    if not (shards / "plan.json").is_file():
-        say("GAF: shard chunks and batches are planned after the shard plan exists")
-        return
-    count = len(json.loads((shards / "plan.json").read_text())["chunks"])
-    chunks = [(f"GAF-shard-{number + 1:05d}",
-               [sys.executable, *shard_command, "--write-shards", "--chunk", number,
-                "--shard-records", GAF_SHARD_RECORDS],
-               [*shard_inputs, shards / "plan.json"], [shards / f"chunk_{number:05d}" / "meta.json"])
-              for number in range(count)]
-    if args.slurm:
-        gaf_array(args, runner, shards, chunks, "shard", 1, '16G')
-    else:
-        for name, command, inputs, outputs in chunks:
-            runner.run(name, command, inputs=inputs, outputs=outputs)
-    runner.run("GAF-shard-finish", command_for('LinGraph-GAF-shard-finish', args.threads, [
-        *shard_command, "--finish-shards"], '16G'),
-        inputs=[*shard_inputs, shards / "plan.json", *(outputs[0] for *_rest, outputs in chunks)],
-        outputs=[shards / "shards.json"])
-    batches = [sample_vcfs[start:start + GAF_BATCH] for start in range(0, len(sample_vcfs), GAF_BATCH)]
-    jobs = []
-    for number, batch in enumerate(batches, 1):
-        folder = output / "gaf" / f"batch_{number:03d}"
-        command = [sys.executable, ROOT / "gfa_sample_gaf.py", "-g", gfa, "--index", index, "--shards", shards,
-                   "-v", *vcf_inputs, "-s", *batch,
-                   "-q", query_list, "-o", folder, "-t", min(args.threads, len(batch)),
-                   "--add-links", folder / "added_links.gfa"]
-        jobs.append((f"sample-GAF-{number:03d}", command,
-                     [gfa, *sidecars, index / "index.json", shards / "shards.json", ROOT / "gfa_gaf_index.py",
-                      *vcf_inputs, *batch, query_list],
-                     [folder / "gaf_stats.tsv", folder / "added_links.gfa"]))
-    if args.slurm:
-        gaf_array(args, runner, output / "gaf", jobs, "batch", args.threads, '64G')
-    else:
-        for name, command, inputs, outputs in jobs:
-            runner.run(name, command, inputs=inputs, outputs=outputs)
-    if not args.dry_run:
-        # The union in gfa_sample_gaf.py's order (encoded link key), so one
-        # batch gives the same file as an unbatched run.
-        links = set()
-        for _name, _command, _inputs, outputs in jobs:
-            with open(outputs[1]) as handle:
-                links.update(handle)
-
-        def key(line):
-            _l, a, oa, b, ob = line.split('\t')[:5]
-            return ((int(a) * 2 + (oa == '-')) << 32) | (int(b) * 2 + (ob == '-'))
-        write_text(output / "gaf" / "added_links.gfa", "".join(sorted(links, key=key)))
-
-
-def array_spec(numbers):
-    """1,2,3,7 -> '1-3,7' for sbatch --array."""
-    ranges = []
-    for number in sorted(numbers):
-        if ranges and number == ranges[-1][1] + 1:
-            ranges[-1][1] = number
-        else:
-            ranges.append([number, number])
-    return ",".join(f"{a}-{b}" if a != b else f"{a}" for a, b in ranges)
-
-
-def gaf_array(args, runner, folder, jobs, label, cpus, memory):
-    """Jobs not yet current as one SLURM job array (task ID = the number ending
-    the job name; each runs OUTPUT_FOLDER/run.sh of its first output), at most
-    --slurm-jobs running; each completed task is recorded even if others fail."""
-    pending = []
-    for name, command, inputs, outputs in jobs:
-        if runner.current(name, command, inputs, outputs):
-            say(f"Reuse {name}")
-        else:
-            pending.append((int(name.rsplit('-', 1)[1]), name, command, inputs, outputs))
-    if not pending:
-        return
-    for _number, _name, command, _inputs, outputs in pending:
-        batch = outputs[0].parent
-        done = batch / "DONE"
-        if not args.dry_run:
-            batch.mkdir(parents=True, exist_ok=True)
-            for stale in (*outputs, done):
-                stale.unlink(missing_ok=True)
-        write_text(batch / "run.sh", "#!/bin/bash\nset -euo pipefail\n" + shlex.join(map(str, command))
-                   + "\ntouch " + shlex.quote(str(done)) + "\n", args.dry_run)
-    # Line N of the task list is the folder of task N.
-    tasks = folder / f"{label}_tasks.txt"
-    lines = [""] * max(number for number, *_rest in pending)
-    for number, _name, _command, _inputs, outputs in pending:
-        lines[number - 1] = str(outputs[0].parent)
-    write_text(tasks, "\n".join(lines) + "\n", args.dry_run)
-    script = folder / f"run_{label}.sh"
-    write_text(script, "#!/bin/bash\nset -euo pipefail\nexec bash \"$(sed -n \"${SLURM_ARRAY_TASK_ID}p\" "
-               + shlex.quote(str(tasks)) + ')/run.sh"\n', args.dry_run)
-    spec = array_spec(number for number, *_rest in pending) + f"%{getattr(args, 'slurm_jobs', None) or 20}"
-    wrapper = [sys.executable, ROOT / 'graph_build_snakemake/workflow/scripts/pipeline_inputs.py',
-               'run-slurm', '--cpus', cpus, '--memory', memory,
-               '--job-name', f'LinGraph-GAF-{label}', '--log-dir', runner.work / 'slurm_logs',
-               '--time', args.slurm_time]
-    for option, value in (('--account', args.slurm_account), ('--partition', args.slurm_partition)):
-        if value:
-            wrapper += [option, value]
-    wrapper += ['--sbatch-arg=' + value for value in shlex.split(args.slurm_args)]
-    wrapper += ['--sbatch-arg=--array=' + spec, '--', 'bash', script]
-    try:
-        runner.run(f'GAF-{label}-array', wrapper, force=True)
-        problem = None
-    except RuntimeError as error:
-        problem = error
-    if args.dry_run:
-        return
-    failed = []
-    # Tasks that just finished on other nodes: give their files time to appear.
-    wait_for_files([path for *_rest, outputs in pending for path in (outputs[0].parent / "DONE", *outputs)])
-    for _number, name, command, inputs, outputs in pending:
-        if (outputs[0].parent / "DONE").is_file() and all(path.is_file() for path in outputs):
-            runner.adopt(name, command, inputs=inputs, outputs=outputs)
-        else:
-            failed.append(name)
-    if failed or problem:
-        raise RuntimeError(f"GAF {label} jobs failed: {', '.join(failed) or 'none recorded'}; see "
-                           f"{runner.work / 'slurm_logs'}; repeat the command to rerun only these") from problem
+        command = [*wrapper, '--', *command]
+    # Stage name kept from the former --MC-graph: it names checkpoints/MC-graph.json.
+    runner.run('MC-graph', command, inputs=inputs, outputs=[output / 'cohort.gfa', gaf / 'gaf_stats.tsv'])
 
 
 RECALL_SETTINGS = {'format_processes', 'edge_blackregion', 'max_extension', 'realignment',
@@ -1609,6 +1467,11 @@ def main(argv=None):
         p.error("--vcf-list requires --merge-only")
     if args.gfa_only:
         args.mc_graph = True
+    if getattr(args, 'gaf_threads', None) is not None:
+        if not args.mc_graph:
+            p.error("--gaf-threads requires --make-graph or --gfa-only")
+        if args.gaf_threads < 1:
+            p.error("--gaf-threads must be positive")
     if args.alignment_mode == 'rigorous' and getattr(args, 'skip_blastn', False):
         p.error("--rigorous requires both aligners and cannot be combined with --skip-blastn")
     if (cli_options.values(args, 'gfa') or args.insertion_only is not None) and not args.mc_graph:
@@ -1811,8 +1674,8 @@ def main(argv=None):
         for path in cohort_merge.output_paths(output, cohort_merge.resolve_mode(args)):
             say(f"Merged VCF: {path}")
     if args.mc_graph:
-        say(f"GFA: {output / 'cohort.gfa'} (final graph: plus {output / 'gaf/added_links.gfa'})")
-        say(f"GAF: {output}/gaf/batch_NNN/SAMPLE.gaf")
+        say(f"GFA: {output / 'cohort.gfa'} (including the links the sample walks add)")
+        say(f"GAF: {output}/gaf/SAMPLE.gaf (summary: {output}/gaf/gaf_stats.tsv)")
     if args.mode == "individual" and not args.reference_only:
         say(f"Coverage: {output}/samples/NAME/NAME.coverage.summary.tsv (plus missing-region BEDs)")
     return 0

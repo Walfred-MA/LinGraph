@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Copy a saved Snakefile with the current 32-CPU/64G SNP chromosome rule.
+"""Copy a saved Snakefile with the current 32-CPU SNP chromosome rule.
+
+RAM scales with cohort size: 64G below 100 samples, 128G through 2,000,
+then up to 512G for 10,000 samples.
 
 Only that rule changes. Original workflow/configuration, shards, SV jobs and
 completed chromosome parts remain in place. Stop the old workflow before

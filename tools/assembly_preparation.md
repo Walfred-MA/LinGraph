@@ -85,17 +85,20 @@ python3 tools/prepare_assemblies.py \
   --contignamefix
 ```
 
-`-j` controls how many assemblies are processed concurrently. Each
-WindowMasker process is single-threaded, so choose this based on available
-memory and I/O bandwidth.
+Preparation is parallel by default. `-t/--threads` is the CPU budget
+(default: the machine's CPUs, at most 16, as LinGraph's `-t`). Without `-j`,
+it is shared: `min(assemblies, -t)` assemblies are prepared at once, each
+masked with `-t // that many` WindowMasker processes. With `-j`, `-j`
+assemblies run at once and `-t` is per assembly (about `-j` x `--threads`
+in total), so choose `-j` by available memory and I/O bandwidth.
 
-`-t/--threads` parallelizes masking within one assembly. WindowMasker first
-counts units once over the whole assembly (single-threaded), then the
-assembly is split into whole-record chunks that are masked concurrently with
-those genome-wide counts and joined back in input order. The mask is the same
-as a single whole-assembly run. Total CPU use is about `-j` x `--threads`;
-each masking process loads the counts file, and the chunks use temporary disk
-space next to the output. For one diploid sample:
+Within one assembly, WindowMasker first counts units once over the whole
+assembly (single-threaded), then the assembly is split into whole-record
+chunks that are masked concurrently with those genome-wide counts and joined
+back in input order. The mask is the same as a single whole-assembly run, and
+the prepared FASTAs are the same for any `-j`/`-t`. Each masking process loads
+the counts file, and the chunks use temporary disk space next to the output.
+For one diploid sample:
 
 ```bash
 python3 tools/prepare_assemblies.py \

@@ -11142,6 +11142,10 @@ def merge_sample_vcfs_fast(
 
 
 def merge_locus_vcfs(args) -> None:
+    if getattr(args, 'small_ram_gb', None) is not None:
+        import graphvcfmerge_native as native
+        os.environ['GRAPHVCFMERGE_RAM_GB'] = str(args.small_ram_gb)
+        native.memory_bytes(0)
     input_values = list(args.input or ())
     input_values.extend(read_vcf_input_lists(args.input_list))
     paths = expand_vcf_inputs(input_values)
@@ -11338,6 +11342,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--snp-shards-dir", help="scan: save original SNPs as separate 21-byte worker shards")
+    parser.add_argument('--small-ram-gb', type=float,
+                        help='SNP/indel native worker RAM budget in GiB (default scales with cohort size)')
     parser.add_argument("--insertion-snps", default=None, metavar="DIR",
                         help="save compact SNPs from merged insertion alignments for a later SNP merge")
     parser.add_argument(

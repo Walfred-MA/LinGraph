@@ -198,6 +198,9 @@ class Writer:
 
 def _scan_one(task):
     index, paths, directory = task
+    import graphvcfmerge_native as native
+    if native.enabled():
+        return native.scan_one(index, paths, directory)
     writer = Writer(Path(directory) / str(index))
     all_samples, metadata = [], []
     try:
@@ -277,9 +280,13 @@ def manifest_from_sources(results, root, directory, manifest_output=None, insert
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     samples, metadata, chroms, sources, definitions = [], [], {}, [], {}
+    sample_set = set()
     seen = set()
     for result in results:
-        samples.extend(sample for sample in result['samples'] if sample not in samples)
+        for sample in result['samples']:
+            if sample not in sample_set:
+                samples.append(sample)
+                sample_set.add(sample)
         chroms.update(result['chroms'])
         sources.extend(result['sources'] if 'sources' in result else [result['source']])
         for line in result['metadata']:
@@ -900,6 +907,9 @@ def apply_realignment(path, ordered, queries, alleles, kind='SNP', data=None):
 
 
 def _emit_chrom(manifest, key, processes, root=None):
+    import graphvcfmerge_native as native
+    if native.enabled():
+        return native.compact_chrom(manifest, key, processes, root)
     from graphvcfmerge_snp import atomic_output, part_path
     from graphvcfmerge_snp_memory import sorted_locus
     chrom = manifest['chroms'][key]

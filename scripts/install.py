@@ -15,6 +15,7 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shlex
 import shutil
@@ -56,6 +57,10 @@ ROOT_BINARY_ALIASES = {
     "build_local_graphs_parallel_hotspots": (
         "build_local_graphs_parallel_hotspots",
     ),
+    # Exact merged grVCF -> rGFA + per-sample GAF (assembly-free).
+    "GrvcfGraph": ("GrvcfGraph",),
+    # Native small-variant (SNP) chromosome merge worker of graphvcfmerge.
+    "SmallVariantMerge": ("SmallVariantMerge",),
 }
 
 
@@ -320,6 +325,18 @@ def run_build(command: Sequence[str]) -> Tuple[bool, str]:
     return True, "compiled successfully"
 
 
+# Tools whose builds target baseline x86-64: a compiler that defaults to the
+# build host's CPU emits AVX, which older compute nodes reject (SIGILL).
+PORTABLE_TOOLS = ("GrvcfGraph",)
+
+
+def portable_flags() -> List[str]:
+    """Return -march flags for baseline x86-64 (none on other machines)."""
+    if platform.machine().lower() in ("x86_64", "amd64"):
+        return ["-march=x86-64", "-mtune=generic"]
+    return []
+
+
 def standalone_dependency_flags(
     directory: Path,
     dependency_prefix: Optional[Path],
@@ -362,6 +379,11 @@ def make_dependency_arguments(
     dependency_prefix: Optional[Path],
 ) -> List[str]:
     """Return Make variable overrides for tools with native dependencies."""
+    if directory.name == "SmallVariantMerge" and dependency_prefix is not None:
+        prefix = dependency_prefix.expanduser().resolve()
+        return [f"CPPFLAGS=-I{shlex.quote(str(prefix / 'include'))}",
+                f"LDFLAGS=-L{shlex.quote(str(prefix / 'lib'))} -Wl,-rpath,{shlex.quote(str(prefix / 'lib'))}",
+                "LDLIBS=-lz"]
     if directory.name != "KmerSearcher":
         return []
     if dependency_prefix is None:
@@ -442,6 +464,8 @@ def compile_directory(
         )
     except (OSError, ValueError) as error:
         return BuildResult(directory, False, str(error))
+    if directory.name in PORTABLE_TOOLS:
+        compile_flags = portable_flags() + compile_flags
     command = list(compiler) + [
         "-O3", "-std=c++17", "-Wall", "-Wextra", "-Wpedantic",
         "-pthread", *compile_flags, "-o", str(output), str(source),

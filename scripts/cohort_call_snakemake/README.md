@@ -53,25 +53,36 @@ SNPs, independently of the existing SV shards. Chromosome offsets/counts and
 coverage intervals live in metadata, outside the 21-byte records. In `--all`,
 the same scan writes both categories; SNP merging never rescans the input VCFs.
 
-SV chromosome scheduling and resource allocations are unchanged. After the
-shared scan, the SNP stage launches one job per original input chromosome.
-Each Slurm SNP chromosome job requests **32 CPUs and 64G memory**, independently
-of the SV merge settings. Local jobs request 32 threads, scaled down by
-Snakemake's available cores. Each job reads all compact observations for its
-chromosome into RAM, remaps the provenance dictionaries and sorts numerically
-with Polars using the requested threads. Shards remain 21 bytes per observation;
-no sorted binary runs or pair-merge rounds are created. Sorting also needs
-workspace and dictionaries beyond the raw record size, so 64G is an allocation,
-not a guarantee that every cohort size fits. VCF formatting currently uses one
-writer; logs report loading, sort completion and VCF-writing progress.
+After the shared scan, the SNP stage launches one job per original input
+chromosome. Each Slurm SNP chromosome job requests **32 CPUs**, with **64G below
+100 samples, 128G through 2,000 samples**, and larger allocations in 64G steps
+(512G at 10,000 samples). Local jobs request 32 threads, scaled down by
+Snakemake's available cores.
 
-Install the added dependency in the environment running the SNP merger with
-`python -m pip install 'polars>=1.0'`. It is also listed by the repository's
-installer, currently located at `notused/install.py`. Manual chromosome jobs
-should pass `graphvcfmerge_snp.py --stage chrom ... --processes 32` and request
-`sbatch --cpus-per-task=32 --mem=64G`. Changing the worker count does not alter
-the original compact shards. Interrupted RAM sorts restart from those shards;
-existing disk-sort checkpoints are retained but are no longer used.
+`SmallVariantMerge`, a C++17 worker, reads the existing 21-byte shards, remaps
+provenance dictionaries, sorts by position/allele with a parallel radix sort,
+and emits the VCF body. Its default RAM budget follows the same cohort policy.
+Half the budget is reserved for dictionaries, grouping, output and the Python
+parent; the other half bounds records plus sort workspace. Oversized chromosomes
+use sorted scratch runs with at most 64 open runs in each merge pass. Coverage
+updates and observations patch reusable sample columns, avoiding a sample loop
+per site. Dense VCF output still necessarily writes one field per sample.
+
+Build with `make -C scripts/src/SmallVariantMerge`, or use `scripts/install.py`.
+The dependency is zlib; the custom graph-VCF parser does not use HTSlib. A missing
+binary is compiled once into a locked local cache. For manual chromosome jobs,
+pass `graphvcfmerge_snp.py --stage chrom ... --processes 32`. Override the budget
+with `--small-ram-gb` or `GRAPHVCFMERGE_RAM_GB`; detected Slurm memory allocations
+cap that budget. Existing shards and saved workflow commands remain readable.
+Interrupted sorts restart from the original shards. Native workers are quiet
+on success and report errors with the source location where available.
+
+The dedicated SNP/indel command also uses C++ scanning and exact small-indel
+grouping. The shared scan and indels produced inside SV alignment/nested calling
+continue through the SV backend. Headers, manifests, insertion-SNP handling and
+publication retain their existing Python orchestration. Set
+`GRAPHVCFMERGE_BACKEND=python` to run the reference implementation; only that SNP
+chromosome fallback requires Polars.
 
 Saved resume Snakefiles retain their old commands. After stopping the previous
 controller and its unfinished SNP jobs, make a copy with just the updated SNP

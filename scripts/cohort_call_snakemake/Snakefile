@@ -1030,7 +1030,8 @@ if SMALL_VCFS:
         resources:
             slurm_jobs=1 if SLURM_ENABLED else 0
         params:
-            slurm=lambda wc: slurm_prefix("merge-small-" + wc.chrom[:12], 32, "64G"),
+            slurm=lambda wc: slurm_prefix("merge-small-" + wc.chrom[:12], 32,
+                                         str(64 if len(SAMPLES) < 100 else max(128, ((len(SAMPLES) + 1279) // 1280) * 64)) + "G"),
             workers=lambda wc, threads: 32 if SLURM_ENABLED else threads,
         shell:
             """

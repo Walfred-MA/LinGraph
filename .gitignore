@@ -1,4 +1,5 @@
 # Local caches and build products
+.claude/
 .DS_Store
 __pycache__/
 *.py[cod]
@@ -20,6 +21,9 @@ __pycache__/
 /scripts/kmerblocking
 /scripts/kmerpartitionmerger
 /scripts/build_local_graphs_parallel_hotspots
+/scripts/GrvcfGraph
+/scripts/SmallVariantMerge
+/scripts/src/GrvcfGraph/GrvcfGraph
 /scripts/src/KmerSearcher/kmer_searcher
 /scripts/src/KmerStrd/kmerstrd
 /scripts/src/KmerMatch/KmerMatch
