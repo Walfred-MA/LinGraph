@@ -150,8 +150,8 @@ Examples:
                            help=argparse.SUPPRESS)
         q.add_argument("--force-prepare", action="store_true",
                        help="prepare fixed copies of assemblies that are not ready in "
-                            f"OUTPUT/{PREPARED_FOLDER} (removed when the run finishes) "
-                            "instead of stopping; duplicates those assemblies on disk")
+                            f"OUTPUT/{PREPARED_FOLDER} (in parallel, sharing -t; removed when "
+                            "the run finishes) instead of stopping; duplicates those assemblies on disk")
         alignment = q.add_mutually_exclusive_group()
         if mode == "graph":
             alignment.add_argument("--fast", "--fast-mode", dest="alignment_mode", action="store_const", const="fast",
@@ -409,6 +409,7 @@ def prepare_assemblies(args, output, pending, graph=None):
     folder = output / PREPARED_FOLDER
     tool = ROOT / "tools" / "prepare_assemblies.py"
     prepared = {}
+    todo = []
     for name, fasta in pending:
         target = folder / name
         listing = target / "query_paths.prepared.txt"
@@ -427,16 +428,35 @@ def prepare_assemblies(args, output, pending, graph=None):
                     say(f"Reuse prepared assembly {name}: {previous}")
                     prepared[(name, fasta)] = previous
                     continue
+        todo.append((name, fasta, target, listing, stamp_file, stat, stamp))
+    # The -t budget is shared: several assemblies at once, each masked with
+    # its part of the threads (prepare_assemblies.share_threads).
+    import importlib.util
+    module = sys.modules.get("lingraph_prepare_assemblies")
+    if module is None:
+        spec = importlib.util.spec_from_file_location("lingraph_prepare_assemblies", tool)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module  # its dataclasses look their module up there
+        spec.loader.exec_module(module)
+    jobs, threads = module.share_threads(len(todo), None, args.threads)
+    if todo:
+        say(f"Preparing {len(todo)} assemblies: {jobs} at once, {threads} WindowMasker process(es) each")
+    commands = []
+    for name, fasta, target, *_rest in todo:
         command = [sys.executable, str(tool), "-i", str(fasta), "--name", name,
-                   "-O", str(target), "--contignamefix", "-t", str(args.threads)]
+                   "-O", str(target), "--contignamefix", "-t", str(threads)]
         say("Prepare: " + shlex.join(command))
-        if args.dry_run:
-            continue
-        try:
-            subprocess.run(command, check=True)
-        except subprocess.CalledProcessError as error:
-            raise RuntimeError(f"preparing assembly {name} failed (exit {error.returncode}); "
-                               f"see the messages above. Input: {fasta}") from None
+        commands.append(command)
+    codes = []
+    if todo and not args.dry_run:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            codes = list(pool.map(lambda command: subprocess.run(command).returncode, commands))
+    failed = [(item, code) for item, code in zip(todo, codes) if code]
+    if failed:
+        raise RuntimeError("preparing assemblies failed (see the messages above): " + "; ".join(
+            f"{name} exit {code} (input {fasta})" for (name, fasta, *_rest), code in failed))
+    for name, fasta, target, listing, stamp_file, stat, stamp in (todo if codes else ()):
         fields = listing.read_text().split()
         result = Path(fields[1])
         check_prepared(name, result, require_mask=False)

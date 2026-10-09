@@ -28,6 +28,8 @@ LEADING_PREFIX_RE = re.compile(
     r"^(?P<sample>[A-Za-z0-9.-]+)#(?P<haplotype>[1-9][0-9]*)#"
 )
 LOWERCASE_DNA = frozenset(b"acgt")
+# Local CPU budget, as LinGraph.py's -t default.
+DEFAULT_THREADS = max(1, min(16, os.cpu_count() or 1))
 
 
 @dataclass(frozen=True)
@@ -561,6 +563,15 @@ def atomic_write_lines(path: Path, lines: Iterable[str]) -> None:
             pass
 
 
+def share_threads(assemblies: int, jobs: Optional[int], threads: int) -> Tuple[int, int]:
+    """(assemblies at once, WindowMasker processes each). Without jobs the
+    thread budget is shared: as many assemblies at once as it allows."""
+    if jobs is not None:
+        return jobs, threads
+    jobs = max(1, min(assemblies, threads))
+    return jobs, max(1, threads // jobs)
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -582,15 +593,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="folder for prepared FASTAs, indexes, and the rewritten list",
     )
     parser.add_argument(
-        "-j", "--jobs", type=int, default=1,
-        help="assemblies to prepare concurrently (default: 1)",
+        "-j", "--jobs", type=int,
+        help=(
+            "assemblies to prepare concurrently; then --threads is per assembly "
+            "(default: shared from --threads, see there)"
+        ),
     )
     parser.add_argument(
-        "-t", "--threads", type=int, default=1,
+        "-t", "--threads", type=int, default=DEFAULT_THREADS,
         help=(
-            "WindowMasker masking processes per assembly: genome-wide counts "
-            "run once, then record chunks are masked concurrently; total CPUs "
-            "are about --jobs x --threads (default: 1, one whole-assembly run)"
+            "CPU budget. Without --jobs it is shared: min(assemblies, THREADS) "
+            "assemblies are prepared at once, each masked with THREADS // that "
+            "many WindowMasker processes (genome-wide counts run once, then record "
+            "chunks are masked concurrently). With --jobs, WindowMasker processes "
+            "per assembly, about --jobs x --threads in total (default: %(default)s)"
         ),
     )
     parser.add_argument(
@@ -618,7 +634,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--windowmasker", default="windowmasker")
     parser.add_argument("--samtools", default="samtools")
     args = parser.parse_args(argv)
-    if args.jobs < 1:
+    if args.jobs is not None and args.jobs < 1:
         parser.error("--jobs must be positive")
     if args.threads < 1:
         parser.error("--threads must be positive")
@@ -663,9 +679,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             name, _prefix = canonical_name(args.name)
             original = assemblies[0]
             assemblies = [Assembly(name, original.fasta, original.output)]
+    jobs, threads = share_threads(len(assemblies), args.jobs, args.threads)
+    print(
+        f"[prepare] {len(assemblies)} assemblies: {jobs} at once, "
+        f"{threads} WindowMasker process(es) each",
+        flush=True,
+    )
     inspections: Dict[str, FastaInspection] = {}
     inspection_errors: List[str] = []
-    with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
         futures = {
             executor.submit(
                 inspect_fasta, assembly.fasta, expected_prefix(assembly.name)
@@ -702,7 +724,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     results: Dict[str, PreparationResult] = {}
     errors: List[str] = []
-    with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
         futures = {
             executor.submit(
                 prepare_one,
@@ -712,7 +734,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.contignamefix,
                 windowmasker,
                 samtools,
-                args.threads,
+                threads,
             ): assembly
             for assembly in assemblies
         }
