@@ -80,10 +80,10 @@ required `SAMPLE#N#CONTIG` form, and indexes them:
 
 ```bash
 python scripts/LinGraph.py prepare \
-  -q raw_assemblies.list -O prepared_assemblies --contignamefix -t 32
+  -q raw_assemblies.list -O prepared_assemblies --contignamefix -t 16
 ```
 
-With two haplotypes, `-t 32` prepares both at once with about 16 WindowMasker
+With two haplotypes, `-t 16` prepares both at once with about 8 WindowMasker
 processes each. The prepared list is written to
 `prepared_assemblies/query_paths.prepared.txt`.
 
@@ -292,14 +292,14 @@ becomes `>HG002#1#chr1`.
 ```bash
 python scripts/LinGraph.py prepare \
   -q raw_assemblies.list -O prepared_assemblies \
-  --contignamefix -t 32
+  --contignamefix -t 16
 ```
 
 This is the same as `python tools/prepare_assemblies.py` with the same options.
 It soft-masks unmasked inputs with WindowMasker, adds missing contig prefixes,
 and writes uncompressed FASTAs with `.fai` indexes. Without `-j`, `-t` is the
-total CPU budget shared across the inputs; for a two-haplotype sample, `-t 32`
-uses two preparations at once with about 16 masking processes each. The source
+total CPU budget shared across the inputs; for a two-haplotype sample, `-t 16`
+uses two preparations at once with about 8 masking processes each. The source
 FASTAs are not changed. **Use `prepared_assemblies/query_paths.prepared.txt`
 as the input list for calling.**
 
