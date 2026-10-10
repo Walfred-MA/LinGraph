@@ -1033,7 +1033,7 @@ Locally, LinGraph uses the machine's memory. With `--slurm`:
 | `graph`: per-sample matching, lifting, graph CIGAR, gap filling, VCF | 32G each | `--match-memory`, `--genomelift-memory`, `--graphcigar-memory`, `--gapfill-memory`, `--vcf-memory` |
 | `graph`: cohort extraction and local templates | 64G | `--extraction-memory` |
 | `graph`: run-once merge scans, concats, publish, GFA export | 64G below 100 sample VCFs, 128G from 100 on | `--slurm-memory` |
-| `graph`: per-chromosome merge jobs | 2G per CPU below 100 samples, 64G from 100 on (chr1 doubled) | `--merge-memory` |
+| `graph`: per-chromosome merge jobs | 32G below 100 sample VCFs, 64G from 100 on (chr1 doubled) | `--merge-memory` |
 | `graph`: novel-locus discovery | 128G | `--novel-slurm-memory` |
 
 To find the failed job, run `sacct -j JOBID` (state `OUT_OF_MEMORY`) and check

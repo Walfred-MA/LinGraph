@@ -209,11 +209,11 @@ MERGE_MEMORY_OVERRIDE = str(RUN.get("merge_memory", "")).strip()
 # below 100 merged sample VCFs, 128G from 100 on.
 MERGE_ONCE_MEMORY = "64G" if len(SAMPLES) < 100 else "128G"
 MERGE_SCAN_MEMORY = MERGE_MEMORY_OVERRIDE or MERGE_ONCE_MEMORY
-# Per-chromosome SV merge jobs: 64G from 100 merged sample VCFs on (chr1 gets
-# twice that through its resource multiplier), else 2G per CPU.
+# Per-chromosome SV merge jobs: 32G below 100 merged sample VCFs, 64G from
+# 100 on. chr1 gets twice the selected base through its resource multiplier.
 MERGE_CHROM_MEMORY = (
     MERGE_MEMORY_OVERRIDE
-    or ("64G" if len(SAMPLES) >= 100 else f"{2 * MERGE_PROCESSES}G")
+    or ("64G" if len(SAMPLES) >= 100 else "32G")
 )
 # One job each: SV concat (writes the insertion SNP manifest), small-variant
 # concat and publish. 2G was too small even for a trio.

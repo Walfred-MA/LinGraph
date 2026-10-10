@@ -50,8 +50,8 @@ publish. Without `--slurm` they run locally one after another (chromosomes one
 at a time, `-t` workers). With `--slurm` each stage is a Slurm job: run-once
 stages get `-t` CPUs and `--slurm-memory` (default 64G below 100 input grVCFs,
 128G from 100 on), and chromosome stages run as up to `--slurm-jobs` (default
-20) jobs at once, sized like the pipeline (SV: min(16, `-t`) CPUs and 2G per CPU,
-or 64G from 100 input grVCFs on, chr1 doubled; SNP: 32 CPUs, 64G). Finished stages and chromosomes are recorded,
+20) jobs at once, sized like the pipeline (SV: min(16, `-t`) CPUs and 32G below
+100 input grVCFs or 64G from 100 on, chr1 doubled; SNP: 32 CPUs, 64G). Finished stages and chromosomes are recorded,
 so repeating a failed command reruns only what did not finish. Both modes write
 the same files as the single-process merge.
 

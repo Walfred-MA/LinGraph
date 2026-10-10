@@ -19,8 +19,8 @@ Each stage is its own process:
   --slurm   one Slurm job per stage; run-once stages get -t CPUs and
             --slurm-memory (default 64G below 100 input grVCFs, 128G from 100
             on), chromosome stages run as up to --slurm-jobs jobs at once
-            (SV: min(16, -t) CPUs and 2G per CPU, or 64G from 100 input
-            grVCFs on, chr1 doubled; SNP: 32 CPUs, 64G)
+            (SV: min(16, -t) CPUs and 32G below 100 input grVCFs, 64G from
+            100 on; chr1 doubled. SNP: 32 CPUs, 64G)
 Finished stages are recorded under OUTPUT/tmp/merge_only/; repeating the
 command resumes after the last finished stage or chromosome.
 
@@ -232,8 +232,9 @@ class Stages:
             return 32, '64G'
         multiplier = 2 if CHR1.fullmatch(chrom) else 1
         cpus = min(16, self.args.threads) * multiplier
-        # As the pipeline: 2G per CPU, or 64G per job from 100 input grVCFs on.
-        return cpus, (f'{64 * multiplier}G' if len(self.plan['paths']) >= 100 else f'{2 * cpus}G')
+        # As the pipeline: 32G below 100 input grVCFs, 64G from 100 on.
+        memory = 64 if len(self.plan['paths']) >= 100 else 32
+        return cpus, f'{memory * multiplier}G'
 
     def each(self, stage, chroms, names=None):
         """Run a chromosome stage; ``names`` labels manifest keys in messages."""

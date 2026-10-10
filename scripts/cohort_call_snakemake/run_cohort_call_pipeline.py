@@ -476,7 +476,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--merge-memory", default="", metavar="MEMORY",
         help=(
             "base memory for merge-stage Slurm jobs; by default chromosome "
-            "stages request 2G per allocated CPU below 100 samples and 64G "
+            "stages request 32G below 100 samples and 64G "
             "from 100 on (chr1 applies its resource multiplier), the scans, "
             "concats and publish 64G below 100 samples and 128G from 100 on"
         ),
