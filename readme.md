@@ -42,6 +42,9 @@ New users who just want VCFs: follow
 This route calls one diploid sample (two haplotype assemblies) against CHM13
 using the precomputed Win50KGraph. Run every command from the LinGraph
 repository root. Replace the paths under `/data/...` with your own files.
+For a complete, step-by-step individual-calling walkthrough, see the
+[HG002 on CHM13 demo](demo/HG002_CHM13/README.md), which also shows how to
+reuse graph alignments when switching references.
 
 **Before you start**, you need:
 
@@ -141,7 +144,11 @@ Tips:
 This route builds a new graph from a cohort, calls all haplotypes together, and
 exports the pangenome GFA. Install and prepare the assemblies as in
 [steps 1–3 above](#quick-start-a-call-variants-in-your-assemblies), listing every
-haplotype in the cohort.
+haplotype in the cohort. For a complete cohort example—including GFA/GAF
+losslessness checks and trio benchmarking—follow the
+[NA19240 trio graph demo](demo/NA19240trio_graph/README.md). If you only want
+individual SV calls with the precomputed Win50KGraph, see the
+[NA19240 trio SV-calling demo](demo/NA19240trio_SVcall/README.md).
 
 **Step 1. Create `cohort.list`** with the reference first, then every prepared
 haplotype:
