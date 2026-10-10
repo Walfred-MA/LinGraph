@@ -80,10 +80,12 @@ required `SAMPLE#N#CONTIG` form, and indexes them:
 
 ```bash
 python scripts/LinGraph.py prepare \
-  -q raw_assemblies.list -O prepared_assemblies --contignamefix -j 2
+  -q raw_assemblies.list -O prepared_assemblies --contignamefix -t 32
 ```
 
-The prepared list is written to `prepared_assemblies/query_paths.prepared.txt`.
+With two haplotypes, `-t 32` prepares both at once with about 16 WindowMasker
+processes each. The prepared list is written to
+`prepared_assemblies/query_paths.prepared.txt`.
 
 **Step 4. Download and unpack Win50KGraph** (once):
 
@@ -290,14 +292,16 @@ becomes `>HG002#1#chr1`.
 ```bash
 python scripts/LinGraph.py prepare \
   -q raw_assemblies.list -O prepared_assemblies \
-  --contignamefix -j 4
+  --contignamefix -t 32
 ```
 
 This is the same as `python tools/prepare_assemblies.py` with the same options.
 It soft-masks unmasked inputs with WindowMasker, adds missing contig prefixes,
-and writes uncompressed FASTAs with `.fai` indexes. The source FASTAs are not
-changed. **Use `prepared_assemblies/query_paths.prepared.txt` as the input list
-for calling.**
+and writes uncompressed FASTAs with `.fai` indexes. Without `-j`, `-t` is the
+total CPU budget shared across the inputs; for a two-haplotype sample, `-t 32`
+uses two preparations at once with about 16 masking processes each. The source
+FASTAs are not changed. **Use `prepared_assemblies/query_paths.prepared.txt`
+as the input list for calling.**
 
 | Option | Effect |
 | --- | --- |
@@ -305,7 +309,8 @@ for calling.**
 | `-O DIR` | Output folder for prepared FASTAs, indexes, and the new list |
 | `--contignamefix` | Add the `SAMPLE#N#` prefix to contigs that lack it |
 | `--remask` | Regenerate soft masking even if the FASTA is already masked |
-| `-j JOBS`, `-t THREADS` | Assemblies prepared at once, and masking processes per assembly (about `-j × -t` CPUs) |
+| `-t THREADS` | Total CPU budget, shared across inputs unless `-j` is set |
+| `-j JOBS` | Set the number of assemblies at once; with `-j`, `-t` is masking processes per assembly (about `-j × -t` CPUs) |
 
 To fix contig names only, without masking:
 
