@@ -334,6 +334,11 @@ def main(argv=None):
     if args.stage:
         return run_stage(args)
     paths = input_vcfs(args)
+    if args.slurm:
+        # Chromosome jobs on different nodes share the insertion SNP bundles:
+        # cross-node locks (graphvcfmerge_insertion_store); jobs inherit it
+        # through sbatch --export=ALL.
+        os.environ['LINGRAPH_SHARED_FS_LOCKS'] = '1'
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     mode = 'all' if args.exact else (args.mode or 'all')

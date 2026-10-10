@@ -204,6 +204,56 @@ the threshold, `both` has an inserted and a deleted part at or above it, and
 and the length of a plain `INFO/SEQ` (or `SVINSSEQ`) otherwise. Records
 without `SVLEN` use explicit REF/ALT lengths. Nested grVCF rows are skipped.
 
+## Count merged variants per nesting level
+
+`tools/count_variants_by_level.py` counts the rows of a cohort merge
+(`cohort.{sv,indel,snp}.vcf`, plain or gzip) per nesting level and category
+(`INS`, `DEL`, `indel_INS`, `indel_DEL`, `SNP`):
+
+```bash
+python tools/count_variants_by_level.py MERGE_OUTPUT -o levels.tsv
+```
+
+Level 0 rows sit on a reference chromosome; a row whose CHROM is another
+row's ID (nested row or insertion SNP) is one level deeper than that row.
+SV/indel rows of at least `-m` bp (default 20, the merge `--svcutoff`, by
+`MAXSIZE`, else `|SVLEN|`) are `INS`/`DEL`, smaller ones `indel_INS`/`indel_DEL`.
+The `<category>_bp` columns add up those sizes (the representative's inserted
+or deleted bases); each SNP counts 1 bp.
+Only columns 1, 3 and 8 are read (through `cut`), so wide cohorts stay fast.
+
+## Merge time at growing cohort sizes
+
+`tools/merge_timecost.py` reruns the merge on subsets of a cohort's grVCFs
+(regex on the grVCF paths in `COHORT/inputs/mergevcf.list` and on their
+samples' lines, name and assembly FASTA, in
+`COHORT/inputs/query_paths.normalized.txt`), one experiment after
+another, each as `tools/merge_grvcfs.py --slurm` with its default job
+resources, and records the wall time of each run and each merge phase.
+Default experiments: `trio` (`NA192`, 6 haplotypes), `panarabic`
+(`KSA|Japan`, 28), `hgsvc3` (`hgsvc3`, 122), `hprc2` (`HPRC2`, 464), `all`
+(1152); a selection with another count stops before anything runs
+(`--allow-count-mismatch`, or `--experiment NAME:REGEX:COUNT` to replace them).
+
+```bash
+nohup python tools/merge_timecost.py start -C cohort_calls -O timecost -t 32 \
+    --slurm-account mchaisso_100 --slurm-partition qcb > timecost.log 2>&1 &
+python tools/merge_timecost.py summary -O timecost
+```
+
+`--exact` by default (`--mode cigar` for the CIGAR version), with the cohort's
+query paths cut to the selected samples. `TIMECOST/NAME/` holds `merge.log`
+(merge messages with elapsed time), `phases.tsv` (plan, sv-scan, snp-prepare,
+chrom = all chromosome jobs, sv-concat, snp-concat, publish), `jobs.tsv`
+(each Slurm job's run time, CPUs and queue wait from `sacct`), `timecost.json`
+and the merge output in `merge/` (Slurm logs in `merge/slurm_logs/`);
+`TIMECOST/summary.tsv` has one line per experiment. `wall_h` runs from start
+to end, queue waiting included; the added-up times leave waiting out:
+`job_h` (sum of job run times), `core_h` (run time x CPUs) and `queue_h`
+(sum of waits), also per phase. `summary -O TIMECOST --refresh` asks `sacct`
+again (e.g. if accounting lagged). Repeating the command skips finished experiments and reruns failed or
+interrupted ones from scratch; `--force` reruns every experiment.
+
 ## Merge two haplotype VCFs for benchmarking
 
 `tools/BCFtoolMergeTwoHaplotypes.sh` combines one sample's two haplotype VCFs

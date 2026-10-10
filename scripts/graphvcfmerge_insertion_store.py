@@ -17,6 +17,13 @@ writer under the bundle lock. A lookup reads it sequentially instead of
 walking every entry header; the entry header still carries the full key and
 checksum, which every read verifies. Bundles of older runs have no index and
 are walked as before.
+
+With LINGRAPH_SHARED_FS_LOCKS=1 (merge_grvcfs.py --slurm sets it), chromosome
+jobs on different nodes share the bundles: flock may then lock one node only
+and a node may see an old file size, so every bundle access also takes a
+cross-node lock (a directory next to the bundle: mkdir is atomic on shared file
+systems), opens the bundle only after taking it, writes at the size it then
+sees (no O_APPEND) and syncs before releasing it.
 """
 from __future__ import annotations
 
@@ -27,8 +34,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import struct
+import sys
 import threading
+import time
 
 _HEADER = struct.Struct('<8s32sQQ32s')
 _FOOTER = struct.Struct('<Q8s')
@@ -41,6 +51,62 @@ _INDEX_LOCK = threading.RLock()
 _LOCAL = threading.local()          # per thread: batch depth and buffered puts
 BATCH_RECORD_LIMIT = 1024 * 1024    # larger record blobs are appended at once
 BATCH_FLUSH_BYTES = 16 * 1024 * 1024
+SHARED_FS_LOCKS = 'LINGRAPH_SHARED_FS_LOCKS'
+STALE_LOCK_SECONDS = 1800           # a cross-node lock this old was left by a killed job
+
+
+def _shared_fs():
+    return os.environ.get(SHARED_FS_LOCKS, '') not in ('', '0')
+
+
+def _break_stale(lock):
+    """Remove LOCK when it is older than STALE_LOCK_SECONDS. Renamed first,
+    so of several waiters only one removes it."""
+    try:
+        age = time.time() - os.stat(lock).st_mtime
+    except FileNotFoundError:
+        return
+    if age < STALE_LOCK_SECONDS:
+        return
+    stale = f'{lock}.stale.{socket.gethostname()}.{os.getpid()}.{threading.get_ident()}'
+    try:
+        os.rename(lock, stale)
+    except OSError:
+        return
+    os.rmdir(stale)
+    print(f'[insertion-store] removed a stale lock ({age:.0f} s old): {lock}', file=sys.stderr, flush=True)
+
+
+@contextmanager
+def _node_lock(path):
+    """Cross-node exclusive lock of one bundle under LINGRAPH_SHARED_FS_LOCKS;
+    otherwise nothing (flock alone serializes the workers of one node)."""
+    if not _shared_fs():
+        yield
+        return
+    lock = f'{path}.lock'
+    delay = 0.005
+    while True:
+        try:
+            os.mkdir(lock)
+            break
+        except FileExistsError:
+            _break_stale(lock)
+        except FileNotFoundError:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            continue
+        time.sleep(delay)
+        delay = min(delay * 2, 0.25)
+    try:
+        yield
+    finally:
+        os.rmdir(lock)
+
+
+def _sync(handle):
+    """Shared bundles: written bytes reach the file server before the lock goes."""
+    if _shared_fs():
+        os.fsync(handle.fileno())
 
 
 def _after_fork():
@@ -156,8 +222,7 @@ def flush():
     for path, key, metadata, records, checksum in entries:
         by_bundle.setdefault(path, []).append((key, metadata, records, checksum))
     for path, items in by_bundle.items():
-        handle = _open_append(path)
-        with handle:
+        with _node_lock(path), _open_append(path) as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             start = end = _append_end(handle)
             handle.seek(end)
@@ -171,16 +236,21 @@ def flush():
                 written.append((bytes.fromhex(key), end))
                 end += _HEADER.size + len(metadata) + len(records) + _FOOTER.size
             handle.flush()
+            _sync(handle)
             _index_append(path, handle.fileno(), start, written)
 
 
 def _open_append(path):
-    # a+b creates without truncating and permits recovery of an incomplete tail.
+    # Created without truncating; not O_APPEND: entries go at the end the
+    # writer found under its locks (on a shared file system O_APPEND writes at
+    # the end the node believes, which another node's append may have moved),
+    # and an incomplete tail can be recovered.
     try:
-        return path.open('a+b')
+        os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o666))
     except FileNotFoundError:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path.open('a+b')
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o666))
+    return open(path, 'r+b')
 
 
 def put(root, key, data, records=b''):
@@ -212,8 +282,7 @@ def put(root, key, data, records=b''):
         if _LOCAL.size >= BATCH_FLUSH_BYTES:
             flush()
         return None
-    handle = _open_append(path)
-    with handle:
+    with _node_lock(path), _open_append(path) as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         end = _append_end(handle)
         handle.seek(end)
@@ -223,6 +292,7 @@ def put(root, key, data, records=b''):
             handle.write(blob)
         handle.write(_FOOTER.pack(end, _COMMIT))
         handle.flush()
+        _sync(handle)
         _index_append(path, handle.fileno(), end, [(bytes.fromhex(key), end)])
         return _source(path, key, (end, checksum.hex()))
 
@@ -266,7 +336,7 @@ def _walk(fd, start, stop):
 def _index_append(path, fd, start, written):
     """Index this append (bundle lock held). Entries committed before START
     but never indexed (a writer killed in between) are indexed first."""
-    with open(_index_path(path), 'a+b') as out:
+    with _open_append(_index_path(path)) as out:
         size = out.seek(0, os.SEEK_END)
         whole = size - size % _IDX.size
         if whole != size:
@@ -282,8 +352,11 @@ def _index_append(path, fd, start, written):
             out.truncate(0)
             covered = 0
         missing = _walk(fd, covered, start)[0] if covered < start else []
+        out.seek(0, os.SEEK_END)             # after any truncation above
         out.write(b''.join(_IDX.pack(int.from_bytes(key[:8], 'little'), offset)
                            for key, offset in missing + written))
+        out.flush()
+        _sync(out)
 
 
 def find(root, key):
@@ -298,14 +371,17 @@ def find_many(root, keys):
         grouped.setdefault(_path(root, key), []).append(key)
     result = {}
     for path, wanted in grouped.items():
-        try:
-            handle = path.open('rb')
-        except FileNotFoundError:
+        if _shared_fs() and not path.is_file():
             continue
-        with handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            for key, offset in _locate(path, handle, wanted).items():
-                result[key] = _source(path, key, offset)
+        with _node_lock(path):
+            try:
+                handle = path.open('rb')
+            except FileNotFoundError:
+                continue
+            with handle:
+                fcntl.flock(handle, fcntl.LOCK_SH)
+                for key, offset in _locate(path, handle, wanted).items():
+                    result[key] = _source(path, key, offset)
     return result
 
 
@@ -367,7 +443,7 @@ def sources(root):
     flush()
     result = []
     for path in sorted(Path(root).glob('insertions-*.bundle')):
-        with path.open('rb') as handle:
+        with _node_lock(path), path.open('rb') as handle:
             fcntl.flock(handle, fcntl.LOCK_SH)
             with _INDEX_LOCK:
                 _, entries = _index(handle)
@@ -388,7 +464,7 @@ def read_many(sources, *, with_records=True):
         by_bundle.setdefault(source['bundle'], []).append(index)
     result = [None] * len(sources)
     for path, indexes in by_bundle.items():
-        with open(path, 'rb') as handle:
+        with _node_lock(path), open(path, 'rb') as handle:
             fcntl.flock(handle, fcntl.LOCK_SH)
             size = os.fstat(handle.fileno()).st_size
             for index in sorted(indexes, key=lambda item: sources[item]['offset']):
