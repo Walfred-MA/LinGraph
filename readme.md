@@ -83,6 +83,10 @@ python scripts/LinGraph.py prepare \
   -q raw_assemblies.list -O prepared_assemblies --contignamefix -t 16
 ```
 
+For inputs that are not already soft-masked, most preparation time is spent
+masking repeats with WindowMasker, so this step can take a while for
+whole-genome assemblies.
+
 With two haplotypes, `-t 16` prepares both at once with about 8 WindowMasker
 processes each. The prepared list is written to
 `prepared_assemblies/query_paths.prepared.txt`.
