@@ -250,6 +250,18 @@ def build_parser() -> argparse.ArgumentParser:
             "100, while 0 disables recursion"
         ),
     )
+    parser.add_argument(
+        "--large-singleton-size",
+        type=int,
+        default=cohort_merge.LARGE_SINGLETON_SIZE,
+        metavar="BP",
+        help=(
+            "after the merge, also write cohort.<kind>.nolargesingleton.vcf "
+            "without the insertions of at least BP that one haplotype carries "
+            "(and the rows nested in them); the graph export reads these; "
+            "0 turns this off (default 10000)"
+        ),
+    )
     pa_group = parser.add_mutually_exclusive_group()
     pa_group.add_argument(
         "--PAtag", "--pa-tag",
@@ -516,7 +528,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     for name in (
         "max_extension", "cross_validation_extension", "edge_blackregion",
-        "var_in_insert",
+        "var_in_insert", "large_singleton_size",
         "buffer_size", "buffer_bytes", "progress_every", "progress_seconds",
         "maxtasksperchild", "latency_wait",
     ):
@@ -620,7 +632,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          keep_merge_tmpdir=args.keep_merge_tmpdir,
                          ignore_full_locus_dup_insertions=(
                              not args.keep_full_locus_dup_insertions
-                         ), exact=args.exact)
+                         ), exact=args.exact, large_singleton_size=args.large_singleton_size)
         return 0
 
     graph = Path(absolute(args.graph_folder))
@@ -974,7 +986,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.slurm:
         resources.append(f"slurm_jobs={args.slurm_jobs}")
     command.extend(["--resources", *resources])
-    command.extend(["--config", f"run_config={config_path}"])
+    # Publish-time only: kept out of the run configuration, whose content
+    # is part of earlier stages' checkpoints.
+    command.extend(["--config", f"run_config={config_path}",
+                    f"large_singleton_size={args.large_singleton_size}"])
     if args.dry_run:
         command.append("--dry-run")
     # Same settings as the Snakefile's chromosome merge command, which the

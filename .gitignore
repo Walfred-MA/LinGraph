@@ -24,6 +24,9 @@ __pycache__/
 /scripts/GrvcfGraph
 /scripts/SmallVariantMerge
 /scripts/src/GrvcfGraph/GrvcfGraph
+/scripts/largeSingletonFilter
+/scripts/src/largeSingletonFilter/largeSingletonFilter
+/tools/largeSingletonFilter
 /scripts/src/KmerSearcher/kmer_searcher
 /scripts/src/KmerStrd/kmerstrd
 /scripts/src/KmerMatch/KmerMatch

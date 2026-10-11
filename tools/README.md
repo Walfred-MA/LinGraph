@@ -251,8 +251,85 @@ and the merge output in `merge/` (Slurm logs in `merge/slurm_logs/`);
 to end, queue waiting included; the added-up times leave waiting out:
 `job_h` (sum of job run times), `core_h` (run time x CPUs) and `queue_h`
 (sum of waits), also per phase. `summary -O TIMECOST --refresh` asks `sacct`
-again (e.g. if accounting lagged). Repeating the command skips finished experiments and reruns failed or
+again (e.g. if accounting lagged).
+
+For an earlier run (e.g. the cohort pipeline's own merge), `usage` adds up
+the `merge-*` jobs whose logs are in its `slurm_logs/` folder (job IDs from
+the `NAME-JOBID.out/.err` names), per phase, and writes one row per job:
+
+```bash
+python tools/merge_timecost.py usage cohort_calls/slurm_logs -o old_merge.tsv
+```
+
+`history` rebuilds each experiment's totals from `sacct` alone (reruns delete
+earlier folders): jobs are assigned to experiments by the folder in their
+submit line, split into attempts at each `merge-sv-scan`, and only the latest
+complete attempt (its `merge-publish` COMPLETED) is counted, else the latest
+one, marked incomplete:
+
+```bash
+python tools/merge_timecost.py history -O timecost -S 2026-10-09
+``` Repeating the command skips finished experiments and reruns failed or
 interrupted ones from scratch; `--force` reruns every experiment.
+
+## Run time of each pipeline step
+
+`tools/slurm_step_times.py` reads a run's `slurm_logs/` (job IDs from the
+`NAME-JOBID.out/.err` names) and `sacct`, and adds up each step's jobs
+(`match`, `extract-samples`, `lift`, `gcigar`, `gapfill`, `vcf`, the merge
+steps, ...). A unit (one sample, batch, once-step, or merge chromosome) run
+more than once counts only its latest COMPLETED job; failed, cancelled,
+timed-out and out-of-memory attempts are skipped (`skipped_attempts`):
+
+```bash
+python tools/slurm_step_times.py graph cohort_calls -o pipeline_steps.tsv
+```
+
+Steps are grouped into stages with subtotals: `1-preprocessing` (prepare =
+`LinGraph-prepare-*`, match, extract-samples, local-templates,
+lift-local-templates, alternative-loci), `2-alignment` (graph build:
+kmersearch, minset, discover-novel-loci), `3-linearization` (lift, gcigar,
+gapfill, vcf), `4-merge` (merge-*); `--group STEP=STAGE` moves a step, unknown
+steps go to `other`. Each RUN's `slurm_logs/` and `lingraph/slurm_logs/` are
+read. Steps run on the launching node (not Slurm jobs) are not counted.
+
+`job_h` = run times added up (no queue waiting), `core_h` = run time x CPUs,
+`longest_h` = slowest unit, `span_h` = first start to last end of the step;
+one row per kept job in `pipeline_steps.jobs.tsv`. Merge chromosome jobs are
+matched by the chromosomes their logs report done, since their numbers change
+on every resume. Merge steps count only the final merge run (jobs from the
+last completed `merge-cohort-scan` on); chromosome jobs of a resume that only
+confirmed finished chromosomes are skipped.
+
+## Remove large singleton insertions
+
+`tools/largeSingletonFilter` (C++, built by `install.py`) removes insertions
+(`SVTYPE=INS`) of at least `-s` bp (default 10000; `MAXSIZE`, else `|SVLEN|`)
+that exactly one haplotype carries (`NSUP=1`; without `NSUP`, one sample column
+with a GT other than `0`/`.`) from a merged `cohort.sv.vcf`. Deletions and other types are kept.
+Rows nested in a removed insertion (CHROM = its ID, at any depth) go with it;
+`-c IN OUT` does the same in the indel file, and `-l IN OUT` in the SNP file
+(its rows never hold other rows, so it is read once instead of twice). Plain or `.gz` input;
+an output ending in `.gz` is gzip-compressed:
+
+```bash
+tools/largeSingletonFilter -i cohort.sv.vcf -o filtered/cohort.sv.vcf -s 10000 \
+    -c cohort.indel.vcf filtered/cohort.indel.vcf \
+    -l cohort.snp.vcf filtered/cohort.snp.vcf -r filtered/removed.tsv
+```
+
+`-r` lists the removed rows (ID, CHROM, POS, SVTYPE, size, carrier haplotype,
+or the row they were nested in). The `##contig` lines of removed rows (an
+insertion's sequence is declared as a contig) are dropped; the outputs gain a
+`##largeSingletonFilter` header line with the counts.
+
+The pipeline runs it by default after every merge (LinGraph, the cohort
+pipeline, `cohort_vcf_merge.py`, `merge_grvcfs.py`): next to the merged files it
+writes `cohort.{sv,indel,snp}.nolargesingleton.vcf` and
+`cohort.largesingleton.removed.tsv`, and the GFA/GAF export (`--make-graph`,
+`--gfa-only`) reads the `nolargesingleton` files, writing them first for a
+merge that predates them. `--large-singleton-size BP` changes the size; `0`
+turns the filter off and the export reads `cohort.*.vcf`.
 
 ## Merge two haplotype VCFs for benchmarking
 

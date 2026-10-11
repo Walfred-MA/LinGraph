@@ -169,6 +169,10 @@ python /path/to/minsetref/LinGraph.py graph -G graph -O cohort_calls --merge-onl
 ```
 
 This reads existing per-sample VCFs and writes separate `cohort.sv.vcf`, `cohort.indel.vcf`, and `cohort.snp.vcf` files in `cohort_calls/`.
+It also writes `cohort.{sv,indel,snp}.nolargesingleton.vcf`: the same files
+without the insertions of at least 10 kb that one haplotype carries, and the
+rows nested in them (listed in `cohort.largesingleton.removed.tsv`); GFA export
+reads these. `--large-singleton-size BP` changes the size, `0` turns it off.
 It does not rebuild the graph, recall samples, or export GFA. An existing
 `cohort_calls/inputs/mergevcf.list` is preferred; otherwise saved sample metadata
 or `samples/NAME/NAME.vcf` supplies the inputs. No reference FASTA is needed for

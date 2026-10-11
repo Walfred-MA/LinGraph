@@ -52,7 +52,7 @@ def tuning_actions(stage):
         return [action for action in tuning_actions('call') if action.dest in {
             'merge_distance', 'size_similarity', 'sequence_similarity', 'merge_processes',
             'var_in_insert', 'kmermatch', 'keep_merge_tmpdir',
-            'keep_full_locus_dup_insertions'}]
+            'keep_full_locus_dup_insertions', 'large_singleton_size'}]
     return [action for action in backend_parser(stage)._actions
             if action.option_strings and action.dest not in MANAGED[stage]]
 

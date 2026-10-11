@@ -62,6 +62,8 @@ ROOT_BINARY_ALIASES = {
     # Native small-variant (SNP) chromosome merge worker of graphvcfmerge.
     "SmallVariantMerge": ("SmallVariantMerge",),
 }
+# User-facing tools: also copied into the repository's tools/ folder.
+TOOLS_DIR_BINARIES = ("largeSingletonFilter",)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -292,10 +294,16 @@ def install_compiled_binary(result: BuildResult, install_dir: Path) -> BuildResu
     source = result.output
     names = (source.name, *ROOT_BINARY_ALIASES.get(result.directory.name, ()))
     installed: List[Path] = []
+    # The user tools/ folder (the one holding merge_grvcfs.py): inside the
+    # flat copy, or beside scripts/ in the repository.
+    tools_dir = next((path for path in (install_dir / "tools", install_dir.parent / "tools")
+                      if (path / "merge_grvcfs.py").is_file()), None)
+    destinations = [install_dir / name for name in dict.fromkeys(names)]
+    if result.directory.name in TOOLS_DIR_BINARIES and tools_dir is not None:
+        destinations.append(tools_dir / source.name)
     try:
         install_dir.mkdir(parents=True, exist_ok=True)
-        for name in dict.fromkeys(names):
-            destination = install_dir / name
+        for destination in destinations:
             shutil.copy2(source, destination)
             if not destination.is_file() or not os.access(destination, os.X_OK):
                 raise OSError(f"installed file is not executable: {destination}")
@@ -327,7 +335,7 @@ def run_build(command: Sequence[str]) -> Tuple[bool, str]:
 
 # Tools whose builds target baseline x86-64: a compiler that defaults to the
 # build host's CPU emits AVX, which older compute nodes reject (SIGILL).
-PORTABLE_TOOLS = ("GrvcfGraph",)
+PORTABLE_TOOLS = ("GrvcfGraph", "largeSingletonFilter")
 
 
 def portable_flags() -> List[str]:

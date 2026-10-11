@@ -7,9 +7,11 @@ import hashlib
 import heapq
 import json
 from pathlib import Path
+import os
 import pickle
 import shutil
 import garbage
+import subprocess
 import sys
 import time
 
@@ -119,6 +121,78 @@ def exact_inputs(output, exact, references=()):
 def output_paths(output, mode):
     kinds = {'all': ('sv', 'indel', 'snp'), 'svindel': ('sv', 'indel'), 'svonly': ('sv',), 'snp': ('snp',)}[mode]
     return [Path(output) / f'cohort.{kind}.vcf' for kind in kinds]
+
+
+# Haplotype-singleton insertions of at least this size are removed after the
+# merge (tools/largeSingletonFilter) into cohort.<kind>.nolargesingleton.vcf,
+# which the graph export reads; 0 turns it off.
+LARGE_SINGLETON_SIZE = 10000
+NO_LARGE_SINGLETON = '.nolargesingleton.vcf'
+LARGE_SINGLETON_REMOVED = 'cohort.largesingleton.removed.tsv'
+
+
+def filtered_paths(output, mode):
+    """cohort.<kind>.nolargesingleton.vcf of a merge that has an SV file."""
+    if mode == 'snp':
+        return []
+    return [path.with_name(path.name[:-len('.vcf')] + NO_LARGE_SINGLETON)
+            for path in output_paths(output, mode)]
+
+
+def large_singleton_tool():
+    """The newest largeSingletonFilter build (install.py's copies or src/)."""
+    here = Path(__file__).resolve().parent
+    candidates = [here / 'largeSingletonFilter', here / 'tools' / 'largeSingletonFilter',
+                  here.parent / 'tools' / 'largeSingletonFilter',
+                  here / 'src' / 'largeSingletonFilter' / 'largeSingletonFilter']
+    built = [path for path in candidates if path.is_file() and os.access(path, os.X_OK)]
+    if not built:
+        raise ValueError('largeSingletonFilter is not built: run python install.py, or compile '
+                         f"{here / 'src' / 'largeSingletonFilter' / 'largeSingletonFilter.cpp'} "
+                         '(or pass --large-singleton-size 0 to skip the filter)')
+    return max(built, key=lambda path: path.stat().st_mtime)
+
+
+def large_singleton_command(output, mode, size, tool=None):
+    sources, targets = output_paths(output, mode), filtered_paths(output, mode)
+    command = [str(tool or large_singleton_tool()), '-i', str(sources[0]), '-o', str(targets[0]),
+               '-s', str(size), '-r', str(Path(output) / LARGE_SINGLETON_REMOVED)]
+    for source, target in zip(sources[1:], targets[1:]):
+        # SNP rows never hold other rows: -l reads that (largest) file once.
+        command += ['-l' if source.name.startswith('cohort.snp') else '-c', str(source), str(target)]
+    return command
+
+
+def large_singleton_current(output, mode, size):
+    """Filtered files exist, are newer than the merged ones, and used SIZE."""
+    sources, targets = output_paths(output, mode), filtered_paths(output, mode)
+    if not targets or not all(path.is_file() for path in [*sources, *targets]):
+        return False
+    if min(path.stat().st_mtime for path in targets) < max(path.stat().st_mtime for path in sources):
+        return False
+    with open(targets[0]) as handle:
+        for line in handle:
+            if not line.startswith('##'):
+                return False
+            if line.startswith('##largeSingletonFilter=<'):
+                return f'<MinSize={int(size)},' in line
+    return False
+
+
+def filter_large_singletons(output, mode, size=LARGE_SINGLETON_SIZE):
+    """Write the nolargesingleton files (unless SIZE is 0 or they are current)."""
+    if not size or mode == 'snp':
+        return []
+    if size < 0:
+        raise ValueError('--large-singleton-size cannot be negative')
+    targets = filtered_paths(output, mode)
+    if large_singleton_current(output, mode, size):
+        print(f'[cohort-merge] large singletons: {targets[0]} is current', flush=True)
+        return targets
+    command = large_singleton_command(output, mode, size)
+    print('[cohort-merge] large singletons: ' + ' '.join(command), flush=True)
+    subprocess.run(command, check=True)
+    return targets
 
 
 def input_paths(output, listing=None):
@@ -350,7 +424,7 @@ def write_sample_headers(sample_vcfs, target):
 
 
 def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
-            cleanup_tmpdirs=(), sample_vcfs=None):
+            cleanup_tmpdirs=(), sample_vcfs=None, large_singleton_size=LARGE_SINGLETON_SIZE):
     targets = output_paths(output, mode)
     sources = {'all': [sv_input, indel_input, snp_input], 'svonly': [sv_input],
                'snp': [snp_input], 'svindel': [sv_input, indel_input]}[mode]
@@ -376,6 +450,7 @@ def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
         print(f'[cohort-merge] warning: input per-sample VCFs unknown; {SAMPLE_HEADERS} '
               'not written, so these merged files cannot be split back with each sample\'s '
               'coverage (pass -I VCF_LIST to publish)', file=sys.stderr, flush=True)
+    filter_large_singletons(output, mode, large_singleton_size)
     cleanup_merge_directories(output, cleanup_tmpdirs, protected=targets)
     return targets
 
@@ -384,7 +459,7 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
         merge_distance=500, size_similarity=.7, sequence_similarity=.7, var_in_insert=100,
         kmermatch=sv.DEFAULT_KMERMATCH, dry_run=False, keep_merge_tmpdir=False,
         ignore_full_locus_dup_insertions=True, exact=None, reference_fastas=(),
-        realignment=True):
+        realignment=True, large_singleton_size=LARGE_SINGLETON_SIZE):
     paths = list(paths) if paths is not None else input_paths(output, listing)
     if exact and mode != 'all':
         raise ValueError('--exact merges like --all')
@@ -403,6 +478,7 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
                       var_in_insert=var_in_insert, kmermatch=kmermatch,
                       ignore_full_locus_dup_insertions=ignore_full_locus_dup_insertions,
                       exact=exact, reference_fastas=reference_fastas, realignment=realignment)
+    plan['large_singleton_size'] = large_singleton_size
     stage_sv_scan(plan, processes)
     stage_sv_chrom(plan, sv_chroms(plan), processes)
     stage_sv_concat(plan, processes)
@@ -537,7 +613,8 @@ def stage_snp_concat(plan):
 def stage_publish(plan):
     root = Path(plan['root'])
     return publish(plan['output'], plan['mode'], sv_input=root/'sv.vcf', snp_input=root/'snp.vcf',
-                   indel_input=str(root/'sv.vcf') + '.small.vcf', sample_vcfs=plan['paths'])
+                   indel_input=str(root/'sv.vcf') + '.small.vcf', sample_vcfs=plan['paths'],
+                   large_singleton_size=plan.get('large_singleton_size', LARGE_SINGLETON_SIZE))
 
 
 def cleanup_plan(plan, targets):
@@ -580,12 +657,19 @@ def main(argv=None):
     )
     parser.add_argument('--cleanup-tmpdir', action='append', default=[],
                         help='publish: remove this merge directory after all final VCFs are written')
+    parser.add_argument('--large-singleton-size', type=int, default=LARGE_SINGLETON_SIZE, metavar='BP',
+                        help='after the merge, write cohort.<kind>.nolargesingleton.vcf without the '
+                             'insertions of at least BP that one haplotype carries (and the rows nested '
+                             f'in them); the graph export reads these; 0 = off (default {LARGE_SINGLETON_SIZE})')
     args = parser.parse_args(argv)
+    if args.large_singleton_size < 0:
+        parser.error('--large-singleton-size cannot be negative')
     mode = resolve_mode(args)
     if args.action == 'publish':
         publish(args.output, mode, sv_input=args.sv_input, snp_input=args.snp_input, indel_input=args.indel_input,
                 cleanup_tmpdirs=() if args.keep_merge_tmpdir else args.cleanup_tmpdir,
-                sample_vcfs=input_paths(args.output, args.vcf_list) if args.vcf_list else None)
+                sample_vcfs=input_paths(args.output, args.vcf_list) if args.vcf_list else None,
+                large_singleton_size=args.large_singleton_size)
     else:
         run(args.output, mode, listing=args.vcf_list, processes=args.processes, cutoff=args.svcutoff,
             merge_distance=args.merge_distance, size_similarity=args.size_similarity,
@@ -595,7 +679,7 @@ def main(argv=None):
             ignore_full_locus_dup_insertions=(
                 args.ignore_full_locus_dup_insertions
             ), exact=resolve_exact(args), reference_fastas=args.reference_fasta,
-            realignment=resolve_realignment(args))
+            realignment=resolve_realignment(args), large_singleton_size=args.large_singleton_size)
     return 0
 
 

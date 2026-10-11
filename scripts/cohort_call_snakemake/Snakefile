@@ -185,6 +185,9 @@ MERGE_SEQUENCE_SIMILARITY = float(
     MERGE_RUN.get("sequence_similarity", 0.7)
 )
 MERGE_VAR_IN_INSERT = int(MERGE_RUN.get("var_in_insert", 100))
+# Publish also writes cohort.<kind>.nolargesingleton.vcf (0 = off); a
+# Snakemake --config value, not part of the run configuration.
+LARGE_SINGLETON_SIZE = int(config.get("large_singleton_size", 10000))
 KEEP_FULL_LOCUS_DUP_INSERTIONS = as_bool(MERGE_RUN.get(
     "keep_full_locus_dup_insertions", False
 ))
@@ -1103,7 +1106,8 @@ rule cohort_vcf_publish:
     shell:
         """
         {params.slurm} {PYTHON:q} {input.script:q} publish --{MERGE_MODE} \
-          -O {params.destination:q} -I {input.vcf_list:q} {params.sources} {params.cleanup}
+          -O {params.destination:q} -I {input.vcf_list:q} {params.sources} {params.cleanup} \
+          --large-singleton-size {LARGE_SINGLETON_SIZE}
         """
 
 

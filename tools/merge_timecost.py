@@ -30,11 +30,18 @@ Examples:
   python tools/merge_timecost.py start -C cohort_calls -O timecost -t 32 \\
       --slurm-account mchaisso_100 --slurm-partition qcb
   python tools/merge_timecost.py start ... --only trio panarabic
+  python tools/merge_timecost.py start ... --only all --resume
+      (continue an interrupted merge; finished stages are kept)
   python tools/merge_timecost.py summary -O timecost [--refresh]
+  python tools/merge_timecost.py usage cohort_calls/slurm_logs -o old_run.tsv
+      (added-up time of an earlier run's merge-* jobs, IDs from its log names)
+  python tools/merge_timecost.py history -O timecost -S 2026-10-09
+      (per experiment, from sacct: the latest complete attempt only)
 """
 import argparse
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -52,6 +59,7 @@ EXPERIMENTS = (('trio', 'NA192', 6), ('panarabic', 'KSA|Japan', 28), ('hgsvc3', 
 # starts each stage (or submits its Slurm job).
 STAGE_LINE = re.compile(r'^\[merge_grvcfs\] ([a-z-]+)(?: \d+/\d+ .*?)?: \S*python\S* ')
 PHASE = {'sv-chrom': 'chrom', 'snp-chrom': 'chrom'}
+STAGE_NAMES = ('sv-scan', 'snp-prepare', 'sv-concat', 'snp-concat', 'publish')
 # sbatch --parsable prints "JOBID" or "JOBID;CLUSTER" on its own line.
 JOB_ID_LINE = re.compile(r'^\[\s*[\d.]+s\] (\d+)(?:;\S+)?$')
 
@@ -216,61 +224,108 @@ def start(args):
     references = exact_references(args)
     texts = match_texts(args, vcfs)
     # Select everything first, so a wrong pattern stops before any merge starts.
-    items = [item for item in (select(args, *experiment, vcfs, texts) for experiment in chosen) if item]
+    items = []
+    for experiment in chosen:
+        directory = Path(args.output).resolve() / experiment[0]
+        if args.resume and (directory / 'experiment.json').is_file() and exit_code(directory) != 0:
+            # Continue in place: merge_grvcfs.py skips the stages it finished.
+            print(f'[timecost] {experiment[0]}: resuming the unfinished merge in {directory}',
+                  file=sys.stderr, flush=True)
+            items.append(dict(name=experiment[0], directory=directory, resume=True))
+            continue
+        item = select(args, *experiment, vcfs, texts)
+        if item:
+            items.append(item)
     failed = []
     for item in items:
-        if run_experiment(write_experiment(args, item, references)):
+        if item.get('resume'):
+            code = run_experiment(item['directory'], resume=True, extra=shlex.split(args.merge_args))
+        else:
+            code = run_experiment(write_experiment(args, item, references))
+        if code:
             failed.append(item['name'])
     if failed:
-        print(f'[timecost] failed: {", ".join(failed)}; repeating the command reruns them', file=sys.stderr)
+        print(f'[timecost] failed: {", ".join(failed)}; repeat with --resume to continue them, '
+              'or without it to rerun them from scratch', file=sys.stderr)
     return 1 if failed else 0
 
 
 # ---------------------------------------------------------------- timing
 
-def run_experiment(directory):
-    """Run the merge, timestamp its log and time its phases; its exit code."""
+STAMP = re.compile(r'^\[\s*([\d.]+)s\] (.*)$')
+
+
+def log_attempts(log_path):
+    """Per attempt in merge.log (each starts with a '# ' line): its last
+    elapsed second and its phases [name, start_s, end_s]. The once stages wait
+    for their job, so a phase ends where the next starts."""
+    attempts = []
+    with open(log_path, errors='replace') as handle:
+        for line in handle:
+            if line.startswith('# '):
+                attempts.append(dict(end=0.0, phases=[['plan', 0.0, None]]))
+                continue
+            match = STAMP.match(line.rstrip('\n'))
+            if not match or not attempts:
+                continue
+            attempt, now = attempts[-1], float(match.group(1))
+            attempt['end'] = now
+            stage = STAGE_LINE.match(match.group(2))
+            if stage:
+                phase = PHASE.get(stage.group(1), stage.group(1))
+                if phase != attempt['phases'][-1][0]:
+                    attempt['phases'][-1][2] = now
+                    attempt['phases'].append([phase, now, None])
+    for attempt in attempts:
+        attempt['phases'][-1][2] = attempt['end']
+    return attempts
+
+
+def run_experiment(directory, resume=False, extra=()):
+    """Run (or, with RESUME, continue) the merge, timestamp its log and time
+    its phases over all attempts; its exit code."""
     config = json.loads((directory / 'experiment.json').read_text())
-    started_at = time.time()
+    command = [*config['command'], *extra]
+    log_path = directory / 'merge.log'
+    previous = {}
+    if resume:
+        try:
+            previous = json.loads((directory / 'timecost.json').read_text())
+        except (OSError, ValueError):
+            pass
+    first_started = previous.get('started') or (
+        time.strftime('%Y-%m-%d %H:%M:%S', time.localtime((directory / 'experiment.json').stat().st_mtime))
+        if resume else time.strftime('%Y-%m-%d %H:%M:%S'))
     started = time.monotonic()
-    print(f'[timecost] {config["name"]}: {config["haplotypes"]} haplotypes started '
-          f'{time.strftime("%Y-%m-%d %H:%M:%S")}', file=sys.stderr, flush=True)
-    child = subprocess.Popen(config['command'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    # The once stages wait for their job, so a phase ends where the next starts.
-    phases = [['plan', 0.0, None]]
-    with open(directory / 'merge.log', 'w') as log:
-        log.write('# ' + shlex.join(config['command']) + '\n')
+    print(f'[timecost] {config["name"]}: {config["haplotypes"]} haplotypes '
+          f'{"resumed" if resume else "started"} {time.strftime("%Y-%m-%d %H:%M:%S")}', file=sys.stderr, flush=True)
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    with open(log_path, 'a' if resume else 'w') as log:
+        log.write(f'# attempt started {time.strftime("%Y-%m-%d %H:%M:%S")}: ' + shlex.join(command) + '\n')
         for raw in child.stdout:
-            line = raw.decode(errors='replace')
-            now = time.monotonic() - started
-            match = STAGE_LINE.match(line)
-            if match:
-                phase = PHASE.get(match.group(1), match.group(1))
-                if phase != phases[-1][0]:
-                    phases[-1][2] = now
-                    phases.append([phase, now, None])
-            log.write(f'[{now:10.1f}s] {line}')
+            log.write(f'[{time.monotonic() - started:10.1f}s] ' + raw.decode(errors='replace'))
             log.flush()
     child.wait()
-    wall = time.monotonic() - started
-    phases[-1][2] = wall
+    attempts = log_attempts(log_path)
     totals = {}
     with open(directory / 'phases.tsv', 'w') as handle:
-        handle.write('phase\tstart_s\tend_s\twall_s\n')
-        for name, begin, end in phases:
-            handle.write(f'{name}\t{begin:.1f}\t{end:.1f}\t{end - begin:.1f}\n')
-            totals[name] = round(totals.get(name, 0) + end - begin, 1)
+        handle.write('attempt\tphase\tstart_s\tend_s\twall_s\n')
+        for number, attempt in enumerate(attempts, 1):
+            for name, begin, end in attempt['phases']:
+                handle.write(f'{number}\t{name}\t{begin:.1f}\t{end:.1f}\t{end - begin:.1f}\n')
+                totals[name] = round(totals.get(name, 0) + end - begin, 1)
+    wall = sum(attempt['end'] for attempt in attempts)
     result = dict(
         experiment=config['name'], pattern=config['pattern'], haplotypes=config['haplotypes'],
         mode=config['mode'], threads=config['threads'], exit_code=child.returncode,
-        wall_s=round(wall, 1), phases=totals,
-        started=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started_at)),
-        finished=time.strftime('%Y-%m-%d %H:%M:%S'),
+        wall_s=round(wall, 1), attempts=len(attempts), phases=totals,
+        started=first_started, finished=time.strftime('%Y-%m-%d %H:%M:%S'),
     )
+    # Every attempt's jobs: resumed stages add to the work already done.
     result['slurm'] = slurm_usage(directory)
     (directory / 'timecost.json').write_text(json.dumps(result, indent=1) + '\n')
-    print(f'[timecost] {config["name"]}: exit {child.returncode}, wall {wall / 3600:.2f} h',
-          file=sys.stderr, flush=True)
+    print(f'[timecost] {config["name"]}: exit {child.returncode}, wall {wall / 3600:.2f} h'
+          + (f' over {len(attempts)} attempts' if len(attempts) > 1 else ''), file=sys.stderr, flush=True)
     if child.returncode:
         report_failure(directory)
     summary(directory.parent)
@@ -290,10 +345,21 @@ def sacct_rows(job_ids):
     return rows
 
 
+# Cohort pipeline (Snakefile) merge job names -> the merge_grvcfs.py phases.
+COHORT_PHASE = {'cohort-scan': 'sv-scan', 'small-scan': 'snp-prepare', 'cohort-chrom': 'chrom',
+                'cohort-concat': 'sv-concat', 'small-concat': 'snp-concat', 'cohort-publish': 'publish'}
+
+
 def job_phase(name):
-    """merge-sv-chrom-3 -> chrom, merge-sv-scan -> sv-scan."""
+    """merge-sv-chrom-3 -> chrom, merge-sv-scan -> sv-scan; cohort pipeline
+    names too (merge-cohort-chrom..., merge-small-<chrom> -> chrom)."""
     stage = re.sub(r'-\d+$', '', name[len('merge-'):] if name.startswith('merge-') else name)
-    return PHASE.get(stage, stage)
+    if stage in PHASE or stage in STAGE_NAMES:
+        return PHASE.get(stage, stage)
+    for prefix, phase in COHORT_PHASE.items():
+        if stage.startswith(prefix):
+            return phase
+    return 'chrom' if stage.startswith('small-') else stage
 
 
 def seconds_between(first, second):
@@ -312,8 +378,14 @@ def slurm_usage(directory, attempts=6):
         match = JOB_ID_LINE.match(line)
         if match and match.group(1) not in job_ids:
             job_ids.append(match.group(1))
+    return account(job_ids, directory / 'jobs.tsv', attempts)
+
+
+def account(job_ids, jobs_tsv, attempts=6):
+    """sacct totals of JOB_IDS (see slurm_usage); one row per job in JOBS_TSV."""
     if not job_ids:
         return None
+    rows = []
     for attempt in range(attempts):
         try:
             rows = sacct_rows(job_ids)
@@ -325,15 +397,33 @@ def slurm_usage(directory, attempts=6):
         if len(rows) >= len(job_ids) or attempt == attempts - 1:
             break
         time.sleep(10)
+    result = summarize(rows, jobs_tsv)
+    missing = len(job_ids) - len(rows)
+    if missing:
+        print(f'[timecost] sacct has no record of {missing} of {len(job_ids)} job(s); '
+              '`summary --refresh` retries', file=sys.stderr, flush=True)
+    return dict(result, missing_jobs=missing)
+
+
+def summarize(rows, jobs_tsv):
+    """Added-up run, core and queue seconds of sacct ROWS, overall and per
+    phase, with job states and first submit / last end; one row per job in
+    JOBS_TSV."""
     total = dict(jobs=0, job_s=0.0, core_s=0.0, queue_s=0.0)
-    phases = {}
-    with open(directory / 'jobs.tsv', 'w') as handle:
-        handle.write('job_id	job_name	phase	state	cpus	run_s	core_s	queue_s	submit	start	end\n')
+    phases, states, first, last = {}, {}, None, None
+    with open(jobs_tsv, 'w') as handle:
+        handle.write('job_id\tjob_name\tphase\tstate\tcpus\trun_s\tcore_s\tqueue_s\tsubmit\tstart\tend\n')
         for row in rows:
             run = float(row['ElapsedRaw'] or 0)
             cpus = int(row['AllocCPUS'] or 0)
             queue = seconds_between(row['Submit'], row['Start'])
             phase = job_phase(row['JobName'])
+            state = row['State'].split()[0] if row['State'] else ''
+            states[state] = states.get(state, 0) + 1
+            if row['Submit'][:1].isdigit():
+                first = min(first or row['Submit'], row['Submit'])
+            if row['End'][:1].isdigit():
+                last = max(last or row['End'], row['End'])
             handle.write('\t'.join(map(str, [row['JobID'], row['JobName'], phase, row['State'], cpus,
                                               f'{run:.0f}', f'{run * cpus:.0f}', f'{queue:.0f}',
                                               row['Submit'], row['Start'], row['End']])) + '\n')
@@ -342,11 +432,106 @@ def slurm_usage(directory, attempts=6):
                 bucket['job_s'] += run
                 bucket['core_s'] += run * cpus
                 bucket['queue_s'] += queue
-    missing = len(job_ids) - len(rows)
-    if missing:
-        print(f'[timecost] sacct has no record of {missing} of {len(job_ids)} job(s); '
-              '`summary --refresh` retries', file=sys.stderr, flush=True)
-    return dict(total, missing_jobs=missing, phases=phases)
+    span = seconds_between(first, last) if first and last else None
+    return dict(total, phases=phases, states=states, first_submit=first, last_end=last, span_s=span)
+
+
+def sacct_user_jobs(start):
+    """This user's job allocations since START with their submit lines
+    (SubmitLine, else StdOut, whichever this Slurm has)."""
+    fields = ['JobID', 'JobName', 'State', 'ElapsedRaw', 'AllocCPUS', 'Submit', 'Start', 'End']
+    errors = []
+    for extra in ('SubmitLine', 'StdOut'):
+        command = ['sacct', '-X', '-n', '-P', '-u', os.environ.get('USER', ''), '-S', start,
+                   '--format=' + ','.join(fields + [extra])]
+        done = subprocess.run(command, capture_output=True, text=True)
+        if done.returncode == 0:
+            rows = []
+            for line in done.stdout.splitlines():
+                values = line.split('|', len(fields))     # the submit line may hold '|'
+                if len(values) == len(fields) + 1:
+                    row = dict(zip(fields, values[:-1]))
+                    row['Command'] = values[-1]
+                    rows.append(row)
+            return rows
+        errors.append(done.stderr.strip())
+    raise ValueError('sacct gives neither SubmitLine nor StdOut: ' + ' | '.join(errors))
+
+
+def history(output, start, output_table):
+    """Per experiment under OUTPUT, the added-up time of its latest complete
+    attempt (an attempt starts at its sv-scan job; complete = its publish job
+    COMPLETED), from sacct alone: earlier attempts' folders are gone."""
+    output = Path(output).resolve()
+    pattern = re.compile(re.escape(str(output)) + r'/([^/\s\'"]+)/merge/')
+    attempts = {}
+    for row in sacct_user_jobs(start):
+        match = pattern.search(row['Command'])
+        if match and row['JobName'].startswith('merge-'):
+            attempts.setdefault(match.group(1), []).append(row)
+    if not attempts:
+        raise ValueError(f'no merge-* jobs of {output}/*/merge since {start} in sacct')
+    expected = {name: count for name, _, count in EXPERIMENTS}
+    hours = lambda seconds: '' if seconds is None else f'{seconds / 3600:.3f}'
+    lines = ['experiment\thaplotypes\tattempts\tcomplete\tjobs\tjob_h\tcore_h\tqueue_h\tspan_h\tfirst_submit\tlast_end\tstates']
+    rows_out = []
+    for name, rows in attempts.items():
+        rows.sort(key=lambda row: (row['Submit'], int(re.sub(r'\D.*', '', row['JobID']) or 0)))
+        starts = [index for index, row in enumerate(rows) if row['JobName'] == 'merge-sv-scan'] or [0]
+        if starts[0] != 0:
+            starts.insert(0, 0)
+        runs = [rows[begin:end] for begin, end in zip(starts, starts[1:] + [len(rows)])]
+        complete = [run for run in runs if any(row['JobName'] == 'merge-publish'
+                                              and row['State'].startswith('COMPLETED') for row in run)]
+        chosen = (complete or runs)[-1]
+        jobs_tsv = output / f'{name}.history.jobs.tsv'
+        result = summarize(chosen, jobs_tsv)
+        try:
+            haplotypes = json.loads((output / name / 'experiment.json').read_text())['haplotypes']
+        except (OSError, ValueError, KeyError):
+            haplotypes = expected.get(name, '')
+        states = ','.join(f'{key}={value}' for key, value in sorted(result['states'].items()))
+        rows_out.append((haplotypes if isinstance(haplotypes, int) else 10 ** 9, '\t'.join(map(str, [
+            name, haplotypes, len(runs), 'yes' if complete else 'no', result['jobs'],
+            hours(result['job_s']), hours(result['core_s']), hours(result['queue_s']),
+            hours(result['span_s']), result['first_submit'], result['last_end'], states]))))
+    lines += [line for _, line in sorted(rows_out)]
+    text = '\n'.join(lines) + '\n'
+    target = Path(output_table) if output_table else output / 'history.tsv'
+    target.write_text(text)
+    sys.stdout.write(text)
+    print(f'[timecost] written to {target}; one row per job in {output}/<name>.history.jobs.tsv',
+          file=sys.stderr)
+    return 0
+
+
+def usage(logs, prefix, output):
+    """Added-up time of an earlier run's Slurm jobs, IDs from the log names
+    (NAME-JOBID.out/.err, as run-slurm writes them) under LOGS."""
+    job_ids = sorted({match.group(2) for path in Path(logs).iterdir()
+                      if (match := re.fullmatch(r'(.+)-(\d+)\.(?:out|err)', path.name))
+                      and match.group(1).startswith(prefix)}, key=int)
+    print(f'[timecost] {len(job_ids)} job(s) named {prefix}* in {logs}', file=sys.stderr, flush=True)
+    jobs_tsv = Path(output).with_suffix('.jobs.tsv') if output else Path(logs) / 'usage.jobs.tsv'
+    result = account(job_ids, jobs_tsv)
+    if not result:
+        raise ValueError('no jobs found or sacct unavailable')
+    hours = lambda seconds: f'{seconds / 3600:.3f}'
+    lines = ['phase\tjobs\tjob_h\tcore_h\tqueue_h']
+    for name, phase in sorted(result['phases'].items()):
+        lines.append(f"{name}\t{phase['jobs']}\t{hours(phase['job_s'])}\t{hours(phase['core_s'])}\t{hours(phase['queue_s'])}")
+    lines.append(f"all\t{result['jobs']}\t{hours(result['job_s'])}\t{hours(result['core_s'])}\t{hours(result['queue_s'])}")
+    lines.append('')
+    lines.append(f"# job states: {', '.join(f'{k}={v}' for k, v in sorted(result['states'].items()))}")
+    if result['span_s'] is not None:
+        lines.append(f"# first submit {result['first_submit']}, last end {result['last_end']}: "
+                     f"span {hours(result['span_s'])} h (wall clock, queue waiting and gaps included)")
+    lines.append(f'# one row per job: {jobs_tsv}')
+    text = '\n'.join(lines) + '\n'
+    if output:
+        Path(output).write_text(text)
+    sys.stdout.write(text)
+    return 0
 
 
 def refresh(output):
@@ -385,14 +570,14 @@ def summary(output):
     for item in results:
         names += [name for name in item['phases'] if name not in names]
     hours = lambda seconds: '' if seconds is None else f'{seconds / 3600:.3f}'
-    columns = ['experiment', 'haplotypes', 'mode', 'threads', 'exit_code', 'wall_h',
+    columns = ['experiment', 'haplotypes', 'mode', 'threads', 'exit_code', 'attempts', 'wall_h',
                'job_h', 'core_h', 'queue_h', 'jobs', 'started', 'finished',
                *(f'{name}_wall_h' for name in names), *(f'{name}_job_h' for name in names),
                *(f'{name}_core_h' for name in names)]
     lines = ['\t'.join(columns)]
     for item in results:
         slurm = item.get('slurm') or {}
-        row = dict(item, wall_h=hours(item['wall_s']), job_h=hours(slurm.get('job_s')),
+        row = dict(item, attempts=item.get('attempts', 1), wall_h=hours(item['wall_s']), job_h=hours(slurm.get('job_s')),
                    core_h=hours(slurm.get('core_s')), queue_h=hours(slurm.get('queue_s')),
                    jobs=slurm.get('jobs', ''))
         for name in names:
@@ -428,12 +613,29 @@ def main(argv=None):
     begin.add_argument('--merge-args', default='', help='quoted extra merge_grvcfs.py options')
     begin.add_argument('--allow-count-mismatch', action='store_true')
     begin.add_argument('--force', action='store_true', help='also rerun experiments that finished')
+    begin.add_argument('--resume', action='store_true',
+                       help='continue unfinished or failed experiments in place (merge_grvcfs.py skips '
+                            'finished stages; times add up over attempts); --merge-args are added')
+    old = commands.add_parser('usage', help="added-up time of an earlier run's Slurm jobs")
+    old.add_argument('logs', help='its slurm_logs folder (e.g. cohort_calls/slurm_logs)')
+    old.add_argument('--prefix', default='merge-', help='job name prefix (default merge-: the merge jobs)')
+    old.add_argument('-o', '--output', help='also write the table here (jobs to OUTPUT .jobs.tsv)')
+    past = commands.add_parser('history', help='per experiment, the latest complete attempt (from sacct)')
+    past.add_argument('-O', '--output', required=True, help='experiments folder (timecost)')
+    past.add_argument('-S', '--start', required=True, help='sacct start date, e.g. 2026-10-09')
+    past.add_argument('-o', '--table', help='default: OUTPUT/history.tsv')
     collect = commands.add_parser('summary', help='rewrite OUTPUT/summary.tsv')
     collect.add_argument('-O', '--output', required=True)
     collect.add_argument('--refresh', action='store_true', help='query sacct again for every experiment')
     args = parser.parse_args(argv)
     if args.command == 'start':
+        if args.resume and args.force:
+            parser.error('--resume and --force exclude each other')
         return start(args)
+    if args.command == 'usage':
+        return usage(args.logs, args.prefix, args.output)
+    if args.command == 'history':
+        return history(args.output, args.start, args.table)
     if args.refresh:
         refresh(args.output)
     print(summary(args.output).read_text(), end='')

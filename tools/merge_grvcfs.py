@@ -101,6 +101,11 @@ def parse_args(argv=None):
                         help='call variants inside merged insertions (0: off)')
     parser.add_argument('--keep-full-locus-dup-insertions', action='store_true',
                         help='retain full-locus duplication parent insertions')
+    parser.add_argument('--large-singleton-size', type=int,
+                        default=cohort_vcf_merge.LARGE_SINGLETON_SIZE, metavar='BP',
+                        help='after the merge, write cohort.<kind>.nolargesingleton.vcf without the '
+                             'insertions of at least BP that one haplotype carries (and the rows nested in '
+                             f'them); 0 = off (default {cohort_vcf_merge.LARGE_SINGLETON_SIZE})')
     parser.add_argument('--keep-merge-tmpdir', action='store_true',
                         help='keep OUTPUT/tmp/merge_only after the merged files are written')
     slurm = parser.add_argument_group('Slurm (each stage as a job; default: local, one stage at a time)')
@@ -136,6 +141,8 @@ def parse_args(argv=None):
         parser.error('--no-realignment applies to --exact only')
     if args.slurm_jobs < 1:
         parser.error('--slurm-jobs must be positive')
+    if args.large_singleton_size < 0:
+        parser.error('--large-singleton-size cannot be negative')
     if not args.slurm and (args.slurm_account or args.slurm_partition or args.slurm_memory or args.slurm_args):
         parser.error('Slurm settings require --slurm')
     try:
@@ -353,6 +360,7 @@ def main(argv=None):
         exact=str(Path(args.exact).resolve()) if args.exact else None,
         reference_fastas=[str(Path(path).resolve()) for path in args.reference_fasta],
         realignment=not args.no_realignment)
+    plan['large_singleton_size'] = args.large_singleton_size     # read by the publish stage
     plan_path = Path(plan['root']) / 'plan.json'
     plan_path.write_text(json.dumps(plan, indent=1) + '\n')
     stages = Stages(args, plan, plan_path)
@@ -392,7 +400,8 @@ def main(argv=None):
             leftover.rmdir()          # only when the merge left it empty
         except OSError:
             pass
-    for target in targets:
+    for target in [*targets, *(cohort_vcf_merge.filtered_paths(output, mode)
+                               if args.large_singleton_size else [])]:
         print(target)
     return 0
 
