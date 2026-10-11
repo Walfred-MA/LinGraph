@@ -1223,19 +1223,8 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
         catalog = graph / "alternatives.fasta"
     merge_mode = cohort_merge.resolve_mode(args)
     vcf_inputs = cohort_merge.output_paths(output, merge_mode)
-    # The graph is built from the merge without large singleton insertions
-    # (cohort.<kind>.nolargesingleton.vcf). The merge's publish step writes
-    # them; a merge from before that has them written here first.
-    singleton_size = getattr(args, 'large_singleton_size', cohort_merge.LARGE_SINGLETON_SIZE)
-    if singleton_size and merge_mode != 'snp':
-        filtered = cohort_merge.filtered_paths(output, merge_mode)
-        if not cohort_merge.large_singleton_current(output, merge_mode, singleton_size):
-            singleton_tool = cohort_merge.large_singleton_tool() if not args.dry_run else Path('largeSingletonFilter')
-            runner.run('large-singleton-filter',
-                       cohort_merge.large_singleton_command(output, merge_mode, singleton_size, singleton_tool),
-                       inputs=[*vcf_inputs, singleton_tool],
-                       outputs=[*filtered, output / cohort_merge.LARGE_SINGLETON_REMOVED])
-        vcf_inputs = filtered
+    # cohort.sv.vcf has no large singleton insertions: the merge publishes
+    # them to cohort.sv.10Ksingleton.vcf, which the graph does not use.
     # The C++ exporter (GrvcfGraph) writes the GFA and every sample's GAF in one
     # assembly-free run: bases come from the merged grVCFs and the FASTAs above.
     if merge_mode == 'svonly' or args.insertion_only is not None:
@@ -1686,9 +1675,10 @@ def main(argv=None):
             args.mode == "graph" or args.merge or args.mc_graph or args.merge_mode is not None):
         for path in cohort_merge.output_paths(output, cohort_merge.resolve_mode(args)):
             say(f"Merged VCF: {path}")
-        if getattr(args, 'large_singleton_size', cohort_merge.LARGE_SINGLETON_SIZE):
-            for path in cohort_merge.filtered_paths(output, cohort_merge.resolve_mode(args)):
-                say(f"Merged VCF without large singleton insertions: {path}")
+        size = getattr(args, 'large_singleton_size', cohort_merge.LARGE_SINGLETON_SIZE)
+        singletons = cohort_merge.large_singleton_path(output, size) if size else None
+        if singletons and singletons.is_file():
+            say(f"Large singleton insertions (not in cohort.sv.vcf or the graph): {singletons}")
     if args.mc_graph:
         say(f"GFA: {output / 'cohort.gfa'} (including the links the sample walks add)")
         say(f"GAF: {output}/gaf/SAMPLE.gaf (summary: {output}/gaf/gaf_stats.tsv)")

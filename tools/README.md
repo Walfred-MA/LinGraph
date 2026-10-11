@@ -323,13 +323,25 @@ or the row they were nested in). The `##contig` lines of removed rows (an
 insertion's sequence is declared as a contig) are dropped; the outputs gain a
 `##largeSingletonFilter` header line with the counts.
 
-The pipeline runs it by default after every merge (LinGraph, the cohort
-pipeline, `cohort_vcf_merge.py`, `merge_grvcfs.py`): next to the merged files it
-writes `cohort.{sv,indel,snp}.nolargesingleton.vcf` and
-`cohort.largesingleton.removed.tsv`, and the GFA/GAF export (`--make-graph`,
-`--gfa-only`) reads the `nolargesingleton` files, writing them first for a
-merge that predates them. `--large-singleton-size BP` changes the size; `0`
-turns the filter off and the export reads `cohort.*.vcf`.
+`-x FILE` writes the removed rows themselves, as a VCF with the same header.
+
+The pipeline does not call this tool: every merge (LinGraph, the cohort
+pipeline, `cohort_vcf_merge.py`, `merge_grvcfs.py`) already publishes the
+insertions of at least 10 kb with `NSUP=1` to `cohort.sv.10Ksingleton.vcf`
+instead of `cohort.sv.vcf`, while writing it (no second pass, no copy).
+`cohort.sv.vcf` plus `cohort.sv.10Ksingleton.vcf` is the whole SV merge;
+everything downstream, the GFA/GAF export included, reads `cohort.sv.vcf`.
+`cohort.indel.vcf` and `cohort.snp.vcf` are unaffected (a one-carrier
+insertion has no nested rows or insertion SNPs). `--large-singleton-size BP`
+changes the size; `0` keeps them in `cohort.sv.vcf`. Tools that compare the
+merge with its inputs (lossless checks, `split`) need both SV files.
+
+For a merge published before this, the tool gives the same layout:
+
+```bash
+mv cohort.sv.vcf cohort.sv.full.vcf
+tools/largeSingletonFilter -i cohort.sv.full.vcf -o cohort.sv.vcf -x cohort.sv.10Ksingleton.vcf
+```
 
 ## Merge two haplotype VCFs for benchmarking
 

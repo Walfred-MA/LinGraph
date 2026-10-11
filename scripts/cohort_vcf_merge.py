@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import heapq
 import json
 from pathlib import Path
-import os
 import pickle
+import re
 import shutil
 import garbage
-import subprocess
 import sys
 import time
 
@@ -123,76 +123,70 @@ def output_paths(output, mode):
     return [Path(output) / f'cohort.{kind}.vcf' for kind in kinds]
 
 
-# Haplotype-singleton insertions of at least this size are removed after the
-# merge (tools/largeSingletonFilter) into cohort.<kind>.nolargesingleton.vcf,
-# which the graph export reads; 0 turns it off.
+# Insertions of at least this size that one haplotype carries (NSUP=1) are
+# published to their own file, cohort.sv.10Ksingleton.vcf, instead of
+# cohort.sv.vcf, which the graph export and everything downstream read; the
+# two files together are the whole SV merge. 0 keeps them in cohort.sv.vcf.
+# The indel and SNP files are not affected: a one-carrier insertion has no
+# nested rows or insertion SNPs (they come from differences between carriers).
 LARGE_SINGLETON_SIZE = 10000
-NO_LARGE_SINGLETON = '.nolargesingleton.vcf'
-LARGE_SINGLETON_REMOVED = 'cohort.largesingleton.removed.tsv'
 
 
-def filtered_paths(output, mode):
-    """cohort.<kind>.nolargesingleton.vcf of a merge that has an SV file."""
-    if mode == 'snp':
-        return []
-    return [path.with_name(path.name[:-len('.vcf')] + NO_LARGE_SINGLETON)
-            for path in output_paths(output, mode)]
+def large_singleton_path(output, size):
+    """cohort.sv.10Ksingleton.vcf for 10000 (cohort.sv.<BP>bpsingleton.vcf
+    for a size that is not whole kb)."""
+    label = f'{size // 1000}K' if size % 1000 == 0 else f'{size}bp'
+    return Path(output) / f'cohort.sv.{label}singleton.vcf'
 
 
-def large_singleton_tool():
-    """The newest largeSingletonFilter build (install.py's copies or src/)."""
-    here = Path(__file__).resolve().parent
-    candidates = [here / 'largeSingletonFilter', here / 'tools' / 'largeSingletonFilter',
-                  here.parent / 'tools' / 'largeSingletonFilter',
-                  here / 'src' / 'largeSingletonFilter' / 'largeSingletonFilter']
-    built = [path for path in candidates if path.is_file() and os.access(path, os.X_OK)]
-    if not built:
-        raise ValueError('largeSingletonFilter is not built: run python install.py, or compile '
-                         f"{here / 'src' / 'largeSingletonFilter' / 'largeSingletonFilter.cpp'} "
-                         '(or pass --large-singleton-size 0 to skip the filter)')
-    return max(built, key=lambda path: path.stat().st_mtime)
+class LargeSingletons:
+    """Routes rows while a merged SV file is written: an insertion of at least
+    MIN_SIZE with NSUP=1, and any row on such an insertion (CHROM = its ID)."""
 
+    def __init__(self, min_size):
+        self.min_size, self.ids = int(min_size), set()
 
-def large_singleton_command(output, mode, size, tool=None):
-    sources, targets = output_paths(output, mode), filtered_paths(output, mode)
-    command = [str(tool or large_singleton_tool()), '-i', str(sources[0]), '-o', str(targets[0]),
-               '-s', str(size), '-r', str(Path(output) / LARGE_SINGLETON_REMOVED)]
-    for source, target in zip(sources[1:], targets[1:]):
-        # SNP rows never hold other rows: -l reads that (largest) file once.
-        command += ['-l' if source.name.startswith('cohort.snp') else '-c', str(source), str(target)]
-    return command
+    def reset(self):
+        """Forget the routed IDs (the rows are written again from the start)."""
+        self.ids.clear()
 
-
-def large_singleton_current(output, mode, size):
-    """Filtered files exist, are newer than the merged ones, and used SIZE."""
-    sources, targets = output_paths(output, mode), filtered_paths(output, mode)
-    if not targets or not all(path.is_file() for path in [*sources, *targets]):
-        return False
-    if min(path.stat().st_mtime for path in targets) < max(path.stat().st_mtime for path in sources):
-        return False
-    with open(targets[0]) as handle:
-        for line in handle:
-            if not line.startswith('##'):
-                return False
-            if line.startswith('##largeSingletonFilter=<'):
-                return f'<MinSize={int(size)},' in line
-    return False
-
-
-def filter_large_singletons(output, mode, size=LARGE_SINGLETON_SIZE):
-    """Write the nolargesingleton files (unless SIZE is 0 or they are current)."""
-    if not size or mode == 'snp':
-        return []
-    if size < 0:
-        raise ValueError('--large-singleton-size cannot be negative')
-    targets = filtered_paths(output, mode)
-    if large_singleton_current(output, mode, size):
-        print(f'[cohort-merge] large singletons: {targets[0]} is current', flush=True)
-        return targets
-    command = large_singleton_command(output, mode, size)
-    print('[cohort-merge] large singletons: ' + ' '.join(command), flush=True)
-    subprocess.run(command, check=True)
-    return targets
+    def __call__(self, line):
+        """True when LINE (str or bytes, one VCF row) goes to the singleton file."""
+        # Only CHROM, ID and INFO are cut out: the sample columns of a wide
+        # row are never copied or split.
+        tab = b'\t' if isinstance(line, bytes) else '\t'
+        ends, start = [], 0
+        for column in range(8):
+            start = line.find(tab, start)
+            if start < 0:
+                if column < 7:
+                    return False
+                start = len(line.rstrip(b'\r\n' if tab == b'\t' else '\r\n'))   # no sample columns
+            ends.append(start)
+            start += 1
+        piece = (lambda a, b: line[a:b].decode()) if isinstance(line, bytes) else (lambda a, b: line[a:b])
+        chrom, row_id = piece(0, ends[0]), piece(ends[1] + 1, ends[2])
+        if chrom in self.ids:
+            self.ids.add(row_id)
+            return True
+        info_text = piece(ends[6] + 1, ends[7])
+        if 'NSUP=1' not in info_text or 'SVTYPE=INS' not in info_text:
+            return False
+        info = {}
+        for item in info_text.split(';'):
+            key, _, value = item.partition('=')
+            if key in ('SVTYPE', 'NSUP', 'MAXSIZE', 'SVLEN'):
+                info[key] = value
+        if info.get('SVTYPE') != 'INS' or info.get('NSUP') != '1':
+            return False
+        size = info.get('MAXSIZE', '')
+        if size in ('', '.'):
+            size = info.get('SVLEN', '')
+        size = size.lstrip('-')
+        if not size.isdigit() or int(size) < self.min_size:
+            return False
+        self.ids.add(row_id)
+        return True
 
 
 def input_paths(output, listing=None):
@@ -217,8 +211,10 @@ def input_paths(output, listing=None):
     return paths
 
 
-def combine(paths, output):
-    """Union compatible headers/samples and coordinate-sort VCF records on disk."""
+def combine(paths, output, split=None):
+    """Union compatible headers/samples and coordinate-sort VCF records on disk.
+    SPLIT = (route, other path): the rows ROUTE(row) accepts are written to
+    the other file (same header) instead of OUTPUT; ROUTE.reset() restarts it."""
     paths = [str(path) for path in paths]
     samples, metadata, seen, file_samples, definitions = [], [], set(), [], {}
     known = set()
@@ -250,7 +246,7 @@ def combine(paths, output):
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     contig_order = sv._contig_order(metadata)
-    if len(paths) == 1 and _combine_sorted(paths[0], output, metadata, samples, contig_order):
+    if len(paths) == 1 and _combine_sorted(paths[0], output, metadata, samples, contig_order, split):
         return
     import tempfile
     with tempfile.TemporaryDirectory(prefix='combine-vcf-', dir=output.parent) as directory:
@@ -269,11 +265,15 @@ def combine(paths, output):
                                        sv._state_sample_field('.', row.fmt) for name in samples]
                         handle.write(f'{contig_order.get(row.chrom, len(contig_order))}\t' + sv.format_vcf_record(row) + '\n')
         sv.run_sort(str(body), str(ordered), ['-k1,1n', '-k2,2', '-k3,3n', '-k5,5', '-k6,6', '-k4,4'])
-        with snp.atomic_output(output) as handle:
+        with snp.atomic_output(output) as handle, \
+                (snp.atomic_output(split[1]) if split else contextlib.nullcontext()) as other:
             sv.write_vcf_header(handle, metadata, samples, 'small')
+            if other is not None:
+                sv.write_vcf_header(other, metadata, samples, 'small')
             with ordered.open() as source:
                 for raw in source:
-                    handle.write(raw.split('\t', 1)[1])
+                    row = raw.split('\t', 1)[1]
+                    (other if other is not None and split[0](row) else handle).write(row)
 
 
 # A merged VCF arrives in (or close to) publication order: its rows are copied
@@ -285,7 +285,7 @@ class _Unsortable(Exception):
     """A row only the full parse and sort reproduces (or reports) exactly."""
 
 
-def _combine_sorted(path, output, metadata, samples, contig_order):
+def _combine_sorted(path, output, metadata, samples, contig_order, split=None):
     """Write one file's rows in the order combine()'s external sort gives:
     contig rank, CHROM, POS, REF, ALT, ID, then the whole line (sort's last
     resort), compared as bytes like LC_ALL=C.  False when the full sort is
@@ -326,11 +326,22 @@ def _combine_sorted(path, output, metadata, samples, contig_order):
                 yield key(line)
 
     try:
-        with snp.atomic_output(output) as handle:
+        with snp.atomic_output(output) as handle, \
+                (snp.atomic_output(split[1]) if split else contextlib.nullcontext()) as other_handle:
             sv.write_vcf_header(handle, metadata, samples, 'small')
             handle.flush()
             out = handle.buffer
             body = out.tell()
+            other = other_body = None
+            if other_handle is not None:
+                sv.write_vcf_header(other_handle, metadata, samples, 'small')
+                other_handle.flush()
+                other = other_handle.buffer
+                other_body = other.tell()
+
+            def write(line):
+                (other if other is not None and split[0](line) else out).write(line + b'\n')
+
             starts, previous = [], None
             with open(path, 'rb') as source:
                 for offset, line in rows(source):
@@ -340,15 +351,21 @@ def _combine_sorted(path, output, metadata, samples, contig_order):
                         if len(starts) > _SORTED_RUNS_LIMIT:
                             raise _Unsortable
                     if len(starts) == 1:
-                        out.write(line + b'\n')
+                        write(line)
                     previous = current
             if len(starts) > 1:
                 out.seek(body)
                 out.truncate()
+                if other is not None:
+                    other.seek(other_body)
+                    other.truncate()
+                    split[0].reset()
                 ends = starts[1:] + [None]
                 for current in heapq.merge(*(keyed(start, end) for start, end in zip(starts, ends))):
-                    out.write(current[-1] + b'\n')
+                    write(current[-1])
     except _Unsortable:
+        if split:
+            split[0].reset()     # combine() writes every row again
         return False
     return True
 
@@ -430,15 +447,25 @@ def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
                'snp': [snp_input], 'svindel': [sv_input, indel_input]}[mode]
     if any(path is None or not Path(path).is_file() for path in sources):
         raise ValueError(f'{mode}: missing merged input VCFs: {sources}')
+    # Large singleton insertions go to their own file while cohort.sv.vcf is
+    # written (no second pass, no copy).
+    splits = {}
+    if large_singleton_size and mode != 'snp':
+        route = LargeSingletons(large_singleton_size)
+        splits[str(targets[0])] = (route, large_singleton_path(output, large_singleton_size))
     if mode in ('svindel', 'all'):
         # One process per category file: each combine is a separate stream.
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=len(targets)) as pool:
-            for done in [pool.submit(combine, [source], target)
+            for done in [pool.submit(combine, [source], target, splits.get(str(target)))
                          for source, target in zip(sources, targets)]:
                 done.result()
     else:
-        combine(sources, targets[0])
+        combine(sources, targets[0], splits.get(str(targets[0])))
+    for _route, path in splits.values():
+        rows = sum(1 for line in open(path) if not line.startswith('#'))
+        print(f'[cohort-merge] large singleton insertions (NSUP=1, >= {large_singleton_size} bp): '
+              f'{rows} row(s) in {path}', flush=True)
     if sample_vcfs is None:
         try:
             sample_vcfs = input_paths(output)
@@ -450,8 +477,8 @@ def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
         print(f'[cohort-merge] warning: input per-sample VCFs unknown; {SAMPLE_HEADERS} '
               'not written, so these merged files cannot be split back with each sample\'s '
               'coverage (pass -I VCF_LIST to publish)', file=sys.stderr, flush=True)
-    filter_large_singletons(output, mode, large_singleton_size)
-    cleanup_merge_directories(output, cleanup_tmpdirs, protected=targets)
+    cleanup_merge_directories(output, cleanup_tmpdirs,
+                              protected=[*targets, *(path for _route, path in splits.values())])
     return targets
 
 
@@ -658,9 +685,9 @@ def main(argv=None):
     parser.add_argument('--cleanup-tmpdir', action='append', default=[],
                         help='publish: remove this merge directory after all final VCFs are written')
     parser.add_argument('--large-singleton-size', type=int, default=LARGE_SINGLETON_SIZE, metavar='BP',
-                        help='after the merge, write cohort.<kind>.nolargesingleton.vcf without the '
-                             'insertions of at least BP that one haplotype carries (and the rows nested '
-                             f'in them); the graph export reads these; 0 = off (default {LARGE_SINGLETON_SIZE})')
+                        help='publish the insertions of at least BP that one haplotype carries (NSUP=1) '
+                             'to cohort.sv.<BP>singleton.vcf (10Ksingleton for 10000) instead of '
+                             f'cohort.sv.vcf; 0 keeps them in cohort.sv.vcf (default {LARGE_SINGLETON_SIZE})')
     args = parser.parse_args(argv)
     if args.large_singleton_size < 0:
         parser.error('--large-singleton-size cannot be negative')

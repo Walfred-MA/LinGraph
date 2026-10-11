@@ -17,7 +17,11 @@
 // Usage:
 //   largeSingletonFilter -i cohort.sv.vcf -o filtered.sv.vcf [-s 10000]
 //       [-c cohort.indel.vcf filtered.indel.vcf] [-l cohort.snp.vcf filtered.snp.vcf]
-//       [-r removed.tsv]
+//       [-r removed.tsv] [-x removed.vcf]
+//
+// The cohort pipeline does not use this tool: its merge publishes these rows
+// to cohort.sv.10Ksingleton.vcf directly. With -x, a merge published before
+// that gets the same layout (cohort.sv.vcf + the removed rows as a VCF).
 
 #include <chrono>
 #include <cstdio>
@@ -198,7 +202,8 @@ void usage() {
         "                       (cohort.indel.vcf); repeatable\n"
         "  -l, --leaf IN OUT    the same for a file whose rows never hold other rows\n"
         "                       (cohort.snp.vcf): read once instead of twice; repeatable\n"
-        "  -r, --removed FILE   write the removed rows (ID, CHROM, POS, SVTYPE, size, carrier, reason)\n");
+        "  -r, --removed FILE   write the removed rows (ID, CHROM, POS, SVTYPE, size, carrier, reason)\n"
+        "  -x, --removed-vcf FILE  write the main file's removed rows as a VCF (same header)\n");
 }
 
 }  // namespace
@@ -206,7 +211,7 @@ void usage() {
 int main(int argc, char **argv) {
     std::vector<Input> inputs(1);
     long long min_size = 10000;
-    std::string removed_path;
+    std::string removed_path, removed_vcf;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         auto value = [&](int count = 1) {
@@ -232,6 +237,7 @@ int main(int argc, char **argv) {
             inputs.push_back(companion);
         }
         else if (arg == "-r" || arg == "--removed") { value(); removed_path = argv[++i]; }
+        else if (arg == "-x" || arg == "--removed-vcf") { value(); removed_vcf = argv[++i]; }
         else if (arg == "-h" || arg == "--help") { usage(); return 0; }
         else { usage(); return 2; }
     }
@@ -336,10 +342,13 @@ int main(int argc, char **argv) {
     std::string header = "##largeSingletonFilter=<MinSize=" + std::to_string(min_size)
         + ",Singletons=" + std::to_string(seeds) + ",NestedRemoved=" + std::to_string(nested)
         + ",Description=\"haplotype-singleton insertions of at least MinSize bp removed, with the rows nested in them\">\n";
-    for (Input &input : inputs) {
-        Stream in, out;
+    for (size_t index = 0; index < inputs.size(); ++index) {
+        Input &input = inputs[index];
+        Stream in, out, extra;
         in.open_read(input.in);
         out.open_write(input.out);
+        // The main file's removed rows, as a VCF with the full header.
+        if (index == 0 && !removed_vcf.empty()) extra.open_write(removed_vcf);
         Lines lines;
         std::string_view line;
         auto started = std::chrono::steady_clock::now();
@@ -347,6 +356,11 @@ int main(int argc, char **argv) {
         while (lines.next(in.file, line)) {
             bytes += line.size() + 1;
             if (!line.empty() && line[0] == '#') {
+                if (extra.file) {
+                    if (line.substr(0, 6) == "#CHROM") std::fputs(header.c_str(), extra.file);
+                    std::fwrite(line.data(), 1, line.size(), extra.file);
+                    std::fputc('\n', extra.file);
+                }
                 if (line.substr(0, 6) == "#CHROM") std::fputs(header.c_str(), out.file);
                 if (line.substr(0, 13) == "##contig=<ID=") {
                     std::string_view id = line.substr(13);
@@ -360,6 +374,10 @@ int main(int argc, char **argv) {
                     if (!removed.empty() && (removed.count(std::string(field[2]))
                                              || removed.count(std::string(field[0])))) {
                         ++input.removed;
+                        if (extra.file) {
+                            std::fwrite(line.data(), 1, line.size(), extra.file);
+                            std::fputc('\n', extra.file);
+                        }
                         continue;
                     }
                 }
@@ -369,6 +387,7 @@ int main(int argc, char **argv) {
         }
         in.close();
         out.close();
+        extra.close();
         report_pass("pass 2 read+write", input.in, bytes, seconds_since(started));
         std::fprintf(stderr, "[largeSingletonFilter] %s: %lld row(s), %lld removed -> %s\n",
                      input.in.c_str(), input.rows, input.removed, input.out.c_str());

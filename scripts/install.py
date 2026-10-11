@@ -62,7 +62,7 @@ ROOT_BINARY_ALIASES = {
     # Native small-variant (SNP) chromosome merge worker of graphvcfmerge.
     "SmallVariantMerge": ("SmallVariantMerge",),
 }
-# User-facing tools: also copied into the repository's tools/ folder.
+# User-facing tools: installed into the tools/ folder only (not used by the pipeline).
 TOOLS_DIR_BINARIES = ("largeSingletonFilter",)
 
 
@@ -300,7 +300,7 @@ def install_compiled_binary(result: BuildResult, install_dir: Path) -> BuildResu
                       if (path / "merge_grvcfs.py").is_file()), None)
     destinations = [install_dir / name for name in dict.fromkeys(names)]
     if result.directory.name in TOOLS_DIR_BINARIES and tools_dir is not None:
-        destinations.append(tools_dir / source.name)
+        destinations = [tools_dir / source.name]
     try:
         install_dir.mkdir(parents=True, exist_ok=True)
         for destination in destinations:

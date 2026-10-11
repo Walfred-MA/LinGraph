@@ -103,9 +103,9 @@ def parse_args(argv=None):
                         help='retain full-locus duplication parent insertions')
     parser.add_argument('--large-singleton-size', type=int,
                         default=cohort_vcf_merge.LARGE_SINGLETON_SIZE, metavar='BP',
-                        help='after the merge, write cohort.<kind>.nolargesingleton.vcf without the '
-                             'insertions of at least BP that one haplotype carries (and the rows nested in '
-                             f'them); 0 = off (default {cohort_vcf_merge.LARGE_SINGLETON_SIZE})')
+                        help='publish the insertions of at least BP that one haplotype carries (NSUP=1) '
+                             'to cohort.sv.<BP>singleton.vcf (10Ksingleton for 10000) instead of '
+                             f'cohort.sv.vcf; 0 keeps them (default {cohort_vcf_merge.LARGE_SINGLETON_SIZE})')
     parser.add_argument('--keep-merge-tmpdir', action='store_true',
                         help='keep OUTPUT/tmp/merge_only after the merged files are written')
     slurm = parser.add_argument_group('Slurm (each stage as a job; default: local, one stage at a time)')
@@ -400,8 +400,9 @@ def main(argv=None):
             leftover.rmdir()          # only when the merge left it empty
         except OSError:
             pass
-    for target in [*targets, *(cohort_vcf_merge.filtered_paths(output, mode)
-                               if args.large_singleton_size else [])]:
+    singletons = (cohort_vcf_merge.large_singleton_path(output, args.large_singleton_size)
+                  if args.large_singleton_size else None)
+    for target in [*targets, *([singletons] if singletons and singletons.is_file() else [])]:
         print(target)
     return 0
 

@@ -256,10 +256,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=cohort_merge.LARGE_SINGLETON_SIZE,
         metavar="BP",
         help=(
-            "after the merge, also write cohort.<kind>.nolargesingleton.vcf "
-            "without the insertions of at least BP that one haplotype carries "
-            "(and the rows nested in them); the graph export reads these; "
-            "0 turns this off (default 10000)"
+            "publish the insertions of at least BP that one haplotype carries "
+            "(NSUP=1) to cohort.sv.<BP>singleton.vcf (10Ksingleton for 10000) "
+            "instead of cohort.sv.vcf; 0 keeps them (default 10000)"
         ),
     )
     pa_group = parser.add_mutually_exclusive_group()
