@@ -6,7 +6,8 @@
 //              [--local-reference-templates TEMPLATES.fa ...] [--local-path-fasta CATALOG.fa ...]
 //              [--reference-haplotype CHM13_h1] -o OUT.gfa [-t THREADS]
 //              [--max-node-length 1024] [--placements FILE] [--roots-table FILE]
-//              [--gaf FOLDER [-s SAMPLE_VCF_OR_HEADERS ...] [--query-lengths TSV]]
+//              [--gaf FOLDER [-s SAMPLE_VCF_OR_HEADERS ...] [--query-lengths TSV]
+//                            [--excluded-vcf VCF ...]]
 //
 // 1. Scan: VCF columns 1-8 only (sample columns are skipped); every row is a
 //    fixed 64-byte record, allele bases come from ALT / INFO/SEQ.
@@ -35,6 +36,11 @@
 //    Links the walks need are added to the GFA (L lines without SR). Column 2
 //    is --query-lengths, else the largest mapped query coordinate. Also
 //    SAMPLE.gaf.breaks/unplaced/lengthdebug.tsv and gaf_stats.tsv.
+//    --excluded-vcf: rows left out of the graph on purpose (the merge's
+//    cohort.sv.10Ksingleton.vcf). A carrier's walk would miss their query
+//    bases, so its record ends before each such allele (QUERYCOORD) and the
+//    next starts after it; the run is not lost. Listed as excluded_row in
+//    SAMPLE.gaf.breaks.tsv.
 //
 // Scale: the VCFs are read once, uncompressed inputs in parallel byte ranges.
 // The scan writes the samples' alleles (20 bytes each) to per-worker spill
@@ -1488,7 +1494,7 @@ class Roots {
 };
 
 struct Options {
-    vector<string> vcfs, alternatives, templates, catalogs, sample_vcfs;
+    vector<string> vcfs, alternatives, templates, catalogs, sample_vcfs, excluded;
     string reference, backbone, output, placements, roots_table, gaf_folder, query_lengths, spill_folder;
     unsigned threads = 1, gaf_threads = 0;  // gaf_threads 0: as --threads
     uint64_t max_node = 1024;
@@ -1805,6 +1811,13 @@ uint64_t walked_length(const vector<Piece> &pieces) {
     for (auto &p : pieces) total += p.bases - p.offset - p.trim;
     return total;
 }
+
+// Query intervals of alleles left out of the graph (--excluded-vcf), per
+// sample: contig name, [qs, qe).
+struct ExcludedSpan {
+    string contig;
+    uint64_t qs, qe;
+};
 
 using Stats = std::map<string, int64_t>;
 
@@ -2172,15 +2185,145 @@ struct GafResult {
     LinkSet added;
 };
 
+// --excluded-vcf: every carrier column's ASSEMBLYCONTIG/QUERYCOORD spans
+// (START-END), read as collect_alleles reads them, by sample name.
+std::unordered_map<string, vector<ExcludedSpan>> read_excluded(const vector<string> &files) {
+    std::unordered_map<string, vector<ExcludedSpan>> spans;
+    auto split = [](string_view text, char separator) {
+        vector<string_view> out;
+        size_t start = 0;
+        for (;;) {
+            size_t stop = text.find(separator, start);
+            out.push_back(text.substr(start, stop == string_view::npos ? string_view::npos : stop - start));
+            if (stop == string_view::npos) return out;
+            start = stop + 1;
+        }
+    };
+    for (const string &file : files) {
+        bool gz = file.size() > 3 && file.compare(file.size() - 3, 3, ".gz") == 0;
+        FILE *in = gz ? popen(("gzip -cd -- '" + file + "'").c_str(), "r") : fopen(file.c_str(), "r");
+        if (!in) fail("cannot read " + file);
+        vector<string> samples;
+        char *buffer = nullptr;
+        size_t capacity = 0;
+        ssize_t got;
+        while ((got = getline(&buffer, &capacity, in)) > 0) {
+            string_view line(buffer, size_t(got));
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.remove_suffix(1);
+            if (line.empty()) continue;
+            vector<string_view> fields = split(line, '\t');
+            if (line[0] == '#') {
+                if (line.compare(0, 6, "#CHROM") == 0)
+                    for (size_t c = 9; c < fields.size(); ++c) samples.emplace_back(fields[c]);
+                continue;
+            }
+            if (fields.size() < 10) continue;
+            vector<string_view> keys = split(fields[8], ':');
+            int64_t gt = -1, contig = -1, coord = -1;
+            for (size_t k = 0; k < keys.size(); ++k) {
+                if (keys[k] == "GT" && gt < 0) gt = int64_t(k);
+                else if (keys[k] == "ASSEMBLYCONTIG" && contig < 0) contig = int64_t(k);
+                else if (keys[k] == "QUERYCOORD" && coord < 0) coord = int64_t(k);
+            }
+            if (gt < 0 || contig < 0 || coord < 0) continue;
+            for (size_t c = 9; c < fields.size() && c - 9 < samples.size(); ++c) {
+                vector<string_view> values = split(fields[c], ':');
+                if (values.size() != keys.size() || values[size_t(gt)] != "1") continue;
+                vector<string_view> names = split(values[size_t(contig)], ','), coords = split(values[size_t(coord)], ',');
+                for (size_t k = 0; k < coords.size(); ++k) {
+                    string_view text = coords[k];
+                    if (!text.empty() && (text.back() == '+' || text.back() == '-')) text.remove_suffix(1);
+                    size_t dash = text.find('-');
+                    uint64_t a = 0, b = 0;
+                    if (dash == string_view::npos || !parse_u64(text.substr(0, dash), a) ||
+                        !parse_u64(text.substr(dash + 1), b))
+                        continue;  // no query bases (a point)
+                    if (a > b) std::swap(a, b);
+                    size_t which = names.size() > 1 ? k : 0;
+                    if (a == b || which >= names.size()) continue;
+                    spans[samples[c - 9]].push_back({string(names[which]), a, b});
+                }
+            }
+        }
+        free(buffer);
+        if (gz ? pclose(in) : fclose(in)) fail("cannot read " + file);
+    }
+    return spans;
+}
+
+// PIECES cut after WALKED bases of the walk: (before, after). A cut inside a
+// segment ends the first part with a trim and starts the second with an offset.
+std::pair<vector<Piece>, vector<Piece>> split_pieces(const GafGraph &g, const vector<Piece> &pieces, uint64_t walked) {
+    vector<Piece> before, after;
+    size_t i = 0;
+    for (; i < pieces.size() && walked; ++i) {
+        const Piece &p = pieces[i];
+        uint64_t length = p.bases - p.offset - p.trim;
+        if (walked >= length) {
+            before.push_back(p);
+            walked -= length;
+            continue;
+        }
+        // The cut is inside this piece: find its segment.
+        uint64_t done = 0, sum = 0;
+        for (uint64_t n = p.first;; p.reverse ? --n : ++n) {
+            uint64_t size = g.node_length(n);
+            uint64_t from = n == p.first ? p.offset : 0, to = size - (n == p.last ? p.trim : 0);
+            if (walked < done + (to - from)) {
+                uint64_t cut = from + (walked - done);   // bases of segment n in the first part
+                Piece left = p, right = p;
+                if (walked == done) {
+                    // At the start of segment n (not the first: walked > 0): the
+                    // first part ends with the previous segment, untrimmed.
+                    left.last = p.reverse ? n + 1 : n - 1;
+                    left.trim = 0;
+                    left.bases = uint32_t(sum);
+                } else {
+                    left.last = n;
+                    left.trim = uint32_t(size - cut);
+                    left.bases = uint32_t(sum + size);
+                }
+                right.first = n;
+                right.offset = uint32_t(cut);
+                right.bases = uint32_t(p.bases - sum);
+                before.push_back(left);
+                after.push_back(right);
+                break;
+            }
+            done += to - from;
+            sum += size;
+            if (n == p.last) break;
+        }
+        walked = 0;
+        ++i;
+        break;
+    }
+    after.insert(after.end(), pieces.begin() + i, pieces.end());
+    return {before, after};
+}
+
 // gfa_sample_gaf.write_sample_gaf for one sample.
 GafResult write_sample_gaf(const GafGraph &g, const string &sample, GafInput input,
                            const vector<string> &contig_names,
                            const std::unordered_map<string, uint32_t> &contig_ids,
                            const std::unordered_map<string, uint64_t> &lengths,
-                           const std::function<Canon(const Mapping &)> &canonical, const string &folder) {
+                           const std::function<Canon(const Mapping &)> &canonical, const string &folder,
+                           const vector<ExcludedSpan> &excluded) {
     GafResult result;
     Stats &stats = result.stats;
     LinkSet &added = result.added;
+    // This sample's excluded query spans by contig, sorted, overlaps merged.
+    std::unordered_map<string, vector<std::pair<uint64_t, uint64_t>>> gaps;
+    for (auto &span : excluded) gaps[span.contig].push_back({span.qs, span.qe});
+    for (auto &[contig, list] : gaps) {
+        std::sort(list.begin(), list.end());
+        vector<std::pair<uint64_t, uint64_t>> merged;
+        for (auto &item : list)
+            if (!merged.empty() && item.first <= merged.back().second) merged.back().second = std::max(merged.back().second, item.second);
+            else merged.push_back(item);
+        list.swap(merged);
+    }
+
     SampleWalker sw(g, std::move(input.records), stats);
     string base = folder + "/" + sample + ".gaf";
     Writer out(base + ".tmp"), breaks(base + ".breaks.tsv.tmp"), debug(base + ".lengthdebug.tsv.tmp");
@@ -2191,6 +2334,23 @@ GafResult write_sample_gaf(const GafGraph &g, const string &sample, GafInput inp
     std::optional<Walk> walk;
     string current_contig;
     string line;
+
+    // Excluded spans of the current contig inside [qs, qe), and their bases.
+    auto gaps_in = [&](uint64_t qs, uint64_t qe) {
+        vector<std::pair<uint64_t, uint64_t>> inside;
+        auto found = gaps.find(current_contig);
+        if (found == gaps.end()) return inside;
+        auto &list = found->second;
+        auto it = std::lower_bound(list.begin(), list.end(), std::make_pair(qs, uint64_t(0)));
+        for (; it != list.end() && it->first < qe; ++it)
+            if (it->second <= qe) inside.push_back(*it);
+        return inside;
+    };
+    auto gap_bases = [](const vector<std::pair<uint64_t, uint64_t>> &inside) {
+        uint64_t total = 0;
+        for (auto &span : inside) total += span.second - span.first;
+        return total;
+    };
 
     auto count = [&](const char *key) -> int64_t {
         auto it = stats.find(key);
@@ -2301,15 +2461,17 @@ GafResult write_sample_gaf(const GafGraph &g, const string &sample, GafInput inp
                 ++stats["variants_spliced"];
             }
             ok = true;
-            if (qe > qs && pieces.empty()) {
+            if (qe > qs && pieces.empty() && gap_bases(gaps_in(qs, qe)) != qe - qs) {
                 ++stats["break_insertion_without_variant"];
                 ok = false;
             }
         }
-        if (ok && walked_length(pieces) != qe - qs) {
+        // Bases of alleles left out of the graph (--excluded-vcf) are not walked.
+        uint64_t expected = qe - qs - gap_bases(gaps_in(qs, qe));
+        if (ok && walked_length(pieces) != expected) {
             // A variant was not placed here: never write a walk that does not spell the query.
             ++stats["break_length_mismatch"];
-            length_report(qs, qe, category, run, candidates, int64_t(walked_length(pieces)) - int64_t(qe - qs));
+            length_report(qs, qe, category, run, candidates, int64_t(walked_length(pieces)) - int64_t(expected));
             ok = false;
         }
         return ok;
@@ -2330,6 +2492,32 @@ GafResult write_sample_gaf(const GafGraph &g, const string &sample, GafInput inp
         return true;
     };
 
+    // walk_on, with the record ended before each excluded allele's query
+    // bases and restarted after them (the walk skips them; query positions
+    // and walk positions match one to one outside them).
+    auto walk_spans = [&](uint64_t qs, uint64_t qe, const vector<Piece> &all, int64_t spliced) -> bool {
+        auto inside = gaps_in(qs, qe);
+        if (inside.empty()) return walk_on(qs, qe, all, spliced);
+        vector<Piece> rest = all;
+        uint64_t cursor = qs;
+        for (auto &[a, b] : inside) {
+            if (a > cursor) {
+                auto parts = split_pieces(g, rest, a - cursor);
+                if (!walk_on(cursor, a, parts.first, spliced)) return false;
+                spliced = 0;
+                rest = std::move(parts.second);
+            }
+            close();
+            breaks.write(current_contig + "\t" + std::to_string(a) + "\t" + std::to_string(b) + "\t" +
+                         std::to_string(b - a) + "\tEXCLUDED\texcluded_row\t.\n");
+            ++stats["excluded_spans"];
+            stats["excluded_bases"] += int64_t(b - a);
+            cursor = b;
+        }
+        if (qe > cursor) return walk_on(cursor, qe, rest, spliced);
+        return true;
+    };
+
     vector<Piece> pieces;
     for (auto &run : make_runs(input.intervals, canonical, stats)) {
         if (run.contig != current_contig) {
@@ -2343,7 +2531,7 @@ GafResult write_sample_gaf(const GafGraph &g, const string &sample, GafInput inp
         if (contig_id >= 0) snapshot = sw.snapshot(uint32_t(contig_id), run.qs, run.qe);
         int64_t spliced_start = count("variants_spliced");
         bool placed = place(run.qs, run.qe, run.qstrand, run.run, run.category, contig_id, pieces);
-        if (placed && walk_on(run.qs, run.qe, pieces, count("variants_spliced") - spliced_start)) continue;
+        if (placed && walk_spans(run.qs, run.qe, pieces, count("variants_spliced") - spliced_start)) continue;
         report(run.contig, run.qs, run.qe, run.category, "run_failed", saved);
         // Variants consumed by the failed attempt stay available to the neighbouring runs.
         if (contig_id >= 0) sw.restore(snapshot);
@@ -2360,7 +2548,7 @@ GafResult write_sample_gaf(const GafGraph &g, const string &sample, GafInput inp
                 bool member_placed = place(member.qs, member.qe, run.qstrand, member.canonical, member.category,
                                            contig_id, pieces);
                 if (!member_placed ||
-                    !walk_on(member.qs, member.qe, pieces, count("variants_spliced") - spliced_start)) {
+                    !walk_spans(member.qs, member.qe, pieces, count("variants_spliced") - spliced_start)) {
                     if (contig_id >= 0) sw.restore(member_snapshot);
                     stats["run_dropped"] += member_placed;
                     report(run.contig, member.qs, member.qe, member.category,
@@ -2962,6 +3150,15 @@ int build(Options &opt) {
 
         vector<GafResult> results(sample_names.size());
         std::atomic<uint64_t> observations{0};
+        // Alleles left out of the graph: their carriers' records break there.
+        const auto excluded = read_excluded(opt.excluded);
+        const vector<ExcludedSpan> no_spans;
+        if (!opt.excluded.empty()) {
+            uint64_t spans = 0;
+            for (auto &item : excluded) spans += item.second.size();
+            log("GAF: " + std::to_string(spans) + " excluded allele span(s) in " + std::to_string(excluded.size()) +
+                " sample(s) from " + std::to_string(opt.excluded.size()) + " --excluded-vcf file(s)");
+        }
         // Samples walked at once: each holds about 400 bytes per carried allele.
         parallel_for(sample_names.size(), opt.gaf_threads ? opt.gaf_threads : threads, [&](size_t k) {
             // This sample's alleles: global rows and contigs, kept rows only, in
@@ -2989,8 +3186,9 @@ int build(Options &opt) {
                     lengths[k][contig_names[o.contig]] = std::max<uint64_t>(lengths[k][contig_names[o.contig]], o.qe);
             }
             GafInput input{std::move(sample_intervals[k]), std::move(records)};
+            auto found = excluded.find(sample_names[k]);
             results[k] = write_sample_gaf(g, sample_names[k], std::move(input), contig_names, contig_ids, lengths[k],
-                                          canonical, opt.gaf_folder);
+                                          canonical, opt.gaf_folder, found == excluded.end() ? no_spans : found->second);
         });
         collector.reset();  // removes the spill files
         log("GAF: " + std::to_string(sample_names.size()) + " samples, " + std::to_string(observations.load()) +
@@ -3279,7 +3477,7 @@ void usage() {
             "                  [--reference-haplotype NAME] -o OUT.gfa [-t THREADS]\n"
             "                  [--max-node-length 1024] [--placements FILE] [--roots-table FILE]\n"
             "                  [--gaf FOLDER [-s SAMPLE_VCF_OR_HEADERS ...] [--query-lengths TSV]\n"
-            "                   [--spill-dir DIR] [--gaf-threads N]]\n");
+            "                   [--spill-dir DIR] [--gaf-threads N] [--excluded-vcf VCF ...]]\n");
 }
 
 }  // namespace
@@ -3325,6 +3523,8 @@ int main(int argc, char **argv) {
                 values(opt.sample_vcfs);
             } else if (option == "--query-lengths") {
                 opt.query_lengths = value();
+            } else if (option == "--excluded-vcf") {
+                values(opt.excluded);
             } else if (option == "--spill-dir") {
                 opt.spill_folder = value();
             } else if (option == "--gaf-threads") {

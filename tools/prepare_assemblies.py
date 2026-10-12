@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare PATs assemblies with WindowMasker and optional contig-name repair."""
+"""Prepare PATs assemblies with WindowMasker or sdust and optional contig-name repair."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 
 SAMPLE_RE = re.compile(
@@ -28,6 +28,7 @@ LEADING_PREFIX_RE = re.compile(
     r"^(?P<sample>[A-Za-z0-9.-]+)#(?P<haplotype>[1-9][0-9]*)#"
 )
 LOWERCASE_DNA = frozenset(b"acgt")
+MASKER_LABELS = {"windowmasker": "WindowMasker", "sdust": "sdust"}
 # Local CPU budget, as LinGraph.py's -t default.
 DEFAULT_THREADS = max(1, min(16, os.cpu_count() or 1))
 
@@ -228,9 +229,9 @@ def copy_uncompressed(source: Path, destination: Path) -> None:
         shutil.copyfileobj(input_handle, output_handle, length=1024 * 1024)
 
 
-def run_command(command: Sequence[str]) -> None:
+def run_command(command: Sequence[str], stdout=None) -> None:
     print("[prepare] run:", shlex.join(command), flush=True)
-    completed = subprocess.run(list(command))
+    completed = subprocess.run(list(command), stdout=stdout)
     if completed.returncode != 0:
         raise RuntimeError(
             f"command exited with status {completed.returncode}: {shlex.join(command)}"
@@ -249,11 +250,21 @@ def find_executable(value: str) -> str:
     return resolved
 
 
+# -mk_counts memory in MB. Counting splits the units by prefix and rereads the
+# whole FASTA once per prefix in each of its two passes; 4096 MB holds all 4**15
+# unit counts (the unit size of a 1.3-5.4 Gb genome), so a human haplotype is
+# read twice instead of eight times. Counts, thresholds and the counts file are
+# the same for any value; only peak memory (4 GiB) and time change.
+COUNTS_MEMORY_MB = 4096
+
+
 def windowmasker_counts(windowmasker: str, source: Path, counts: Path) -> None:
     run_command(
         [
             windowmasker,
             "-mk_counts",
+            "-mem",
+            str(COUNTS_MEMORY_MB),
             "-infmt",
             "fasta",
             "-in",
@@ -360,19 +371,41 @@ def run_windowmasker_parallel(
     """
     windowmasker_counts(windowmasker, source, counts)
 
-    folder = output.parent / "windowmasker_chunks"
+    mask_chunks_parallel(
+        source,
+        output,
+        threads,
+        total_bases,
+        "WindowMasker",
+        lambda chunk, masked: windowmasker_mask(windowmasker, chunk, counts, masked),
+    )
+
+
+def mask_chunks_parallel(
+    source: Path,
+    output: Path,
+    threads: int,
+    total_bases: int,
+    label: str,
+    mask,
+) -> None:
+    """Mask whole-record chunks of ``source`` concurrently, joined in input order.
+
+    ``mask(chunk, masked)`` writes the masked copy of one chunk.
+    """
+    folder = output.parent / f"{label.lower()}_chunks"
     folder.mkdir()
     # About four chunks per thread keeps workers busy when record sizes vary.
     target_bases = max(1, total_bases // (threads * 4))
     chunks = split_fasta_chunks(source, folder, target_bases)
     print(
-        f"[prepare] WindowMasker masking {len(chunks)} chunks with {threads} threads",
+        f"[prepare] {label} masking {len(chunks)} chunks with {threads} threads",
         flush=True,
     )
 
     def mask_chunk(chunk: Path) -> Path:
         masked = chunk.with_suffix(".masked.fa")
-        windowmasker_mask(windowmasker, chunk, counts, masked)
+        mask(chunk, masked)
         chunk.unlink()
         return masked
 
@@ -392,7 +425,7 @@ def run_windowmasker_parallel(
                 errors.append(f"{chunk.name}: {error}")
     if errors:
         raise RuntimeError(
-            "WindowMasker chunk masking failed:\n  " + "\n  ".join(errors)
+            f"{label} chunk masking failed:\n  " + "\n  ".join(errors)
         )
 
     with output.open("wb") as output_handle:
@@ -403,7 +436,93 @@ def run_windowmasker_parallel(
             masked.unlink()
     folder.rmdir()
     if output.stat().st_size == 0:
-        raise RuntimeError(f"WindowMasker did not create a nonempty FASTA: {output}")
+        raise RuntimeError(f"{label} did not create a nonempty FASTA: {output}")
+
+
+def read_sdust_intervals(path: Path) -> Iterator[Tuple[bytes, int, int]]:
+    """sdust output lines: record name, 0-based start, exclusive end."""
+    with path.open("rb") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            fields = raw.split()
+            if not fields:
+                continue
+            if len(fields) != 3:
+                raise ValueError(f"{path}:{line_number}: expected NAME START END from sdust")
+            yield fields[0], int(fields[1]), int(fields[2])
+
+
+def apply_soft_mask(source: Path, intervals: Path, output: Path) -> None:
+    """Write ``source`` in uppercase with the intervals lowercased.
+
+    sdust reports each record's intervals in input order, so the FASTA and the
+    interval file are read together; the line layout is kept.
+    """
+    pending = read_sdust_intervals(intervals)
+    upcoming = next(pending, None)
+    current: List[Tuple[int, int]] = []
+    first = 0
+    offset = 0
+    with open_fasta(source) as input_handle, output.open("wb") as output_handle:
+        for raw in input_handle:
+            if raw.startswith(b">"):
+                name = raw[1:].split(None, 1)[0]
+                current = []
+                while upcoming is not None and upcoming[0] == name:
+                    current.append(upcoming[1:])
+                    upcoming = next(pending, None)
+                current.sort()
+                first = 0
+                offset = 0
+                output_handle.write(raw)
+                continue
+            body = raw.rstrip(b"\r\n")
+            end = offset + len(body)
+            line = bytearray(body.upper())
+            while first < len(current) and current[first][1] <= offset:
+                first += 1
+            index = first
+            while index < len(current) and current[index][0] < end:
+                start = max(current[index][0], offset) - offset
+                stop = min(current[index][1], end) - offset
+                line[start:stop] = line[start:stop].lower()
+                index += 1
+            output_handle.write(line)
+            output_handle.write(raw[len(body):])
+            offset = end
+    if upcoming is not None:
+        raise RuntimeError(
+            f"sdust interval on {upcoming[0].decode(errors='replace')!r} does not "
+            f"match the FASTA record order of {source}"
+        )
+
+
+def run_sdust(sdust: str, source: Path, output: Path) -> None:
+    """Soft-mask sdust's low-complexity intervals; every other base is uppercase."""
+    intervals = output.with_name(output.name + ".sdust.txt")
+    with intervals.open("wb") as handle:
+        run_command([sdust, str(source)], stdout=handle)
+    apply_soft_mask(source, intervals, output)
+    intervals.unlink()
+    if not output.is_file() or output.stat().st_size == 0:
+        raise RuntimeError(f"sdust did not create a nonempty FASTA: {output}")
+
+
+def run_sdust_parallel(
+    sdust: str,
+    source: Path,
+    output: Path,
+    threads: int,
+    total_bases: int,
+) -> None:
+    """sdust masks each record on its own, so chunks give the whole-assembly mask."""
+    mask_chunks_parallel(
+        source,
+        output,
+        threads,
+        total_bases,
+        "sdust",
+        lambda chunk, masked: run_sdust(sdust, chunk, masked),
+    )
 
 
 def output_basename(path: Path) -> str:
@@ -469,9 +588,10 @@ def prepare_one(
     inspection: FastaInspection,
     remask: bool,
     contignamefix: bool,
-    windowmasker: Optional[str],
+    masker_executable: Optional[str],
     samtools: str,
     threads: int = 1,
+    masker: str = "windowmasker",
 ) -> PreparationResult:
     prefix = expected_prefix(assembly.name)
     masking_ran = remask or not inspection.is_masked
@@ -489,12 +609,25 @@ def prepare_one(
             copy_uncompressed(assembly.fasta, windowmasker_input)
 
         if masking_ran:
-            if windowmasker is None:
-                raise RuntimeError("internal error: WindowMasker was not resolved")
+            if masker_executable is None:
+                raise RuntimeError(
+                    f"internal error: {MASKER_LABELS[masker]} was not resolved"
+                )
             masked = temporary / "masked.fa"
-            if threads > 1:
+            if masker == "sdust":
+                if threads > 1:
+                    run_sdust_parallel(
+                        masker_executable,
+                        windowmasker_input,
+                        masked,
+                        threads,
+                        inspection.bases,
+                    )
+                else:
+                    run_sdust(masker_executable, windowmasker_input, masked)
+            elif threads > 1:
                 run_windowmasker_parallel(
-                    windowmasker,
+                    masker_executable,
                     windowmasker_input,
                     temporary / "windowmasker.counts",
                     masked,
@@ -503,7 +636,7 @@ def prepare_one(
                 )
             else:
                 run_windowmasker(
-                    windowmasker,
+                    masker_executable,
                     windowmasker_input,
                     temporary / "windowmasker.counts",
                     masked,
@@ -513,7 +646,7 @@ def prepare_one(
             staged = temporary / "copied.fa"
             copy_uncompressed(assembly.fasta, staged)
 
-        # WindowMasker preserves FASTA IDs, so the input inspection determines
+        # Both maskers preserve FASTA IDs, so the input inspection determines
         # whether repair is needed. The resulting FASTA is inspected again below.
         if names_fixed:
             fixed = temporary / "namefixed.fa"
@@ -576,7 +709,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Prepare one FASTA or every FASTA in a PATs assembly list with "
-            "WindowMasker, optional contig-name repair, and samtools faidx."
+            "WindowMasker or sdust, optional contig-name repair, and samtools faidx."
         )
     )
     inputs = parser.add_mutually_exclusive_group(required=True)
@@ -604,14 +737,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "CPU budget. Without --jobs it is shared: min(assemblies, THREADS) "
             "assemblies are prepared at once, each masked with THREADS // that "
-            "many WindowMasker processes (genome-wide counts run once, then record "
-            "chunks are masked concurrently). With --jobs, WindowMasker processes "
-            "per assembly, about --jobs x --threads in total (default: %(default)s)"
+            "many masking processes (record chunks are masked concurrently; "
+            "WindowMasker counts once genome-wide first). With --jobs, masking "
+            "processes per assembly, about --jobs x --threads in total "
+            "(default: %(default)s)"
         ),
     )
     parser.add_argument(
         "--remask", action="store_true",
-        help="run WindowMasker even when lowercase soft masking is detected",
+        help="run the masker even when lowercase soft masking is detected",
+    )
+    parser.add_argument(
+        "--masker", choices=sorted(MASKER_LABELS), default="windowmasker",
+        help=(
+            "masker for unmasked inputs (and --remask): windowmasker masks "
+            "transposons and low-complexity sequence; sdust is much faster but "
+            "masks low-complexity sequence only, not transposons, which lowers "
+            "SV calling accuracy "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--contignamefix", action="store_true",
@@ -632,6 +776,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="output assembly-list path (default: OUTPUT/query_paths.prepared.txt)",
     )
     parser.add_argument("--windowmasker", default="windowmasker")
+    parser.add_argument("--sdust", default="sdust")
     parser.add_argument("--samtools", default="samtools")
     args = parser.parse_args(argv)
     if args.jobs is not None and args.jobs < 1:
@@ -682,7 +827,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     jobs, threads = share_threads(len(assemblies), args.jobs, args.threads)
     print(
         f"[prepare] {len(assemblies)} assemblies: {jobs} at once, "
-        f"{threads} WindowMasker process(es) each",
+        f"{threads} {MASKER_LABELS[args.masker]} process(es) each",
         flush=True,
     )
     inspections: Dict[str, FastaInspection] = {}
@@ -715,11 +860,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     samtools = find_executable(args.samtools)
-    needs_windowmasker = args.remask or any(
+    needs_masker = args.remask or any(
         not inspection.is_masked for inspection in inspections.values()
     )
-    windowmasker = (
-        find_executable(args.windowmasker) if needs_windowmasker else None
+    masker_executable = (
+        find_executable(args.sdust if args.masker == "sdust" else args.windowmasker)
+        if needs_masker else None
     )
 
     results: Dict[str, PreparationResult] = {}
@@ -732,9 +878,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 inspections[assembly.name],
                 args.remask,
                 args.contignamefix,
-                windowmasker,
+                masker_executable,
                 samtools,
                 threads,
+                args.masker,
             ): assembly
             for assembly in assemblies
         }
@@ -746,7 +893,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 errors.append(f"{assembly.name}: {error}")
                 continue
             results[assembly.name] = result
-            mask_action = "WindowMasker run" if result.masking_ran else "mask retained"
+            mask_action = (
+                f"{MASKER_LABELS[args.masker]} run" if result.masking_ran
+                else "mask retained"
+            )
             if result.names_fixed:
                 name_action = "contig names repaired"
             elif args.contignamefix:

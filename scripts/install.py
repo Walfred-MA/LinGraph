@@ -44,6 +44,7 @@ CONDA_PACKAGES: Tuple[str, ...] = (
     "blast>=2.14.0",
     "bcftools",
     "meryl",
+    "sdust",
 )
 PIP_ONLY_PACKAGES: Tuple[str, ...] = ("ssw-py", "parasail", "edlib")
 ROOT_BINARY_ALIASES = {
@@ -112,6 +113,7 @@ EXTERNAL_DEPENDENCIES: Tuple[ExternalDependency, ...] = (
     ExternalDependency("makeblastdb", "makeblastdb", "NCBI BLAST+"),
     ExternalDependency("bcftools", "bcftools", "bcftools"),
     ExternalDependency("meryl", "meryl", "meryl"),
+    ExternalDependency("sdust", "sdust", "sdust (prepare_assemblies.py --masker sdust)"),
     ExternalDependency(
         "Snakemake CLI", "snakemake", "snakemake 6.15.1 Python package",
         ("--version",), "6.15.1",

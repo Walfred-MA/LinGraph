@@ -253,6 +253,7 @@ installs:
 | Snakemake **6.15.1**, tabulate **0.8.10** | Pinned workflow versions |
 | HTSlib **≥1.19**, samtools | Indexed sequence access |
 | BLAST+ **≥2.14.0**, including WindowMasker | Alignment and assembly soft masking |
+| sdust | Optional fast assembly soft masking (`--masker sdust`) |
 | minimap2, Winnowmap2, meryl | Mapping and k-mer processing |
 | bcftools | VCF normalization, compression, and indexing |
 | numpy, polars ≥1.0, mappy, parasail, edlib, ssw-py | Python analysis and alignment libraries |
@@ -314,12 +315,23 @@ uses two preparations at once with about 8 masking processes each. The source
 FASTAs are not changed. **Use `prepared_assemblies/query_paths.prepared.txt`
 as the input list for calling.**
 
+WindowMasker is slow, but there is a much faster alternative: sdust. However,
+sdust masks only low-complexity sequence, not transposons, and drops SV calling
+accuracy by about 0.3–0.6%. To use it, add `--masker sdust`:
+
+```bash
+python scripts/LinGraph.py prepare \
+  -q raw_assemblies.list -O prepared_assemblies \
+  --contignamefix --masker sdust -t 16
+```
+
 | Option | Effect |
 | --- | --- |
 | `-q LIST` / `-i FASTA --name HG002_h1` | Prepare a list, or a single FASTA |
 | `-O DIR` | Output folder for prepared FASTAs, indexes, and the new list |
 | `--contignamefix` | Add the `SAMPLE#N#` prefix to contigs that lack it |
 | `--remask` | Regenerate soft masking even if the FASTA is already masked |
+| `--masker sdust` | Mask with sdust instead of WindowMasker (much faster, no transposon masking) |
 | `-t THREADS` | Total CPU budget, shared across inputs unless `-j` is set |
 | `-j JOBS` | Set the number of assemblies at once; with `-j`, `-t` is masking processes per assembly (about `-j × -t` CPUs) |
 

@@ -687,6 +687,18 @@ def reference(args, cohort, samples):
                 and (args.mode != 'individual' or name in dict(samples))):
             raise ValueError(f"Reference name {name} already identifies another FASTA")
         return name, fasta
+    # An existing cohort call keeps the reference it was called against
+    # (--merge-only/--recall-only/--gfa-only reuse it), not the first assembly.
+    run_config = absolute(args.output) / "inputs" / "cohort_call.run.json" if getattr(args, "output", None) else None
+    if args.mode == "graph" and run_config is not None and run_config.is_file():
+        try:
+            called = json.loads(run_config.read_text())
+        except ValueError:
+            called = {}
+        name = called.get("reference")
+        if name:
+            say(f"Reference from the existing cohort call ({run_config}): {name}")
+            return name, known.get(name, Path(called.get("reference_fasta") or ""))
     defaults = cohort or (samples if args.mode == "graph" else [])
     if defaults:
         return defaults[0]
@@ -1224,7 +1236,8 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
     merge_mode = cohort_merge.resolve_mode(args)
     vcf_inputs = cohort_merge.output_paths(output, merge_mode)
     # cohort.sv.vcf has no large singleton insertions: the merge publishes
-    # them to cohort.sv.10Ksingleton.vcf, which the graph does not use.
+    # them to cohort.sv.10Ksingleton.vcf, which the graph does not include
+    # (the GAF walks are told about them below).
     # The C++ exporter (GrvcfGraph) writes the GFA and every sample's GAF in one
     # assembly-free run: bases come from the merged grVCFs and the FASTAs above.
     if merge_mode == 'svonly' or args.insertion_only is not None:
@@ -1250,9 +1263,16 @@ def mc_graph(args, runner, graph, output, cohort, samples, ref):
                *template_options, "-o", output / "cohort.gfa", "--gaf", gaf, "-t", args.threads]
     if 'max_node_length' in settings:
         command += ["--max-node-length", settings['max_node_length']]
+    # The large singleton insertions are not in the graph: their carriers'
+    # GAF records break around them instead of losing the whole run.
+    singleton_size = getattr(args, 'large_singleton_size', cohort_merge.LARGE_SINGLETON_SIZE)
+    singletons = cohort_merge.large_singleton_path(output, singleton_size) if singleton_size else None
+    if singletons and (singletons.is_file() or args.dry_run):
+        command += ["--excluded-vcf", singletons]
     if getattr(args, 'gaf_threads', None):
         command += ["--gaf-threads", args.gaf_threads]
-    inputs = [*vcf_inputs, fixed, templates, *([loci] if loci.is_file() else []), tool]
+    inputs = [*vcf_inputs, fixed, templates, *([loci] if loci.is_file() else []), tool,
+              *([singletons] if singletons and singletons.is_file() else [])]
     if args.mode == 'individual':
         for value in args.alternative:
             fasta = absolute(value)

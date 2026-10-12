@@ -336,12 +336,37 @@ insertion has no nested rows or insertion SNPs). `--large-singleton-size BP`
 changes the size; `0` keeps them in `cohort.sv.vcf`. Tools that compare the
 merge with its inputs (lossless checks, `split`) need both SV files.
 
+The graph does not contain these rows, so the graph export passes
+`cohort.sv.10Ksingleton.vcf` to `GrvcfGraph --excluded-vcf`: a carrier's GAF
+record ends before each such insertion and the next starts after it
+(`excluded_row` in `SAMPLE.gaf.breaks.tsv`), instead of the whole run failing on
+the missing bases. Its other bases stay in the GAF.
+
 For a merge published before this, the tool gives the same layout:
 
 ```bash
 mv cohort.sv.vcf cohort.sv.full.vcf
 tools/largeSingletonFilter -i cohort.sv.full.vcf -o cohort.sv.vcf -x cohort.sv.10Ksingleton.vcf
 ```
+
+## Compare merged VCF variants with the GAF walks
+
+`tools/compare_vcf_gaf_stats.py` checks, per haplotype, that the variants its
+merged-VCF genotypes carry are the ones its GAF walks take: inserted bases
+(INS `SVLEN` against the bases walked on variant sequences), deleted bases
+(DEL `|SVLEN|` against the bases the walks jump over, minus one per SNP) and,
+with the SNP VCF, SNPs. Only the merged VCFs the graph was built from and the
+GrvcfGraph rGFA/GAFs are needed (no assemblies):
+
+```bash
+python tools/compare_vcf_gaf_stats.py -g cohort.gfa -a gaf/*.gaf \
+    -v cohort.sv.vcf cohort.indel.vcf [cohort.snp.vcf] -o vcf_gaf_stats.tsv
+```
+
+One line per sample plus a total; `match` is `no` where the counts differ (exit
+code 1). Records cut around excluded rows are read as one walk. It compares
+variant content, not coverage: bases a GAF does not cover are measured by
+`tools/check_gaf_lossless.py`.
 
 ## Merge two haplotype VCFs for benchmarking
 

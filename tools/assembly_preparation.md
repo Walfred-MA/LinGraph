@@ -57,7 +57,12 @@ samtools faidx assembly.namefixed.fa
 
 - A FASTA is considered soft-masked when at least one lowercase `a`, `c`, `g`,
   or `t` occurs in its sequence. An already masked FASTA skips WindowMasker.
-- `--remask` runs WindowMasker regardless of the detected input state.
+- `--remask` runs the masker regardless of the detected input state.
+- `--masker sdust` masks with sdust instead of WindowMasker. It is much faster
+  but masks only low-complexity sequence, not transposons, and drops SV calling
+  accuracy by about 0.3–0.6%. Its mask is the only one in the output: other
+  bases are uppercased. `install.py` installs sdust; `--sdust PATH` selects
+  another executable.
 - `--contignamefix` checks every identifier against the list name. For
   `HG002_h1`, valid identifiers are `HG002#1` or start with `HG002#1#`. A
   prefix is added only when necessary, and duplicate prefixes are collapsed.

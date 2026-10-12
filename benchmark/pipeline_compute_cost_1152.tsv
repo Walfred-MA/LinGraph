@@ -1,0 +1,23 @@
+Stage	Step	Job name	Units	Jobs counted	Compute time (h) [a]	CPU time (core-h) [b]	Queue time (h) [c]
+Preprocessing	Partition block matching	match	Batch	40	0.046	0.183	0.022
+Preprocessing	Sample extraction	extract-samples	Run	1	0.973	62.276	0.000
+Preprocessing	Local reference templates	local-templates	Run	1	0.000	0.000	0.000
+Preprocessing	Subtotal				1.019	62.459	0.022
+Graph construction and alignment	Novel loci discovery	discover-novel-loci	Run	1	1.039	33.244	0.000
+Graph construction and alignment	K-mer search	kmersearch	Haplotype	1152	38.916	622.669	0.519
+Graph construction and alignment	Partition alignment [d]	minset	Batch	304	1473.06	47137.86	NA
+Graph construction and alignment	Subtotal				1513.015	47793.773	0.519 [e]
+Linearization	Genome lift	lift	Haplotype	1152	21.021	672.676	6.773
+Linearization	Graph-CIGAR projection	gcigar	Haplotype	1152	472.903	15132.889	5.832
+Linearization	Gap filling	gapfill	Haplotype	1152	113.523	3632.729	0.436
+Linearization	Variant calling	vcf	Haplotype	1152	108.180	3461.760	0.445
+Linearization	Subtotal				715.627	22900.054	13.486
+Total					2229.661	70756.286	14.027 [e]
+
+Computational cost of the LinGraph pipeline stages for 1,152 haplotypes, excluding cohort merging.
+[a] Sum of SLURM job run times (sacct ElapsedRaw), excluding queue waiting. For each haplotype, batch or single-run step, the latest completed job is counted; failed, cancelled, out-of-memory and timed-out attempts are excluded.
+[b] Sum of run time x allocated CPUs.
+[c] Sum of time between job submission and start.
+[d] All 304 attempts of each batch's final round (20 batches), including failed attempts, whose completed partitions were retained. Counting only each batch's completed job gives 601.96 h (19262.69 core-h); the subtotal is then 641.915 h (19918.603 core-h).
+[e] Excludes minset queue time, which was not measured.
+Steps not run as SLURM jobs (assembly preparation and repeat masking; graph-build steps on the launching node) are not included. Values are sums of figures reported to 0.001 h (minset: 0.01 h).
