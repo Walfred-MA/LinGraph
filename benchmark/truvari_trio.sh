@@ -211,7 +211,7 @@ prep_vcf() {
         | sed -E 's/^##contig=<ID=([^,>]+).*/\1/' \
         | LC_ALL=C sort -u > "$existing_contigs" || true
 
-    comm -23 "$used_contigs" "$existing_contigs" > "$missing_contigs" || true
+    LC_ALL=C comm -23 "$used_contigs" "$existing_contigs" > "$missing_contigs" || true
 
     if [[ -s "$missing_contigs" ]]; then
         local nmiss

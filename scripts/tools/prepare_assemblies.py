@@ -459,12 +459,23 @@ def apply_soft_mask(source: Path, intervals: Path, output: Path) -> None:
     """
     pending = read_sdust_intervals(intervals)
     upcoming = next(pending, None)
+    name = b""
     current: List[Tuple[int, int]] = []
     first = 0
     offset = 0
+
+    def check_record() -> None:
+        # An interval past the record's end means sdust saw another sequence.
+        if current and max(stop for _start, stop in current) > offset:
+            raise RuntimeError(
+                f"sdust interval ends past record {name.decode(errors='replace')!r} "
+                f"({offset} bp) in {source}"
+            )
+
     with open_fasta(source) as input_handle, output.open("wb") as output_handle:
         for raw in input_handle:
             if raw.startswith(b">"):
+                check_record()
                 name = raw[1:].split(None, 1)[0]
                 current = []
                 while upcoming is not None and upcoming[0] == name:
@@ -489,6 +500,7 @@ def apply_soft_mask(source: Path, intervals: Path, output: Path) -> None:
             output_handle.write(line)
             output_handle.write(raw[len(body):])
             offset = end
+        check_record()
     if upcoming is not None:
         raise RuntimeError(
             f"sdust interval on {upcoming[0].decode(errors='replace')!r} does not "

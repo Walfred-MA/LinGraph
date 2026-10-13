@@ -145,9 +145,11 @@ def build_loci(templates, blocks, log=print, originals=None):
         for block in members:
             if runs and runs[-1][-1][4] == block[3]:
                 runs[-1].append(block)
-            elif runs and block[3] < runs[-1][-1][4]:
-                raise ValueError(f'overlapping original blocks {runs[-1][-1][5]} and {block[5]}')
             else:
+                # Overlapping blocks (neighbouring windows sharing bases) stay
+                # separate loci, each an independent contig under its own name.
+                if runs and block[3] < runs[-1][-1][4]:
+                    counts['overlapping_block_loci'] += 1
                 runs.append([block])
         for run in runs:
             start, end = run[0][3], run[-1][4]
