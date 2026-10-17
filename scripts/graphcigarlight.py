@@ -579,7 +579,10 @@ def graphicalign(allaligns, allow_gap = pathminsize):
                 if index %2 == 0 :
 
 
-                        if len(current_alignscores) ==0 or score > current_alignscores[-1][0]:
+                        # Rank exactly as current_alignscores does (score,
+                        # then earlier row) so equal-score duplicates cannot
+                        # take a segment from the hit that owns it.
+                        if len(current_alignscores) ==0 or [score, -(index//2)] > current_alignscores[-1]:
 
                                 if len(current_alignscores):
                                         allgroups[-1][-1] = coordinate

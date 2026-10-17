@@ -9,29 +9,36 @@ to the neighboring gap analysis.  Unchanged rows remain byte-identical;
 trimmed rows replace their input row in the output, and rows with no confident
 core are omitted.  The original alignment columns remain provenance.
 
-Internal positive gaps on each query contig are selected from the union of the
-effective column-3 query intervals.  Finite GenomeLift regions always mask
+Gap analysis first slices rows to their finalized query ownership, then
+projects those slices onto the reference. Touching query intervals remain
+separate so a zero-query-gap tandem boundary can be inspected. Finite GenomeLift regions always mask
 overlapping ``-inf`` rows; the remaining ``-inf`` rows are assigned by the
 same complete-alignment score and >=1000 threshold used by graphreftovcf.py.
-Every gap shorter than 100 bp is selected; larger gaps require more than 100
-uppercase A/C/G/T bases and an uppercase fraction greater than 0.2.  Gaps of
-1 Mb or more are never selected.
+Query gaps are selected when their weighted cost is strictly below
+``--maximum-gap`` (default 1,000,000): uppercase A/C/G/T costs one per base,
+lowercase a/c/g/t costs ten, and any ambiguous base makes the cost infinite.
+There is no minimum base count, fraction filter, or short-gap exception.
+For tandem copies, the same weighted cutoff applies to the complete inserted
+query sequence, including the projected duplicate and any intervening gap.
 
 The neighboring GenomeLift rows select the higher-priority side from columns
 13/14.  When the two graph-CIGAR edges describe a positive gap on the same
-reference contig whose span is plausible for the query gap, the complete query
-and reference gaps are aligned with 100-bp anchors on both sides.  Otherwise
+reference contig in the same direction, and the smaller of the query and
+reference gaps is strictly smaller than 1 Mb, the complete gaps are aligned with 100-bp
+anchors on both sides.  No reference/query gap-size ratio is required.  Otherwise
 the reference is extended away from the higher-priority block using the same
 size rule as the raw-reference flank rescue in
 ``graphcigartoref_persample.py``.  Anchor sequence participates in the
 alignment but is removed from the emitted query interval and graph CIGAR.
+Touching same-reference breakpoints with a positive query gap are emitted as
+a pure insertion without running the aligner.
 Overlapping same-reference breakpoints are emitted as a pure insertion: the
 insertion contains the query gap plus the lower-priority query sequence that
 projects across the reference overlap, which represents a tandem duplication.
 
 After query-gap alignment, positive same-reference gaps at exact query
-breakpoints are considered only when both neighboring anchors have overlapping
-extended query and reference alignment windows.  Those gaps are subtracted
+breakpoints are treated as pure deletions. The neighboring alignment windows
+do not need to overlap. Those gaps are subtracted
 from the union of all reference intervals represented by the query, and any
 uncovered piece is emitted as a pure deletion.  Pairs lacking either anchor,
 separated by unresolved query sequence, or overlapping on the query cannot
@@ -66,6 +73,7 @@ import bisect
 import dataclasses
 import functools
 import heapq
+import math
 import multiprocessing as mp
 import os
 import re
@@ -110,8 +118,7 @@ def default_pseudolinear_path(output_path: str) -> str:
 
 DEFAULT_ANCHOR = 100
 DEFAULT_MAXIMUM_GAP = 1_000_000
-DEFAULT_MINIMUM_UNMASKED = 100
-DEFAULT_MINIMUM_UNMASKED_FRACTION = 0.2
+MAXIMUM_TWO_SIDED_GAP = 1_000_000
 DEFAULT_REFERENCE_EXTENSION = 10_000
 DEFAULT_MAX_IMPUTE = 10_000
 OWNERSHIP_TIER_UNMAPPED = 0
@@ -475,7 +482,9 @@ def _clusters(
     end = ordered[0].query_coord.end
     members = [ordered[0]]
     for row in ordered[1:]:
-        if row.query_coord.start <= end:
+        # Touching owned intervals can project to overlapping reference
+        # intervals. Keep that boundary visible for tandem discovery.
+        if row.query_coord.start < end:
             end = max(end, row.query_coord.end)
             members.append(row)
             continue
@@ -1073,22 +1082,22 @@ def _same_reference(
     return left_path is not None and left_path == right_path
 
 
+def gap_sequence_cost(sequence: str) -> float:
+    """Count ACGT x1, acgt x10; ambiguity makes a gap ineligible (infinity)."""
+    uppercase = count_unmasked(sequence)
+    lowercase = sum(sequence.count(base) for base in "acgt")
+    if uppercase + lowercase != len(sequence):
+        return math.inf
+    return uppercase + 10 * lowercase
+
+
 def gap_is_eligible(
     gap_size: int,
-    unmasked: int,
+    weighted_cost: float,
     maximum_gap: int = DEFAULT_MAXIMUM_GAP,
-    minimum_unmasked: int = DEFAULT_MINIMUM_UNMASKED,
-    minimum_fraction: float = DEFAULT_MINIMUM_UNMASKED_FRACTION,
-    short_gap: int = DEFAULT_ANCHOR,
 ) -> bool:
-    if gap_size <= 0 or gap_size >= maximum_gap:
-        return False
-    if gap_size < short_gap:
-        return True
-    return (
-        unmasked > minimum_unmasked
-        and (unmasked / gap_size) > minimum_fraction
-    )
+    """Select nonempty query gaps using only the strict weighted cutoff."""
+    return gap_size > 0 and math.isfinite(weighted_cost) and weighted_cost < maximum_gap
 
 
 def discover_gap_tasks(
@@ -1098,8 +1107,6 @@ def discover_gap_tasks(
     reference_index: Mapping[str, Tuple[int, int, int, int]],
     query_genome: str,
     maximum_gap: int = DEFAULT_MAXIMUM_GAP,
-    minimum_unmasked: int = DEFAULT_MINIMUM_UNMASKED,
-    minimum_fraction: float = DEFAULT_MINIMUM_UNMASKED_FRACTION,
 ) -> Tuple[List[GapTask], Dict[str, int]]:
     by_contig: Dict[str, List[AnnotationRow]] = {}
     for row in annotations:
@@ -1129,24 +1136,16 @@ def discover_gap_tasks(
         ):
             _left_start, gap_start, left_members = left_cluster
             gap_end, _right_end, right_members = right_cluster
-            if gap_end <= gap_start:
+            if gap_end < gap_start:
                 continue
             stats["internal_gaps"] += 1
             gap_size = gap_end - gap_start
-            sequence = query_reader.fetch(contig, gap_start, gap_end, "+")
-            unmasked = count_unmasked(sequence)
-            if not gap_is_eligible(
-                gap_size,
-                unmasked,
-                maximum_gap,
-                minimum_unmasked,
-                minimum_fraction,
-                # The masking exception is fixed at <100 bp.  Changing the
-                # alignment-anchor length must not change gap eligibility.
-                DEFAULT_ANCHOR,
-            ):
-                stats["masked_or_large"] += 1
-                continue
+            if gap_size:
+                sequence = query_reader.fetch(contig, gap_start, gap_end, "+")
+                weighted_cost = gap_sequence_cost(sequence)
+                if not gap_is_eligible(gap_size, weighted_cost, maximum_gap):
+                    stats["masked_or_large"] += 1
+                    continue
             left_edge_rows = tuple(
                 row for row in left_members
                 if row.query_coord.end == gap_start
@@ -1229,13 +1228,13 @@ def discover_gap_tasks(
                     if selected_boundary.strand == "+"
                     else left_boundary.position - right_boundary.position
                 )
-                if reference_gap_size == 0:
+                if reference_gap_size == 0 and gap_size > 0:
                     # The query interval is absent from both neighboring rows
                     # but the two reference breakpoints touch. Preserve it as
                     # a pure insertion instead of silently dropping the gap.
                     insertion_start = gap_start
                     insertion_end = gap_end
-                    mode = "tandem-duplication"
+                    mode = "pure-insertion"
                     stats["zero_reference"] += 1
                     stats["query_insertion"] += 1
                 elif reference_gap_size < 0:
@@ -1270,24 +1269,44 @@ def discover_gap_tasks(
                         stats["unprojectable_tandem"] += 1
                         continue
                     mode = "tandem-duplication"
-                    stats["tandem_duplication"] += 1
 
-            # A bounded alignment must include the *complete* interval between
-            # the two reference breakpoints.  The former 1-kb cap sent every
-            # larger same-reference gap through the one-sided 10-kb rescue
-            # window.  For an unmodified reference sample, a 23,667-bp gap was
-            # consequently encoded as 13,667I + 10,000=; deletion discovery
-            # then emitted the missing 13,667-bp reference prefix as a false
-            # DEL.  Keep the existing three-times-query plausibility rule, but
-            # allow it across the same <maximum_gap range already accepted for
-            # query gaps.
-            bounded_limit = min(maximum_gap, 3 * gap_size)
+            # Zero query length needs a task only for a reference overlap.
+            # Positive reference gaps are emitted by deletion discovery;
+            # touching on both axes needs no new row.
+            if gap_size == 0 and mode != "tandem-duplication":
+                continue
+
             if mode == "tandem-duplication":
+                if insertion_start is None or insertion_end is None:
+                    stats["unprojectable_tandem"] += 1
+                    continue
+                insertion_size = insertion_end - insertion_start
+                if insertion_size <= 0:
+                    stats["unprojectable_tandem"] += 1
+                    continue
+                insertion_sequence = query_reader.fetch(
+                    contig, insertion_start, insertion_end, "+",
+                )
+                if not gap_is_eligible(
+                    insertion_size, gap_sequence_cost(insertion_sequence), maximum_gap,
+                ):
+                    stats["masked_or_large"] += 1
+                    continue
+                stats["tandem_duplication"] += 1
+
+            # Align the complete gap on both axes even when a large deletion
+            # leaves only a few unaligned query bases. A reference/query size
+            # ratio would route those cases to a short one-sided rescue window.
+            # Query neighbors already share a contig; same_reference also
+            # requires a shared reference chromosome and traversal direction.
+            if mode in {"pure-insertion", "tandem-duplication"}:
                 pass
             elif (
                 same_reference
                 and reference_gap_size is not None
-                and 0 < reference_gap_size < bounded_limit
+                and 0 < reference_gap_size
+                # The smaller of the two gaps sets the size cut.
+                and min(gap_size, reference_gap_size) < MAXIMUM_TWO_SIDED_GAP
             ):
                 mode = "bounded"
                 stats["bounded_reference"] += 1
@@ -2576,17 +2595,15 @@ def select_annotations_for_final_ownership(
     lift_by_allele: Mapping[str, object],
     max_impute: int = DEFAULT_MAX_IMPUTE,
 ) -> Tuple[List[AnnotationRow], Dict[str, int]]:
-    """Filter the analysis view to rows with at least one surviving owner.
+    """Slice the gap-analysis view to finalized PA-owned query intervals.
 
-    Ownership was already finalized and swapped into the GenomeLift overlay.
-    The graph-CIGAR rows were generated per block independently of ownership
-    in graphcigartoref_persample.py, so the analysis view keeps every
-    surviving row byte-identical: no interval clipping, no per-PA expansion,
-    and no CIGAR work.  A row is excluded only when every matching PA lost
-    ownership (pure ``-inf`` after finalization); rows with no matching
-    GenomeLift name are kept for backward compatibility.
+    Use the updated GenomeLift ownership to resolve overlapping source rows
+    before projecting their boundaries to the reference. Each distinct owned
+    interval of a merged annotation receives its own CIGAR slice and owner
+    names for priority lookup. Rows without matching GenomeLift names remain
+    unchanged. These analysis slices do not replace the trimmed source rows
+    saved alongside the generated gaps for the final pseudo-linear election.
     """
-    del max_impute
     retained: List[AnnotationRow] = []
     stats = {
         "input_rows": len(annotations),
@@ -2598,7 +2615,7 @@ def select_annotations_for_final_ownership(
     }
     for annotation in annotations:
         matched = [
-            lift_by_allele[allele]
+            (allele, lift_by_allele[allele])
             for allele in query_name_parts(annotation.query_name)
             if (
                 allele in lift_by_allele
@@ -2609,13 +2626,50 @@ def select_annotations_for_final_ownership(
         if matched:
             stats["logical_pa_rows"] += len(matched)
             owned = [
-                lift for lift in matched
+                (allele, lift) for allele, lift in matched
                 if not _lift_has_infinite_ownership(lift)
             ]
             stats["excluded_pa_rows"] += len(matched) - len(owned)
             if not owned:
                 stats["excluded_rows"] += 1
                 continue
+
+            owners_by_interval: Dict[Tuple[int, int], List[str]] = {}
+            for allele, lift in owned:
+                owned_start, owned_end = apply_interval_extensions_to_coord(
+                    lift.locus.start,
+                    lift.locus.end,
+                    lift.locus.strand,
+                    lift.left_extension,
+                    lift.right_extension,
+                    max_impute,
+                )
+                start = max(annotation.query_coord.start, owned_start)
+                end = min(annotation.query_coord.end, owned_end)
+                if end <= start:
+                    stats["excluded_pa_rows"] += 1
+                    continue
+                owners_by_interval.setdefault((start, end), []).append(allele)
+
+            if not owners_by_interval:
+                stats["excluded_rows"] += 1
+                continue
+
+            ordered_intervals = sorted(owners_by_interval)
+            for previous, current in zip(ordered_intervals, ordered_intervals[1:]):
+                if previous[1] > current[0]:
+                    raise ValueError(
+                        f"{annotation.query_name}: finalized ownership "
+                        f"intervals overlap: {previous} and {current}"
+                    )
+
+            slices = slice_annotation_query_intervals(annotation, ordered_intervals)
+            for interval in ordered_intervals:
+                owners = tuple(sorted(set(owners_by_interval[interval])))
+                row = dataclasses.replace(slices[interval], query_name=";".join(owners))
+                retained.append(row)
+                stats["retained_bases"] += interval[1] - interval[0]
+            continue
         else:
             stats["legacy_rows"] += 1
         retained.append(annotation)
@@ -2877,13 +2931,11 @@ def discover_reference_gap_deletions(
     query_genome: str,
     represented_deletions: Iterable[Tuple[str, int, int]] = (),
 ) -> Tuple[List[SyntheticDeletionRow], Dict[str, int]]:
-    """Call uncovered reference gaps only at an observed query breakpoint.
+    """Emit pure deletions for positive reference gaps at touching query rows.
 
-    Missing graph coverage is not, by itself, evidence of a deletion.  The
-    neighboring query annotations must meet exactly and their complete
-    alignment windows must overlap on both the query and reference axes.  If
-    either anchor is absent, the interval is unresolved/unassembled rather
-    than evidence for a biological deletion.
+    The flanks must share a query contig, reference chromosome, and reference
+    traversal direction. Overlap of their padded alignment windows is not
+    required. Subtract represented intervals to avoid duplicate absence calls.
     """
     represented_deletions = tuple(represented_deletions)
     coverage = reference_coverage_by_contig(
@@ -2903,7 +2955,6 @@ def discover_reference_gap_deletions(
         "positive_query_gaps_skipped": 0,
         "positive_query_gap_bases_skipped": 0,
         "query_overlaps_skipped": 0,
-        "unanchored_reference_gaps_skipped": 0,
     }
     for contig in sorted(by_contig):
         ordered = sorted(by_contig[contig], key=lambda row: (
@@ -2939,11 +2990,6 @@ def discover_reference_gap_deletions(
                 # breakpoint either.  They require ownership reconciliation,
                 # not an absence call inferred from missing graph coverage.
                 stats["query_overlaps_skipped"] += 1
-                continue
-            if not _deletion_anchors_have_overlapping_context(
-                left, right, reference_index,
-            ):
-                stats["unanchored_reference_gaps_skipped"] += 1
                 continue
             uncovered = _subtract_coverage(
                 gap_start, gap_end, coverage.get(path, ()),
@@ -2992,6 +3038,221 @@ def discover_reference_gap_deletions(
                     deletion_end - deletion_start
                 )
     return output, stats
+
+
+def _read_location_assignments(path: str) -> List[dict]:
+    """Location-layer rows of a pseudo-linear table (alternative sources excluded)."""
+    rows: List[dict] = []
+    with open(path, "rt") as handle:
+        header = handle.readline().rstrip("\r\n").split("\t")
+        for raw in handle:
+            if not raw.strip():
+                continue
+            row = dict(zip(header, raw.rstrip("\r\n").split("\t")))
+            if row.get("pa_path", "pri") == "alt":
+                continue
+            query = core.parse_coord(row.get("query_interval", ""))
+            if query is None:
+                continue
+            row["query"] = query
+            row["reference"] = core.parse_coord(row.get("reference_interval", ""))
+            rows.append(row)
+    return rows
+
+
+def elected_map_deletions(
+    pseudo_linear_path: str,
+    reference_index: Mapping[str, Tuple[int, int, int, int]],
+    query_genome: str,
+    represented_deletions: Iterable[Tuple[str, int, int]] = (),
+) -> Tuple[List[Tuple[SyntheticDeletionRow, dict]], Dict[str, int]]:
+    """Deletions implied by the elected location layer.
+
+    Along each query contig, two PRIMARY rows joined on the query only through
+    elected INSERTION/DELETION rows (no query gap, overlap or UNMAPPED row)
+    on the same reference contig and traversal direction, with a positive
+    reference gap between their edges, delete that gap minus the reference
+    the elected rows (or existing deletion rows) already map. An insertion
+    between them makes the event an insertion plus deletion. Returns each
+    deletion with its left PRIMARY row.
+    """
+    rows = _read_location_assignments(pseudo_linear_path)
+    coverage: Dict[str, List[Tuple[int, int]]] = {}
+    for row in rows:
+        reference = row["reference"]
+        if row.get("type") not in {"PRIMARY", "DELETION"} or reference is None:
+            continue
+        path = _resolve_reference_path(reference.chrom, reference_index)
+        if path is not None and reference.end > reference.start:
+            coverage.setdefault(path, []).append((reference.start, reference.end))
+    for path, start, end in represented_deletions:
+        resolved = _resolve_reference_path(path, reference_index)
+        if resolved is not None and end > start:
+            coverage.setdefault(resolved, []).append((start, end))
+    coverage = {path: _merge_intervals(spans) for path, spans in coverage.items()}
+
+    stats = {
+        "positive_reference_gaps": 0,
+        "reference_gap_bases": 0,
+        "reference_gap_covered_bases": 0,
+        "reference_deletions": 0,
+        "reference_deletion_bases": 0,
+        "positive_query_gaps_skipped": 0,
+        "positive_query_gap_bases_skipped": 0,
+        "query_overlaps_skipped": 0,
+        "insertion_joined_gaps": 0,
+    }
+    by_contig: Dict[str, List[dict]] = {}
+    for row in rows:
+        by_contig.setdefault(row["query"].chrom, []).append(row)
+    output: List[Tuple[SyntheticDeletionRow, dict]] = []
+    seen: set = set()
+    for contig in sorted(by_contig):
+        ordered = sorted(
+            by_contig[contig],
+            key=lambda row: (row["query"].start, row["query"].end),
+        )
+        left: Optional[dict] = None
+        joined_by_insertion = False
+        cursor: Optional[int] = None
+        for row in ordered:
+            query = row["query"]
+            if cursor is not None and query.start != cursor:
+                if query.start > cursor:
+                    stats["positive_query_gaps_skipped"] += 1
+                    stats["positive_query_gap_bases_skipped"] += query.start - cursor
+                else:
+                    stats["query_overlaps_skipped"] += 1
+                left, joined_by_insertion = None, False
+            cursor = query.end if cursor is None else max(cursor, query.end)
+            kind = row.get("type")
+            if kind == "INSERTION":
+                joined_by_insertion = joined_by_insertion or query.end > query.start
+                continue
+            if kind == "DELETION":
+                continue
+            if kind != "PRIMARY" or row["reference"] is None:
+                left, joined_by_insertion = None, False
+                continue
+            right = row
+            pair_left, insertion_between = left, joined_by_insertion
+            left, joined_by_insertion = right, False
+            if pair_left is None:
+                continue
+            left_ref, right_ref = pair_left["reference"], right["reference"]
+            left_same = pair_left["query"].strand == left_ref.strand
+            if (
+                left_ref.chrom != right_ref.chrom
+                or left_same != (right["query"].strand == right_ref.strand)
+            ):
+                continue
+            path = _resolve_reference_path(left_ref.chrom, reference_index)
+            if path is None:
+                continue
+            if left_same:
+                gap_start, gap_end = left_ref.end, right_ref.start
+            else:
+                gap_start, gap_end = right_ref.end, left_ref.start
+            if gap_end <= gap_start:
+                continue
+            stats["positive_reference_gaps"] += 1
+            stats["reference_gap_bases"] += gap_end - gap_start
+            uncovered = _subtract_coverage(gap_start, gap_end, coverage.get(path, ()))
+            uncovered_bases = sum(end - start for start, end in uncovered)
+            stats["reference_gap_covered_bases"] += (
+                gap_end - gap_start - uncovered_bases
+            )
+            if uncovered and insertion_between:
+                stats["insertion_joined_gaps"] += 1
+            query_point = pair_left["query"].end
+            reference_name = (
+                pair_left.get("reference_pa")
+                if pair_left.get("reference_pa") not in {None, "", "."}
+                else right.get("reference_pa", ".")
+            )
+            for deletion_start, deletion_end in uncovered:
+                key = (path, deletion_start, deletion_end, contig, query_point)
+                if key in seen:
+                    continue
+                seen.add(key)
+                safe_path = re.sub(r"[^A-Za-z0-9]+", "p", path).strip("p")
+                output.append((SyntheticDeletionRow(
+                    query_name=(
+                        f"DEL{safe_path}p{deletion_start}p{deletion_end}_"
+                        f"{query_genome}_{len(output) + 1}"
+                    ),
+                    query_coord=core.Coord(
+                        contig, query_point, query_point,
+                        pair_left["query"].strand,
+                    ),
+                    ref_name=reference_name,
+                    ref_coord=core.Coord(path, deletion_start, deletion_end, "+"),
+                ), pair_left))
+                stats["reference_deletions"] += 1
+                stats["reference_deletion_bases"] += deletion_end - deletion_start
+    return output, stats
+
+
+def append_elected_deletions(
+    output_path: str,
+    pseudo_linear_path: str,
+    deletions: Sequence[Tuple[SyntheticDeletionRow, dict]],
+    reference_lengths: Mapping[str, int],
+) -> Tuple[int, int]:
+    """Append deletion rows to the graph-CIGAR table and, citing those lines,
+    DELETION assignments to the pseudo-linear table. Returns (rows, bases)."""
+    with open(output_path, "rt") as handle:
+        line_count = sum(1 for _ in handle)
+    with open(pseudo_linear_path, "rt") as handle:
+        header = handle.readline().rstrip("\r\n").split("\t")
+        last_id = 0
+        for raw in handle:
+            identifier = raw.split("\t", 1)[0]
+            if identifier[1:].isdigit():
+                last_id = max(last_id, int(identifier[1:]))
+    graph_lines: List[str] = []
+    assignment_lines: List[str] = []
+    bases = 0
+    for row, left in deletions:
+        rendered = render_synthetic_deletion_or_warn(
+            row, reference_lengths[row.ref_coord.chrom], "fill_graphcigartoref_gaps",
+        )
+        if rendered is None:
+            continue
+        fields = rendered.split("\t")
+        graph_lines.append(rendered)
+        reference = core.parse_coord(fields[3])
+        bases += reference.end - reference.start
+        last_id += 1
+        values = {
+            "assignment_id": f"A{last_id}",
+            "pa_name": ".",
+            "query_interval": fields[2],
+            "type": "DELETION",
+            "reference_interval": fields[3],
+            "reference_alignment_cigar": fields[6],
+            "alternative_interval": ".",
+            "alternative_alignment_cigar": ".",
+            "reference_pa": row.ref_name,
+            "operation": "D",
+            "source_line": f"line:{line_count + len(graph_lines)}",
+            "anchor": ".", "dependency": ".", "dup_group": ".",
+            "insertion_group": ".", "insertion_anchor_interval": ".",
+            "region_tier": left.get("region_tier", "."),
+            "trimmed": "0", "encoded": "0",
+            "lift_stage": left.get("lift_stage", "."),
+            "secondary_lift": "0", "lift_kind": "location", "lift_role": "main",
+            "alignment_score": "0.000000", "resurrected_lift": "0",
+            "pa_path": "pri",
+        }
+        assignment_lines.append("\t".join(values.get(name, ".") for name in header))
+    with open(output_path, "at") as handle:
+        for line in graph_lines:
+            handle.write(line + "\n")
+    with open(pseudo_linear_path, "at") as handle:
+        for line in assignment_lines:
+            handle.write(line + "\n")
+    return len(graph_lines), bases
 
 
 def _build_tandem_duplication_row(
@@ -3074,7 +3335,7 @@ def build_gap_row(
     anchor: int = DEFAULT_ANCHOR,
     maximum_reference_extension: int = DEFAULT_REFERENCE_EXTENSION,
 ) -> str:
-    if task.mode == "tandem-duplication":
+    if task.mode in {"pure-insertion", "tandem-duplication"}:
         return _build_tandem_duplication_row(
             task, query_reader, reference_reader,
         )
@@ -3118,14 +3379,17 @@ def build_gap_row(
         # A one-sided alignment must remain connected to the selected
         # neighboring block's reference boundary.  Keep a terminal deletion
         # only on that core-facing side; terminal reference sequence on the
-        # far/search-window side is not owned by this query gap.  Bounded
-        # alignments use query anchors on both sides and retain neither outer
-        # boundary deletion after those anchors are removed.
+        # far/search-window side is not owned by this query gap. Bounded
+        # alignments have anchors on both sides: a deletion exactly at either
+        # inner slice boundary belongs to the gap and must survive removing
+        # the anchors (e.g. 100=1000D5=100= becomes 1000D5=).
         include_left_boundary_deletions=(
-            task.mode == "one-sided" and task.selected_side == "left"
+            task.mode == "bounded"
+            or (task.mode == "one-sided" and task.selected_side == "left")
         ),
         include_right_boundary_deletions=(
-            task.mode == "one-sided" and task.selected_side == "right"
+            task.mode == "bounded"
+            or (task.mode == "one-sided" and task.selected_side == "right")
         ),
     )
     if core.graph_cigar_query_span(graph_cigar, task.name) != gap_size:
@@ -3486,14 +3750,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="fork",
     )
     parser.add_argument("--anchor", type=int, default=DEFAULT_ANCHOR)
-    parser.add_argument("--maximum-gap", type=int, default=DEFAULT_MAXIMUM_GAP)
     parser.add_argument(
-        "--minimum-unmasked", type=int, default=DEFAULT_MINIMUM_UNMASKED,
+        "--maximum-gap", type=int, default=DEFAULT_MAXIMUM_GAP,
+        help="exclusive query-gap cost limit (ACGT x1, acgt x10; ambiguity rejected)",
+    )
+    parser.add_argument(
+        "--minimum-unmasked", type=int, default=None,
+        help="deprecated; ignored under the weighted gap-cost rule",
     )
     parser.add_argument(
         "--minimum-unmasked-fraction",
         type=float,
-        default=DEFAULT_MINIMUM_UNMASKED_FRACTION,
+        default=None,
+        help="deprecated; ignored under the weighted gap-cost rule",
     )
     parser.add_argument(
         "--maximum-reference-extension",
@@ -3526,10 +3795,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--anchor must be >= 1")
     if args.maximum_gap < 1:
         parser.error("--maximum-gap must be >= 1")
-    if args.minimum_unmasked < 0:
-        parser.error("--minimum-unmasked must be >= 0")
-    if not 0 <= args.minimum_unmasked_fraction <= 1:
-        parser.error("--minimum-unmasked-fraction must be between 0 and 1")
+    if args.minimum_unmasked is not None or args.minimum_unmasked_fraction is not None:
+        sys.stderr.write(
+            "[fill_graphcigartoref_gaps] --minimum-unmasked and "
+            "--minimum-unmasked-fraction are deprecated and ignored; "
+            "selection uses the weighted --maximum-gap cutoff\n"
+        )
     if args.maximum_reference_extension < 1:
         parser.error("--maximum-reference-extension must be >= 1")
     if args.max_impute < 0:
@@ -3684,8 +3955,6 @@ def run(args: argparse.Namespace) -> int:
             primary_reference_index,
             query_genome,
             args.maximum_gap,
-            args.minimum_unmasked,
-            args.minimum_unmasked_fraction,
         )
     finally:
         query_reader.handle.close()
@@ -3754,12 +4023,17 @@ def run(args: argparse.Namespace) -> int:
         annotation_from_tsv(row, len(input_annotations) + index + 1)
         for index, row in enumerate(rows)
     ]
-    deletion_rows, deletion_stats = discover_reference_gap_deletions(
-        tuple(analysis_annotations) + tuple(generated_annotations),
-        lift_by_allele,
-        primary_reference_index,
-        query_genome,
-        represented_deletions,
+    # With a pseudo-linear table, deletions are derived after the election
+    # from the elected map (append_elected_deletions below), so the graph-CIGAR
+    # DEL rows and the DELETION assignments agree with the elected flanks.
+    deletion_rows, deletion_stats = ([], {}) if pseudo_linear_path else (
+        discover_reference_gap_deletions(
+            tuple(analysis_annotations) + tuple(generated_annotations),
+            lift_by_allele,
+            primary_reference_index,
+            query_genome,
+            represented_deletions,
+        )
     )
     chrom_lengths = reference_lengths
     rendered_deletions = []
@@ -3793,12 +4067,32 @@ def run(args: argparse.Namespace) -> int:
         args.gaps_only,
     )
     assignment_counts = {}
+    emitted_deletions = len(rendered_deletions)
     if pseudo_linear_path:
         assignment_counts = pseudolinear.build_assignments(
             output_path,
             (genomelift_path, genomelift_fix_path),
             pseudo_linear_path,
             args.max_impute,
+        )
+        deletions, deletion_stats = elected_map_deletions(
+            pseudo_linear_path,
+            primary_reference_index,
+            query_genome,
+            represented_deletions,
+        )
+        emitted_deletions, rendered_deletion_bases = append_elected_deletions(
+            output_path, pseudo_linear_path, deletions, chrom_lengths,
+        )
+        assignment_counts = dict(assignment_counts)
+        assignment_counts["DELETION"] = (
+            assignment_counts.get("DELETION", 0) + emitted_deletions
+        )
+        sys.stderr.write(
+            "[fill_graphcigartoref_gaps] elected-map deletions: "
+            f"{emitted_deletions} row(s) ({rendered_deletion_bases} bp), "
+            f"{deletion_stats['insertion_joined_gaps']} joined through an "
+            "elected insertion (insertion plus deletion)\n"
         )
     deletion_elapsed = time.monotonic() - deletion_started
     sys.stderr.write(
@@ -3812,10 +4106,8 @@ def run(args: argparse.Namespace) -> int:
         f"({deletion_stats['positive_query_gap_bases_skipped']} query bp) "
         "with unresolved query sequence and "
         f"{deletion_stats['query_overlaps_skipped']} pair(s) with query "
-        "overlap, and "
-        f"{deletion_stats['unanchored_reference_gaps_skipped']} pair(s) "
-        "without overlapping extended query/reference anchors; emitted "
-        f"{len(rendered_deletions)}/"
+        "overlap; emitted "
+        f"{emitted_deletions}/"
         f"{deletion_stats['reference_deletions']} uncovered deletion row(s) "
         f"({rendered_deletion_bases} bp); alignment "
         f"{alignment_elapsed:.2f}s, deletion/output "

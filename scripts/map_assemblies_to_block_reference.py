@@ -1429,11 +1429,15 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         help="target FASTA already containing blocked reference plus novels",
     )
     parser.add_argument("-o", "--output", required=True, help="output BED")
+    parser.add_argument("--threads", type=int, default=DEFAULT_THREADS,
+                        help="alignment thread budget (default: up to 50)")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if args.threads < 1:
+        raise ValueError("--threads must be positive")
     if shutil.which("minimap2") is None:
         raise FileNotFoundError("Required executable not found on PATH: minimap2")
     if shutil.which("sort") is None:
@@ -1449,9 +1453,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }:
         raise ValueError("-o/--output must differ from -q and -t")
 
-    # The command line intentionally exposes only q/t/o. All behavior below is
-    # the fixed policy requested for this mapper.
-    args.threads = DEFAULT_THREADS
+    # Preserve the established mapping policy; only the CPU budget is tunable.
     args.min_identity = MIN_IDENTITY
     args.min_alignment_bp = MIN_ALIGNMENT_BP
     args.min_residual_unmasked = MIN_RESIDUAL_UNMASKED

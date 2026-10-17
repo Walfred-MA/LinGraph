@@ -1066,8 +1066,12 @@ def _final_stage_kmer_differences(fields, part_index: int) -> dict:
                 difference = float(raw_difference)
             except ValueError:
                 continue
-            if not reference or not math.isfinite(difference) or difference < 0:
+            if not reference or not math.isfinite(difference):
                 continue
+            # RefMatch distance is 1 - ratio with ratio <= 1, so a negative
+            # value is float32 rounding for (near-)identical copies: keep it
+            # as 0 rather than dropping the best candidate.
+            difference = max(0.0, difference)
             result[reference] = min(
                 difference, result.get(reference, math.inf),
             )
@@ -1082,10 +1086,9 @@ def _final_stage_kmer_differences(fields, part_index: int) -> dict:
     if (
         best not in {"", ".", "NA", "na", "None", "none"}
         and math.isfinite(best_difference)
-        and best_difference >= 0
     ):
         result[best] = min(
-            best_difference, result.get(best, math.inf),
+            max(0.0, best_difference), result.get(best, math.inf),
         )
     return result
 

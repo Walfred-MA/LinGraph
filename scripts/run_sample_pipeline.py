@@ -353,6 +353,20 @@ def build_hotspot_stages(
     ]
 
 
+def query_allele_label(sample: str, reference_sample: str) -> str:
+    """Label for the query's alleles in refmatch, GenomeLift, and later stages.
+
+    Query and reference alleles are told apart only by this label
+    (``GRAPH_LABEL_N``). When the reference assembly is itself the query, as
+    for a control run, its alleles get a distinct internal label; files,
+    folders, and contig names keep the sample name.
+    """
+    if sample != reference_sample:
+        return sample
+    base, haplotype = sample.rsplit("_", 1)
+    return f"{base}self_{haplotype}"
+
+
 def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePaths, List[Stage]]:
     output_root = clean_path(args.output_root, "--output-root")
     graph_folder = clean_path(args.graph_folder, "--graph-folder")
@@ -367,6 +381,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
     paths = output_paths(
         output_root, args.sample, reference_align, reference_blocks,
     )
+    query_label = query_allele_label(args.sample, args.reference_sample)
 
     align_threads = args.align_threads or args.threads
     summary_jobs = args.summary_jobs or min(args.threads, 16)
@@ -500,7 +515,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
     match_arguments: List[object] = [
         "--bed-query", paths.query_blocks,
         "--fasta-query", fasta_query,
-        "--sample-query", args.sample,
+        "--sample-query", query_label,
         "--bed-ref", paths.reference_blocks,
         "--fasta-ref", fasta_reference,
         "--sample-ref", args.reference_sample,
@@ -550,7 +565,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
         "-m", f"{paths.genomelift},{paths.genomeliftfix}",
         "--pseudo-linear-assignments", paths.pseudolinear,
         "-o", template_vcf,
-        "--columns", args.sample,
+        "--columns", query_label,
         "-t", args.threads,
         "--format-processes", args.format_processes,
         "--edge-blackregion", args.edge_blackregion,
@@ -591,7 +606,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
                 "--genomelift", paths.genomelift,
                 "--align-query", paths.query_align,
                 "--align-ref", paths.reference_align,
-                "--query-genome", args.sample,
+                "--query-genome", query_label,
                 "--refhaplo", args.reference_sample,
                 "--fasta-query", fasta_query,
                 "-G", graph_folder,
@@ -627,7 +642,7 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
                 "--genomelift", paths.genomelift,
                 "--genomelift-fix-output", paths.genomeliftfix,
                 "--pseudo-linear-output", paths.pseudolinear,
-                "--query-genome", args.sample,
+                "--query-genome", query_label,
                 "--fasta-query", fasta_query,
                 "--reference", fasta_reference,
                 "--local-reference-templates", paths.local_templates,
@@ -701,6 +716,51 @@ def build_stages(args: argparse.Namespace, script_dir: Path) -> Tuple[PipelinePa
                 inputs=(template_vcf, *loci_outputs[:2],
                         script_dir / "alternative_coordinates.py"),
                 outputs=(paths.vcf,),
+            ),
+        ))
+    if args.remaining_gaps:
+        # Optional: gaps the gap fill left (UNMAPPED query between collinear
+        # anchors, any size) are aligned with k-mer blocks. The events go to a
+        # separate table; the VCF stages above are unchanged.
+        tools_dir = next((folder for folder in (script_dir / "tools", script_dir.parent / "tools")
+                          if (folder / "fill_remaining_gaps.py").is_file()), script_dir / "tools")
+        blockmatchdp = args.blockmatchdp or (
+            str(script_dir / "BlockMatchDP") if (script_dir / "BlockMatchDP").is_file()
+            else "BlockMatchDP")
+        query_dir = paths.vcf.parent
+        gaps_prefix = query_dir / f"{args.sample}.remaining_gaps"
+        sv_prefix = query_dir / f"{args.sample}.remaining_sv"
+        gaps_bed = Path(str(gaps_prefix) + ".query.bed")
+        stages.extend((
+            Stage(
+                name="remaining_gaps_find",
+                command=script_command(
+                    tools_dir, "find_pseudolinear_gaps.py", paths.pseudolinear,
+                    "--min-size", 0, "-o", gaps_prefix,
+                    # Only gaps the gap fill would trust: both anchors at its
+                    # complete-row score gate, and no N in either gap.
+                    "--min-anchor-score", 1000,
+                    "--fasta-query", fasta_query, "--fasta-reference", fasta_reference,
+                    # Safety check: placed blocks within 1 Mb on each side vote,
+                    # the contig extends >= 1 Mb beyond the gap, GenomeLift agrees.
+                    "--vote-window", 1_000_000,
+                    "--genomelift", f"{paths.genomelift},{paths.genomeliftfix}",
+                ),
+                inputs=(paths.pseudolinear, fasta_query, fasta_query_index,
+                        fasta_reference, fasta_reference_index,
+                        paths.genomelift, paths.genomeliftfix),
+                outputs=(gaps_bed,),
+            ),
+            Stage(
+                name="remaining_gaps_align",
+                command=script_command(
+                    tools_dir, "fill_remaining_gaps.py",
+                    "--gaps", gaps_bed, "-q", fasta_query, "-r", fasta_reference,
+                    "-o", sv_prefix, "--blockmatchdp", blockmatchdp, "-T", args.threads,
+                ),
+                inputs=(gaps_bed, fasta_query, fasta_reference),
+                outputs=(Path(str(sv_prefix) + ".events.tsv"),
+                         Path(str(sv_prefix) + ".summary.tsv")),
             ),
         ))
     return paths, stages
@@ -1145,6 +1205,22 @@ def build_parser() -> argparse.ArgumentParser:
             "comma-separated exact non-reference allele names allowed to "
             "seed GenomeLift tags, or 'all' (default: none)"
         ),
+    )
+    parser.add_argument(
+        "--remaining-gaps",
+        action="store_true",
+        help=(
+            "after the gap fill, align every remaining gap (UNMAPPED query "
+            "between collinear anchors) with k-mer blocks "
+            "(tools/fill_remaining_gaps.py); writes SAMPLE.remaining_sv.events.tsv "
+            "next to the VCF (default: off)"
+        ),
+    )
+    parser.add_argument(
+        "--blockmatchdp",
+        default="",
+        help="BlockMatchDP executable for --remaining-gaps (default: the one beside "
+             "the pipeline scripts, else PATH)",
     )
     parser.add_argument("--merge-gap", type=int, default=30000)
     parser.add_argument("--timeout", type=int, default=3600)

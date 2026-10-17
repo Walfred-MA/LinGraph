@@ -6,6 +6,16 @@ threads="${3:-4}"
 simi="${4:-90}"
 size="${5:-150}"
 mode="${6:-nonmasking}" # 'nonmask' (default) or 'mask'
+aligner="${7:-winnowmap}" # 'winnowmap' (default) or 'minimap2' (nonmasking only)
+
+if [[ "$aligner" != "winnowmap" && "$aligner" != "minimap2" ]]; then
+    echo "runwinnowmaplight.sh: unknown aligner '$aligner'" >&2
+    exit 2
+fi
+if [[ "$aligner" == "minimap2" && "$mode" == "masking" ]]; then
+    echo "runwinnowmaplight.sh: masking mode needs Winnowmap's -W k-mer file" >&2
+    exit 2
+fi
 
 # Set base options common to both modes
 base_opts=" -t $threads -cx asm5 --secondary=yes "
@@ -28,7 +38,7 @@ else
     extra_opts="-k 19 -w 10 -m 300 -p 0.05 "
 fi
 
-winnowmap $extra_opts $base_opts "$database" "$query" 2>/dev/null |
+"$aligner" $extra_opts $base_opts "$database" "$query" 2>/dev/null |
 
 awk -v cutoff=$size -v simicutoff=$simi '
 BEGIN {

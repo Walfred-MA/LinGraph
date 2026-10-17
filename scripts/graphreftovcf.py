@@ -3679,9 +3679,9 @@ def parse_row_events(
                     query=query_rec.name,
                 )
                 # A bracketed reference-only row emitted by
-                # graphcigartoref_persample is an explicit absence call, not
-                # evidence that the sample covers the deleted reference span.
-                deletion_owned = object_interval_is_owned(
+                # graphcigartoref_persample is an explicit absence call; it
+                # counts as coverage below only once it is called.
+                deletion_owned = None if pa_metadata_only else object_interval_is_owned(
                     query_rec, base_label, qpos, qpos,
                 )
                 # In pseudo-linear mode a D reaches this caller only inside an
@@ -3702,6 +3702,9 @@ def parse_row_events(
                     filtered_spans.append((query_rec.name, ref_rec.contig, g0, g1 if g1 > g0 else g0 + 1))
                     rpos += op.n
                     continue
+                # A synthetic deletion called as a variant maps its span.
+                if synthetic_reference_deletion and inside_contig_keep(qpos, qpos):
+                    _add_coverage_span(coverage_spans, query_rec.name, ref_rec, f0, f1)
                 qg0, qg1 = query_rec.genomic_interval_from_local(qpos, qpos)
                 add_variant({
                     "kind": "sv",

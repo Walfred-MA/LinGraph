@@ -96,6 +96,10 @@ def alignment_mode_protocol(args: argparse.Namespace) -> str:
     """Return the final-output mode marker used for safe resume decisions."""
     if bool(getattr(args, "slow_rigorous", False)):
         mode = "slow-rigorous-v1;blastn=all;winnowmap=all"
+        if getattr(args, "primary_aligner", "blastn") == "minimap2":
+            mode = "slow-rigorous-v1;minimap2=all;winnowmap=all"
+            if getattr(args, "no_winnowmap", False):
+                mode = "slow-rigorous-v1;minimap2=all;winnowmap=none"
     elif bool(getattr(args, "fast_mode", False)):
         mode = "fast-mode-v2;max-unmapped-gap=50"
     elif bool(getattr(args, "cycle", False)):
@@ -1569,54 +1573,76 @@ def run_fast_direct_alignment(
         "enabled" if use_masked_alignment else "disabled",
     )
 
-    combined_sam = os.path.join(work_root, "fast_blastn.sam")
-    blast_query_fasta, blast_query_aliases = alias_long_blast_query_ids(
-        oriented_fasta,
-        os.path.join(work_root, "fast_blast_queries.fasta"),
-    )
-    if blast_query_aliases:
-        info(
-            "BLAST local-ID compatibility: replaced %d query ID(s) longer "
-            "than %d bytes with Q-number aliases; full names will be restored",
-            len(blast_query_aliases), BLAST_LOCAL_ID_MAXIMUM,
-        )
-    blast_database = ensure_graph_blast_database(
-        graph_fasta, tools, args.timeout,
-    )
-    repeat_options = (
-        ["-dust", "yes", "-lcase_masking"] if use_masked_alignment else []
-    )
-    if completed_command_output(combined_sam):
-        info("RESUME: reusing completed bulk BLASTN output: %s", combined_sam)
+    primary_aligner = getattr(args, "primary_aligner", "blastn")
+    if primary_aligner == "minimap2":
+        # minimap2 replaces only the bulk BLASTN pass. It writes the same
+        # legacy SAM layout as the Winnowmap batches, so evidence pooling and
+        # conversion below are unchanged.
+        combined_sam = os.path.join(work_root, "fast_minimap2.sam")
+        if completed_command_output(combined_sam):
+            info("RESUME: reusing completed bulk minimap2 output: %s", combined_sam)
+        else:
+            for stale in (combined_sam, combined_sam + ".complete"):
+                try:
+                    os.remove(stale)
+                except FileNotFoundError:
+                    pass
+            with open(combined_sam, "wb") as alignment_output:
+                run_graph_alignment_command([
+                    "bash", graph_alignment_tool(tools, "runwinnowmaplight.sh"),
+                    oriented_fasta, graph_fasta, str(args.threads),
+                    str(BLAST_IDENTITY), "300", "nonmasking", "minimap2",
+                ], stdout=alignment_output, timeout=args.timeout)
+            mark_command_output_complete(combined_sam)
     else:
-        for stale in (combined_sam, combined_sam + ".complete"):
-            try:
-                os.remove(stale)
-            except FileNotFoundError:
-                pass
-        run_graph_alignment_command([
-            "bash", graph_alignment_tool(tools, "runblastn"),
-            "-task", "megablast", "-query", blast_query_fasta,
-            "-db", blast_database, "-gapopen", "10", "-gapextend", "2",
-            "-word_size", "30", "-perc_identity", str(BLAST_IDENTITY),
-            *repeat_options,
-            "-evalue", "1e-200", "-outfmt", "17", "-out", combined_sam,
-            # Query_N is usable for single-record BLAST but is too fragile for a
-            # bulk query. Preserve each FASTA ID in the SAM so byte-offset
-            # routing is based on the real query name rather than an inferred
-            # ordinal.
-            "-parse_deflines",
-            "-num_threads", str(args.threads), "-max_target_seqs", "100",
-        ], timeout=args.timeout)
-        restored_rows = restore_blast_query_ids(
-            combined_sam, blast_query_aliases,
+        combined_sam = os.path.join(work_root, "fast_blastn.sam")
+        blast_query_fasta, blast_query_aliases = alias_long_blast_query_ids(
+            oriented_fasta,
+            os.path.join(work_root, "fast_blast_queries.fasta"),
         )
         if blast_query_aliases:
             info(
-                "Restored full query IDs in %d BLAST SAM alignment row(s)",
-                restored_rows,
+                "BLAST local-ID compatibility: replaced %d query ID(s) longer "
+                "than %d bytes with Q-number aliases; full names will be restored",
+                len(blast_query_aliases), BLAST_LOCAL_ID_MAXIMUM,
             )
-        mark_command_output_complete(combined_sam)
+        blast_database = ensure_graph_blast_database(
+            graph_fasta, tools, args.timeout,
+        )
+        repeat_options = (
+            ["-dust", "yes", "-lcase_masking"] if use_masked_alignment else []
+        )
+        if completed_command_output(combined_sam):
+            info("RESUME: reusing completed bulk BLASTN output: %s", combined_sam)
+        else:
+            for stale in (combined_sam, combined_sam + ".complete"):
+                try:
+                    os.remove(stale)
+                except FileNotFoundError:
+                    pass
+            run_graph_alignment_command([
+                "bash", graph_alignment_tool(tools, "runblastn"),
+                "-task", "megablast", "-query", blast_query_fasta,
+                "-db", blast_database, "-gapopen", "10", "-gapextend", "2",
+                "-word_size", "30", "-perc_identity", str(BLAST_IDENTITY),
+                *repeat_options,
+                "-evalue", "1e-200", "-outfmt", "17", "-out", combined_sam,
+                # Query_N is usable for single-record BLAST but is too fragile for a
+                # bulk query. Preserve each FASTA ID in the SAM so byte-offset
+                # routing is based on the real query name rather than an inferred
+                # ordinal.
+                "-parse_deflines",
+                "-num_threads", str(args.threads), "-max_target_seqs", "100",
+            ], timeout=args.timeout)
+            restored_rows = restore_blast_query_ids(
+                combined_sam, blast_query_aliases,
+            )
+            if blast_query_aliases:
+                info(
+                    "Restored full query IDs in %d BLAST SAM alignment row(s)",
+                    restored_rows,
+                )
+            mark_command_output_complete(combined_sam)
     blast_offsets = index_fast_sam_offsets(combined_sam, prepared)
     blast_rows = sum(map(len, blast_offsets.values()))
     evidence: DefaultDict[str, List[FastSamSource]] = defaultdict(list)
@@ -1624,7 +1650,8 @@ def run_fast_direct_alignment(
         name = item.prepared.query_name
         evidence[name].append((combined_sam, tuple(blast_offsets.get(name, ()))))
     info(
-        "Fast BLASTN indexed %d SAM records for %d/%d queries in one scan",
+        "Fast %s indexed %d SAM records for %d/%d queries in one scan",
+        "minimap2" if primary_aligner == "minimap2" else "BLASTN",
         blast_rows, len(blast_offsets), len(prepared),
     )
 
@@ -1652,12 +1679,16 @@ def run_fast_direct_alignment(
             prepared, evidence, graphcigar_path, graph_lengths,
             conversion_workers, executor,
         )
-        if slow_rigorous:
+        if getattr(args, "no_winnowmap", False):
+            unfinished = []
+            info("Winnowmap disabled; using the bulk minimap2 alignments only")
+        elif slow_rigorous:
             unfinished = list(prepared)
             info(
                 "Slow-rigorous mode sends all %d queries to Winnowmap after "
-                "bulk BLASTN",
+                "bulk %s",
                 len(prepared),
+                "minimap2" if primary_aligner == "minimap2" else "BLASTN",
             )
         else:
             unfinished = [
@@ -1872,6 +1903,8 @@ def direct_alignment_signature(
     )
     if slow_rigorous:
         digest.update(b"slow-rigorous=1\n")
+    if getattr(args, "primary_aligner", "blastn") == "minimap2":
+        digest.update(b"primary-aligner=minimap2\n")
     with open(graph_fasta, "rb") as graph_handle:
         while True:
             chunk = graph_handle.read(1024 * 1024)
@@ -2203,6 +2236,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "BLASTN and Winnowmap for every query"
         ),
     )
+    parser.add_argument(
+        "--primary-aligner", choices=("blastn", "minimap2"), default="blastn",
+        help=(
+            "bulk first-pass aligner for --fast/--slow-rigorous direct mode; "
+            "Winnowmap batches are unchanged (default: blastn)"
+        ),
+    )
+    parser.add_argument(
+        "--no-winnowmap", action="store_true",
+        help="with --primary-aligner minimap2, skip the Winnowmap pass",
+    )
     parser.add_argument("--header", action="store_true", help="include a TSV header")
     payload_group = parser.add_mutually_exclusive_group()
     payload_group.add_argument(
@@ -2255,6 +2299,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             parser.error("hotspot mode requires " + ", ".join(missing))
         if args.input_format not in {"auto", "hotspot"}:
             parser.error("BED/FASTA --input-format requires --graph")
+    if args.primary_aligner != "blastn" and not (
+        args.graph and (args.fast_mode or args.slow_rigorous)
+    ):
+        parser.error("--primary-aligner minimap2 needs --graph with --fast or --slow-rigorous")
+    if args.no_winnowmap and args.primary_aligner != "minimap2":
+        parser.error("--no-winnowmap requires --primary-aligner minimap2")
     return args
 
 

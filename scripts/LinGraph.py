@@ -47,6 +47,7 @@ def parser(show_advanced=False):
         epilog="""Run modes:
   individual   Call each sample/haplotype independently; write individual VCFs
              against an existing graph cache. A reference cache can be reused.
+  blockindex   Automatically create grouped blocks and an index for one reference.
   graph      Build/resume a pangenome graph from a cohort run; variants are
              called across the assemblies as part of graph construction.
 
@@ -70,6 +71,7 @@ Graph-only options:
   --gfa-only             Export existing merged VCFs
   --gaf-threads N        Samples walked at once for the GAFs (default: -t)
   --static-block         Keep initial templates; skip additional novel loci
+  --construct-only       Build/cache graphs without calling variants; -O optional
   --recall-only          Recall and merge from saved calling alignments
   --slurm-jobs INT       Maximum simultaneous SLURM jobs (default: 20)
   --dag-dry-run          Preview actual Snakemake jobs for a completed graph;
@@ -91,6 +93,9 @@ Examples:
     modes = p.add_subparsers(dest="mode", title="commands")
     prepare = modes.add_parser('prepare', add_help=False, help='explicitly prepare assemblies; use prepare --help for all options')
     prepare.add_argument('arguments', nargs=argparse.REMAINDER)
+    blockindex = modes.add_parser('blockindex', add_help=False,
+                                  help='create blocks for one reference; use blockindex --help')
+    blockindex.add_argument('arguments', nargs=argparse.REMAINDER)
     for mode in ("graph", "individual"):
         # Short help hides options inside mutually exclusive groups, which makes
         # Python < 3.12 argparse fail an assertion while wrapping the usage line.
@@ -115,7 +120,9 @@ Examples:
         q.add_argument("-G", "--graph", "--graph-folder", required=True,
                        help="directory to save or resume graph construction" if mode == "graph" else
                             "existing compact summary/graph directory")
-        q.add_argument("-O", "--output", "--output-folder", required=True, help="output directory for VCFs, logs, and run metadata")
+        q.add_argument("-O", "--output", "--output-folder", required=mode != "graph",
+                       help="output directory for VCFs, logs, and run metadata" +
+                            ("; optional with --construct-only" if mode == "graph" else ""))
         inputs = q.add_mutually_exclusive_group()
         inputs.add_argument("-I", "--input-list", help="NAME FASTA list; graph defaults to its saved cohort list")
         if mode == "individual":
@@ -186,6 +193,8 @@ Examples:
             stages.add_argument("--gfa-only", action="store_true", help="export existing merged VCFs to GFA, without calling or merging")
         q.add_argument("--vcf-list", help="input VCF list for --merge-only")
         if mode == 'graph':
+            stages.add_argument("--construct-only", action="store_true",
+                                help="build/cache graphs without variant calling or merging; -O defaults to -G")
             q.add_argument("--static-block", action="store_true",
                            help="keep initial block templates fixed; skip additional novel-locus discovery")
             stages.add_argument("--recall-only", action="store_true", help="recall VCFs from saved gap-filled alignments and merge; require existing upstream inputs")
@@ -283,12 +292,14 @@ def check_fasta(path):
         raise ValueError(f"Compressed FASTA is not supported: {path}; decompress it first")
 
 
-def check_prepared(name, fasta, require_mask=True):
+def check_prepared(name, fasta, require_mask=True, preserve_contigs=False):
     """Inspect the first FASTA record and the FAI names; never modify inputs.
 
     require_mask=False for a prepared copy: prepare_assemblies.py decides
-    masking over the whole assembly, not only the first record."""
-    native_reference = name in {"CHM13_h1", "HG38_h1"}
+    masking over the whole assembly, not only the first record.
+    preserve_contigs=True permits a single construction-only reference to use
+    native contig names, as the bundled human references already do."""
+    native_reference = preserve_contigs or name in {"CHM13_h1", "HG38_h1"}
     prefix = name.rsplit("_h", 1)[0] + "#" + name.rsplit("_h", 1)[1]
 
     def fail(reason, *, fix_names=False, name_collision=False):
@@ -770,7 +781,8 @@ def graph_mode(args, runner, graph, output, samples, ref):
         common.append('--dry-run')
     from cohort_call_snakemake.run_cohort_call_pipeline import parse_args as parse_call
     from graph_build_snakemake.run_graph_pipeline import parse_args as parse_build
-    parse_call(list(map(str, common)))
+    if not args.construct_only:
+        parse_call(list(map(str, common)))
     if args.graph_list:
         common += ["-L", absolute(args.graph_list)]
     if args.snakemake_args:
@@ -781,7 +793,7 @@ def graph_mode(args, runner, graph, output, samples, ref):
     build = bool(args.input_list or args.bed or args.find_novel_loci or args.alternative or build_tuning
                  or args.alignment_mode is not None or not graph_complete(graph))
     if build:
-        say("Build/resume graph before calling all cohort assemblies")
+        say("Build/resume graph" if args.construct_only else "Build/resume graph before calling all cohort assemblies")
         command = ["-r", name, "-q", normalized, "-G", graph, "-j", args.threads,
                    "--snakemake", args.snakemake,
                    "--rigorous" if args.alignment_mode == "rigorous" else "--fast",
@@ -818,6 +830,8 @@ def graph_mode(args, runner, graph, output, samples, ref):
                 f"{summary_targets} differs from {targets}, but {summary_targets.parent} "
                 "is a read-only view of the original package (a reconstructed graph); "
                 "update the package itself or reconstruct again") from error
+    if args.construct_only:
+        return []
     runner.script("call-cohort", "cohort_call_snakemake/run_cohort_call_pipeline.py", common,
                   outputs=cohort_merge.output_paths(output, cohort_merge.resolve_mode(args)), force=True)
     if getattr(args, 'samples', ''):
@@ -1427,16 +1441,32 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == 'prepare':
         return subprocess.call([sys.executable, str(ROOT / 'tools/prepare_assemblies.py'), *argv[1:]])
+    if argv and argv[0] == 'blockindex':
+        return subprocess.call([sys.executable, str(ROOT / 'blockindex.py'), *argv[1:]])
     p = parser(show_advanced="--help-all" in argv)
     args = p.parse_args(argv)
+    construct_only = bool(getattr(args, 'construct_only', False))
+    if args.mode == 'graph':
+        if construct_only:
+            if args.mc_graph:
+                p.error("--construct-only cannot be combined with --make-graph; GFA export requires variant calling")
+            call_settings = cli_options.values(args, 'call')
+            if not call_settings.get('no_merge_realignment'):
+                call_settings.pop('no_merge_realignment', None)
+            if args.graph_list or args.snakemake_args or call_settings.keys() - cli_options.values(args, 'build').keys():
+                p.error("calling-only settings cannot be used with --construct-only")
+            if not args.output:
+                args.output = args.graph
+        elif not args.output:
+            p.error("graph requires -O/--output unless --construct-only is supplied")
     if args.unlock is not None:
         if args.mode is not None:
             p.error("--unlock is a standalone command; omit graph/individual and run options")
         return unlock_workflows(args.unlock, args.dry_run)
     if args.mode is None:
-        p.error("choose graph or individual, or use --unlock")
-    if args.mode == 'prepare':
-        p.error('put preparation options after prepare: LinGraph.py prepare --help')
+        p.error("choose blockindex, graph or individual, or use --unlock")
+    if args.mode in {'prepare', 'blockindex'}:
+        p.error(f'put options after the command: LinGraph.py {args.mode} --help')
     if getattr(args, 'dag_dry_run', False):
         if args.merge_only or args.recall_only or args.gfa_only:
             p.error("partial runs do not use Snakemake; use --dry-run")
@@ -1506,7 +1536,7 @@ def main(argv=None):
     if args.mode == "graph" and args.threads < 4 and not partial:
         p.error("graph mode requires at least 4 threads (existing graph-builder requirement)")
     graph, output = absolute(args.graph), absolute(args.output)
-    if graph == output or graph in output.parents or output in graph.parents:
+    if (graph == output or graph in output.parents or output in graph.parents) and not (construct_only and graph == output):
         p.error("-G and -O must be separate, non-nested directories")
     if getattr(args, 'recall_only', False):
         if args.slurm:
@@ -1606,7 +1636,9 @@ def main(argv=None):
     for name, fasta in [*checked_samples, ref]:
         if (name, fasta) not in checked:
             try:
-                check_prepared(name, fasta)
+                check_prepared(name, fasta, preserve_contigs=(
+                    construct_only and len({(n, f) for n, f in [*samples, ref]}) == 1
+                ))
             except NeedsPreparation as problem:
                 print(f"[LinGraph] WARNING: {problem}" + (
                           f"\n  A fixed copy is prepared in {output / PREPARED_FOLDER / name} "
@@ -1691,7 +1723,7 @@ def main(argv=None):
                 pass
     for path in vcfs:
         say(f"Sample VCF: {path}")
-    if (args.mode == "graph" or partial or len(vcfs) > 1) and (
+    if not construct_only and (args.mode == "graph" or partial or len(vcfs) > 1) and (
             args.mode == "graph" or args.merge or args.mc_graph or args.merge_mode is not None):
         for path in cohort_merge.output_paths(output, cohort_merge.resolve_mode(args)):
             say(f"Merged VCF: {path}")

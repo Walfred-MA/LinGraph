@@ -6125,9 +6125,23 @@ def _exact_split_shifted(row_id, observations, rep_slot, bodies, exact, decision
         return []
     kept, kept_bodies, separate = [], [], []
     representative = observations[rep_slot]
+
+    def span(observation):
+        return ((observation.pos, observation.pos + abs(observation.size))
+                if observation.svtype == "DEL"
+                else (observation.pos, max(observation.pos, observation.end)))
+
+    rep_span = span(representative)
     for slot, (observation, body, decision) in enumerate(
         zip(observations, bodies, decisions),
     ):
+        if (slot != rep_slot and decision is None and span(observation) == rep_span
+                and _size_similarity(abs(observation.size), abs(representative.size))
+                < _EXACT_SAME_BREAKPOINT_SIZE):
+            # Not planned (same span as the representative), but linked only
+            # through other members: an allele under half (or over twice) the
+            # representative's size gets its own row.
+            decision = ("separate", "same_breakpoint_size")
         if slot == rep_slot and decision is not None and decision[0] == "move":
             # A single-member row realigned: its new allele represents it.
             representative = decision[1]
@@ -6853,8 +6867,19 @@ def _exact_round_apply(svtype, pick, chosen, candidates, decisions):
         return None
     rep_event = candidates[pick]
     kept, separated, pieces, flank = [], [], {}, []
+
+    def span(event):
+        return (event[1], event[1] + event[3]) if event[0] == "DEL" else (event[1], max(event[1], event[2]))
+
     for index, body in chosen:
         decision = decisions.get(index)
+        if (index != pick and decision is None
+                and span(candidates[index]) == span(rep_event)
+                and _size_similarity(abs(candidates[index][3]), abs(rep_event[3]))
+                < _EXACT_SAME_BREAKPOINT_SIZE):
+            # As at the top level: same span as the representative but under
+            # half (or over twice) its size -> its own nested row.
+            decision = ("separate", "same_breakpoint_size")
         if index == pick or decision is None:
             kept.append((index, body))
         elif decision[0] == "drop":
@@ -8382,6 +8407,7 @@ def _exact_piece_alignment(query, template, cache, core):
 _EXACT_MIN_MAPPED = 0.7     # share of a row's allele a moved allele must map
 _EXACT_MOVEMENT_SHARE = 0.1  # breakpoint shift (share of variant size) accepted as a movement
 _EXACT_MOVEMENT_MAX = 50     # and a movement shifts a breakpoint by less than this many bases
+_EXACT_SAME_BREAKPOINT_SIZE = 0.5  # size ratio a member at the representative's span needs to stay
 
 
 def _exact_body_score(body, window, template):
