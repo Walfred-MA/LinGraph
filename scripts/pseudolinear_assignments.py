@@ -2328,6 +2328,125 @@ def _covered_by(
     return index >= 0 and masks[index][0] <= start and masks[index][1] >= end
 
 
+def _edge_insertion_size(
+    cigar: str, name: str, path: str, at_end: bool,
+) -> int:
+    """Query bases of the pure insertion ending (or starting) a main-path
+    CIGAR in CIGAR order, when an aligned base precedes it; else 0."""
+    segments = core.parse_reference_cigar_segments(cigar, name)
+    segment = segments[-1] if at_end else segments[0]
+    if not segment.is_main or segment.path != path:
+        return 0
+    ops = [op for op in segment.ops if op.op != "H" and op.n > 0]
+    if at_end:
+        ops.reverse()
+    size = 0
+    for op in ops:
+        if op.op != "I":
+            return size if op.op in {"=", "X", "M"} else 0
+        size += op.n
+    return 0
+
+
+def _split_junction_insertions(rows: List[dict]) -> None:
+    """Give a PRIMARY row's edge insertion to the INSERTION row beside it.
+
+    A PRIMARY slice can end (or start), in CIGAR order, with inserted bases
+    at the reference point where an elected INSERTION row of another
+    alignment continues on the query. graphreftovcf joins those bases with
+    that insertion into one call, so they become an INSERTION row of the same
+    source alignment at that point; the PRIMARY row keeps its aligned part
+    and its reference interval. New rows are appended, so ``@`` dependencies
+    keep their row numbers.
+    """
+    starts, ends = {}, {}
+    for row in rows:
+        if (
+            row.get("kind") == "INSERTION"
+            and row.get("alternative_path") in {None, "", "."}
+            and isinstance(row.get("query_start"), int)
+            and isinstance(row.get("query_end"), int)
+            and row["query_end"] > row["query_start"]
+            and isinstance(row.get("reference_start"), int)
+            and row["reference_start"] == row.get("reference_end")
+        ):
+            layer = (row.get("pa_path", "pri"), row["query_contig"])
+            starts[(*layer, row["query_start"])] = row
+            ends[(*layer, row["query_end"])] = row
+
+    added = []
+    for row in rows:
+        cigar = row.get("alignment_cigar")
+        if (
+            row.get("kind") != "PRIMARY" or row.get("encoded")
+            or row.get("interval") is None
+            or not isinstance(cigar, str) or cigar in {"", "."}
+        ):
+            continue
+        interval = row["interval"]
+        name = getattr(interval, "source_query_name", "") or interval.query_name
+        layer = (row.get("pa_path", "pri"), row["query_contig"])
+        for at_end in (True, False):
+            cigar = row["alignment_cigar"]
+            size = _edge_insertion_size(
+                cigar, name, row["reference_path"], at_end,
+            )
+            if not size:
+                continue
+            # CIGAR order is physical order on '+', reversed on '-'.
+            right = at_end == (row["query_strand"] != "-")
+            start, end = row["query_start"], row["query_end"]
+            neighbor = (
+                starts.get((*layer, end)) if right
+                else ends.get((*layer, start))
+            )
+            point = _reference_edge_at_query_side(
+                row, "right" if right else "left",
+            )
+            if (
+                neighbor is None
+                or neighbor.get("query_strand") != row["query_strand"]
+                or neighbor.get("reference_path") != row["reference_path"]
+                or neighbor.get("reference_strand") != row["reference_strand"]
+                or neighbor["reference_start"] != point
+            ):
+                continue
+            length = end - start
+            cut = length - size if at_end else size
+            head = core.slice_reference_cigar_by_query(
+                cigar, 0, cut, name,
+                include_left_boundary_deletions=True,
+                include_right_boundary_deletions=False,
+            )
+            tail = core.slice_reference_cigar_by_query(
+                cigar, cut, length, name,
+                include_left_boundary_deletions=True,
+                include_right_boundary_deletions=True,
+            )
+            kept, moved = (head, tail) if at_end else (tail, head)
+            if right:
+                kept_span, moved_span = (start, end - size), (end - size, end)
+            else:
+                kept_span, moved_span = (start + size, end), (start, start + size)
+            added.append({
+                **row, "kind": "INSERTION",
+                "query_start": moved_span[0], "query_end": moved_span[1],
+                "alignment_cigar": moved,
+                "reference_start": point, "reference_end": point,
+                "anchor": point, "dependency": ".",
+            })
+            row["query_start"], row["query_end"] = kept_span
+            row["alignment_cigar"] = kept
+    if added:
+        print(
+            f"[pseudolinear] gave {len(added)} PRIMARY edge insertion(s) "
+            f"({sum(row['query_end'] - row['query_start'] for row in added)} "
+            "bp) to the adjacent elected INSERTION row",
+            file=sys.stderr, flush=True,
+        )
+    rows.extend(added)
+
+
 def _finish_assignment_rows(
     rows: List[dict], query_spans: Sequence[Span],
     intervals: Sequence[AlignmentInterval],
@@ -2335,6 +2454,7 @@ def _finish_assignment_rows(
     rows.extend(_internal_unmapped_gap_rows(
         query_spans, intervals, "interval",
     ))
+    _split_junction_insertions(rows)
     resolve_insertion_anchors(rows)
     for index, row in enumerate(rows, 1):
         row["assignment_id"] = f"A{index}"

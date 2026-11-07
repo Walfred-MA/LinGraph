@@ -51,20 +51,27 @@ from local_reference_templates import LocalTemplate, read_templates
 from graph_cigar_payloads import query_only_graph_cigar
 from query_error_bed import QueryErrorBed
 
+# Required aligners: a missing one stops the job instead of silently keeping
+# unrealigned sample CIGARs.
 try:
     from ssw import AlignmentMgr  # type: ignore
-    try:
-        from ssw.alignmentmgr import BitwiseAlignmentFlag  # type: ignore
-    except Exception:  # pragma: no cover
-        BitwiseAlignmentFlag = None
-except Exception:  # pragma: no cover
-    AlignmentMgr = None
+except ImportError as _error:
+    raise ImportError(
+        "graphreftovcf.py requires ssw-py; install it with "
+        "`python install.py` or `python -m pip install ssw-py`"
+    ) from _error
+try:
+    from ssw.alignmentmgr import BitwiseAlignmentFlag  # type: ignore
+except ImportError:  # older ssw-py releases lack the flag enum
     BitwiseAlignmentFlag = None
 
 try:
     import mappy  # type: ignore
-except Exception:  # pragma: no cover
-    mappy = None
+except ImportError as _error:
+    raise ImportError(
+        "graphreftovcf.py requires mappy (minimap2 Python bindings); install "
+        "it with `python install.py` or `python -m pip install mappy`"
+    ) from _error
 
 QUERY_OPS = {"M", "=", "X", "I", "S"}
 REF_OPS = {"M", "=", "X", "D"}
@@ -6285,7 +6292,6 @@ def format_info_field(info: Dict[str, str], original_order: Optional[List[str]] 
 
 REALIGN_MIN_ALIGNED_BP = 200
 REALIGN_MIN_SIMILARITY = 0.90
-REALIGN_MAX_SSW_SEQ_LEN = 50_000  # skip SSW for sequences larger than this to avoid O(m*n) hangs
 
 
 def _add_extend_op(ops: List[Tuple[str, int, str]], op: str, n: int, payload: str = "") -> None:
@@ -6791,7 +6797,7 @@ def ssw_local_align(query_seq: str, target_seq: str) -> Optional[dict]:
 
     Returns query and target half-open coordinates plus a polished payloaded body.
     """
-    if AlignmentMgr is None or not query_seq or not target_seq:
+    if not query_seq or not target_seq:
         return None
     mgr = AlignmentMgr(match_score=2, mismatch_penalty=2)
     mgr.set_read(query_seq.upper())
@@ -6842,7 +6848,7 @@ def ssw_local_align(query_seq: str, target_seq: str) -> Optional[dict]:
 
 def minimap2_local_align(query_seq: str, target_seq: str) -> Optional[dict]:
     """Rank forward local candidates using the standard alignment score."""
-    if mappy is None or not query_seq or not target_seq:
+    if not query_seq or not target_seq:
         return None
     try:
         aligner = mappy.Aligner(seq=target_seq, preset="asm10", best_n=1)
@@ -6862,7 +6868,7 @@ def _minimap2_insertion_alignment(
     same reference strand.  Reverse hits are therefore not valid encodings for
     the sample graph CIGAR and are ignored.
     """
-    if mappy is None or not query_seq or not target_seq:
+    if not query_seq or not target_seq:
         return None
     if aligner is None:
         try:
@@ -6922,8 +6928,6 @@ def _make_insertion_minimap2_aligner(target_sequence: str):
     preset keeps those nested 100--1000 bp comparisons callable; longer
     insertion targets retain the assembly preset.
     """
-    if mappy is None:
-        raise RuntimeError("mappy is unavailable")
     preset = "sr" if len(target_sequence) < 1000 else "asm10"
     return mappy.Aligner(seq=target_sequence, preset=preset, best_n=5)
 
@@ -7181,7 +7185,6 @@ def recursive_insertion_cigar_overrides(
         int(min_unmasked_bases) <= 0
         or len(members) < 2
         or representative.unmasked_bases <= int(min_unmasked_bases)
-        or mappy is None
     ):
         return {}
     root_target = representative
@@ -7316,9 +7319,6 @@ def build_alignment_candidates_for_target(raw_seq: str, remaining: Sequence[Tupl
             continue
         qpiece = raw_seq[a:b]
         use_minimap2 = len(qpiece) > 1000 or len(target_seq) > 1000
-        if use_minimap2 and mappy is None:
-            if len(qpiece) > REALIGN_MAX_SSW_SEQ_LEN or len(target_seq) > REALIGN_MAX_SSW_SEQ_LEN:
-                continue
         aln = minimap2_local_align(qpiece, target_seq) if use_minimap2 else ssw_local_align(qpiece, target_seq)
         if aln is None:
             continue
@@ -7398,8 +7398,6 @@ def segmented_encode_raw_insertion(raw_seq: str, encoded_locs: Sequence[dict], r
     so the caller keeps the original plain sample CIGAR.
     """
     if not raw_seq:
-        return ""
-    if AlignmentMgr is None and mappy is None:
         return ""
 
     targets: List[dict] = []
@@ -7502,10 +7500,7 @@ def _best_encoded_for_allele(
         exact = f">{target_name}:{len(raw_seq)}="
         if count_raw_unaligned_bp(exact) < best_u:
             return exact, False
-    
-    if AlignmentMgr is None and mappy is None:
-        return best, best_is_info_cigar
-            
+
     if encoded_locs:
         # Thresholds: cutoff=200, sim_min=0.0 (per request), min_align=200
         enc = segmented_encode_raw_insertion(raw_seq, encoded_locs, "", cutoff=200, sim_min=0.0, min_align=200)
@@ -7703,7 +7698,7 @@ def reencode_vcf_line(line: str, ref_lookup: Optional[Dict[str, SeqRecord]] = No
                     has_work = True; break
         if has_work: break
         
-    if not has_work or (AlignmentMgr is None and mappy is None) or not info_cigar:
+    if not has_work or not info_cigar:
         cols[7] = format_info_field(info, info_order)
         return "\t".join(cols) + "\n"
     
@@ -7783,24 +7778,6 @@ def line_level_reencode_vcf(tmp_path: str, out_path: str, realignment: bool, ref
         if not realignment:
             with open(tmp_path) as src, open(stage_path, "w") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
-            os.replace(stage_path, out_path)
-            return
-
-        # Without an aligner the re-encoding operation is a no-op. Copying in
-        # large blocks avoids dispatching hundreds of thousands of unchanged
-        # VCF lines through Python workers.
-        if AlignmentMgr is None and mappy is None:
-            warned_no_aligner = False
-            with open(tmp_path) as src, open(stage_path, "w") as dst:
-                for line in src:
-                    dst.write(line)
-                    if not warned_no_aligner and not line.startswith("#"):
-                        print(
-                            "[WARN] --realignment requested but no supported "
-                            "aligner is importable; keeping raw sample insertion cigars",
-                            file=sys.stderr,
-                        )
-                        warned_no_aligner = True
             os.replace(stage_path, out_path)
             return
 
@@ -9105,6 +9082,16 @@ def parse_pseudolinear_row_events(row: dict, assignments: Sequence[dict], ctx: d
     return result
 
 
+def grouped_replacement_coverage(svs: Iterable[SVUnit]) -> List[Tuple[str, str, int, int]]:
+    """Coverage spans of grouped insertions that replace reference: the span
+    between a group's flanks is called reference, as a deletion's is."""
+    return [
+        (sv.query, sv.ref_contig, sv.ref_start, sv.ref_end) for sv in svs
+        if sv.pseudolinear_group and not sv.source_relative
+        and sv.ref_end > sv.ref_start
+    ]
+
+
 def merge_pseudolinear_insertions(svs: Sequence[SVUnit]) -> List[SVUnit]:
     """Concatenate bracketed insertion groups and same-point fragments."""
     insertion_groups = defaultdict(list)
@@ -9803,10 +9790,6 @@ def main():
         parser.error("--filter-edge must be at least 0")
     if args.var_in_insert < 0:
         parser.error("--var-in-insert must be at least 0")
-    if args.var_in_insert > 0 and mappy is None:
-        parser.error(
-            "--var-in-insert requires the mappy minimap2 Python bindings"
-        )
     if not (
         0 < args.cross_graph_ratio_min
         <= args.cross_graph_ratio_max
@@ -10211,6 +10194,7 @@ def main():
         svs = merge_pseudolinear_insertions(svs)
         for event_id, sv in enumerate(svs, 1):
             sv.id = event_id
+        coverage_spans_set.update(grouped_replacement_coverage(svs))
     parsed_snp_total = spilled_snp_count if spill_snps else len(snps)
     if error_regions is not None:
         print(f"[graphreftovcf] --error-bed excluded {error_bed_filtered_rows} input row(s)", file=sys.stderr)

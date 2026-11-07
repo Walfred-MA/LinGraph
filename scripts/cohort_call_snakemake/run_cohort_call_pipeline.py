@@ -357,13 +357,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum reference distance for final cohort SV merging (default: 500)",
     )
     parser.add_argument(
-        "--size-similarity", type=float, default=0.7, metavar="FRACTION",
-        help="minimum min(size)/max(size) for final SV merging (default: 0.7)",
+        "--size-similarity", type=float, default=0.5, metavar="FRACTION",
+        help="minimum min(size)/max(size) for final SV merging (default: 0.5)",
     )
     parser.add_argument(
-        "--sequence-similarity", type=float, default=0.7,
+        "--sequence-similarity", type=float, default=0.5,
         metavar="FRACTION",
         help="compatibility option; final insertion merging uses fixed KmerMatch cosine >=0.5",
+    )
+    parser.add_argument(
+        "--partial-merge", action="store_true",
+        help="final SV merging without the size cutoff; for insertion pairs whose "
+             "shorter one is at least --partial-merge-min-size, similarity leaves "
+             "trimmed edges out of its denominator but needs a score of "
+             "min(--partial-merge-min-size, half the shorter insertion); an "
+             "insertion representative of at least 10 kb whose largest other "
+             "member is below --size-similarity of it keeps a row of its own",
+    )
+    parser.add_argument(
+        "--partial-merge-min-size", type=int, default=300, metavar="BP",
+        help="with --partial-merge: pairs whose shorter insertion is at least BP are "
+             "scored partially and must reach min(BP, half the shorter); shorter pairs "
+             "are scored as without --partial-merge (default: 300)",
+    )
+    parser.add_argument(
+        "--merge-recurrent", action="store_true",
+        help="final SV merging: at the end of the top level, an insertion row whose "
+             "representative is at least --partial-merge-min-size merges into a longer "
+             "nearby row (movement rule of its representative) whose representative "
+             "passes the partial-merge score, every member force shifted onto it "
+             "(off with --no-shift)",
     )
     parser.add_argument(
         "--merge-processes", type=int, default=None, metavar="INT",
@@ -540,6 +563,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args.exact = cohort_merge.resolve_exact(args)
     try:
         args.merge_realignment = cohort_merge.resolve_realignment(args)
+        args.merge_shift = cohort_merge.resolve_shift(args)
     except ValueError as error:
         parser.error(str(error))
     args.merge_mode = cohort_merge.resolve_mode(args)
@@ -551,6 +575,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--size-similarity must be between 0 and 1")
     if not 0 <= args.sequence_similarity <= 1:
         parser.error("--sequence-similarity must be between 0 and 1")
+    if args.partial_merge_min_size < 0:
+        parser.error("--partial-merge-min-size cannot be negative")
+    if args.partial_merge and args.merge_only:
+        parser.error("--partial-merge runs through the Snakemake merge; drop --merge-only")
+    if args.merge_recurrent and args.merge_only:
+        parser.error("--merge-recurrent runs through the Snakemake merge; drop --merge-only")
     if args.seqcompress:
         parser.error(
             "--seqcompress is incompatible with cohort merging because the "
@@ -631,7 +661,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          keep_merge_tmpdir=args.keep_merge_tmpdir,
                          ignore_full_locus_dup_insertions=(
                              not args.keep_full_locus_dup_insertions
-                         ), exact=args.exact, large_singleton_size=args.large_singleton_size)
+                         ), exact=args.exact, realignment=args.merge_realignment,
+                         shift=args.merge_shift, large_singleton_size=args.large_singleton_size)
         return 0
 
     graph = Path(absolute(args.graph_folder))
@@ -887,6 +918,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # --no-merge-realignment only: default runs keep their merge folder.
         # Not "realignment", the graph-CIGAR/VCF setting of the run config.
         **({} if args.merge_realignment else {"merge_realignment": False}),
+        # --no-shift; a --no-merge-realignment run records it either way
+        # (before --no-shift it never shifted).
+        **({} if args.merge_realignment and args.merge_shift
+           else {"merge_shift": args.merge_shift}),
+        # --partial-merge only: default runs keep their merge folder.
+        **({"partial_merge": True, "partial_merge_min_size": args.partial_merge_min_size}
+           if args.partial_merge else {}),
+        # --merge-recurrent only: default runs keep their merge folder.
+        **({"merge_recurrent": True, "partial_merge_min_size": args.partial_merge_min_size}
+           if args.merge_recurrent else {}),
     }
     merge_signature = hashlib.sha256(json.dumps([merge_settings, args.merge_mode == "all", "worker-snp-v3"], sort_keys=True).encode()).hexdigest()[:16]
     merge_tmpdir = Path(absolute(
@@ -984,6 +1025,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     resources = [f"io_jobs={args.io_jobs}"]
     if args.slurm:
         resources.append(f"slurm_jobs={args.slurm_jobs}")
+        # Merge chromosome jobs on different nodes share the insertion SNP
+        # bundles: cross-node locks (graphvcfmerge_insertion_store); jobs
+        # inherit it through sbatch --export=ALL.
+        os.environ['LINGRAPH_SHARED_FS_LOCKS'] = '1'
     command.extend(["--resources", *resources])
     # Publish-time only: kept out of the run configuration, whose content
     # is part of earlier stages' checkpoints.
@@ -1000,7 +1045,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "emit_small": args.merge_mode in ('all', 'svindel'),
         "kmermatch": str(kmermatch),
         **({} if args.merge_realignment else {"realignment": False}),
+        **({} if args.merge_shift else {"shift": False}),
     }
+    if args.partial_merge:
+        # As the chromosome stage records it: no size cutoff, the singleton
+        # test at graphvcfmerge.py's 10 kb with the configured size cutoff.
+        merge_settings.update(
+            size_similarity=0.0, partial_merge=True,
+            partial_merge_singleton=[10_000, float(args.size_similarity)],
+            partial_merge_min_size=args.partial_merge_min_size)
+    if args.merge_recurrent:
+        merge_settings.update(merge_recurrent=True,
+                              partial_merge_min_size=args.partial_merge_min_size)
     if args.merge_mode == "all":
         merge_settings["insertion_snps"] = str(merge_tmpdir / "insertion_snps")
     if args.slurm and (merge_tmpdir / "chroms.complete.tsv").is_file() and merge_needs_resume(

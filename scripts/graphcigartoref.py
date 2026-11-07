@@ -20,20 +20,24 @@ import traceback
 from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
-try:
-    import numpy as _np
-except ImportError:  # pure-python fallback keeps the pipeline runnable
-    _np = None
+# Required aligners: a missing one stops the job instead of silently
+# producing different alignments.
 try:
     import parasail as _parasail
-except ImportError:  # numpy/pure-python DP fallback remains available
-    _parasail = None
+except ImportError as _error:
+    raise ImportError(
+        'graphcigartoref.py requires parasail; install it with '
+        '`python install.py` or `python -m pip install parasail`'
+    ) from _error
 _PARASAIL_MATRIX_CACHE: dict = {}
 _SV_REALIGNMENT_ENABLED = True
 try:
     import mappy as _mappy
-except ImportError:  # subprocess minimap2 fallback remains available
-    _mappy = None
+except ImportError as _error:
+    raise ImportError(
+        'graphcigartoref.py requires mappy (minimap2 Python bindings); install '
+        'it with `python install.py` or `python -m pip install mappy`'
+    ) from _error
 from alignment_scoring import (alignment_score, scoring_runs, run_score,
                                MATCH_SCORE, MISMATCH_SCORE, GAP_OPEN,
                                whole_pair_score, MaskedSVScorer,
@@ -2345,11 +2349,9 @@ def _tm_global_insert_align_dp(ref_seq: str, qry_seq: str) -> Tuple[List[Tuple[i
     Return ops plus aligned ref/query start/end coordinates. D has no payload;
     I carries query payload; X carries ref+query payload.
 
-    The matrix fill is vectorized with numpy when available, replicating the
-    per-cell recurrence exactly: match +2 / mismatch -3 / gap -4 with strict
-    ">" tie-breaking that prefers diagonal, then delete, then insert.  The
-    insert chain curr[j] = max(cand[j], curr[j-1] - 4) is computed as a
-    running maximum of cand[j] + 4j (a prefix max with linear decay).
+    parasail fills the score table for the recurrence match +2 / mismatch -3 /
+    gap -4; the traceback applies strict ">" tie-breaking that prefers
+    diagonal, then delete, then insert.
     """
     n = len(ref_seq)
     m = len(qry_seq)
@@ -2363,132 +2365,51 @@ def _tm_global_insert_align_dp(ref_seq: str, qry_seq: str) -> Tuple[List[Tuple[i
         if m:
             _tm_add_op(trivial, m, 'I', qry_seq)
         return (trivial, 0, 0, n, m)
-    if _parasail is not None:
-        # parasail computes only the score TABLE (SIMD, same recurrence:
-        # +2/-3 matrix with open=extend=4 equals this DP's linear gap model);
-        # the traceback below recomputes this function's own tie-breaking
-        # (diagonal > delete > insert, strict ">") from the table values, so
-        # the emitted ops are byte-identical to the numpy/pure-python paths.
-        ref_upper_text = ref_seq.upper()
-        qry_upper_text = qry_seq.upper()
-        alphabet = ''.join(sorted(set(ref_upper_text) | set(qry_upper_text)))
-        matrix = _parasail_scoring_matrix(alphabet, match_score, mismatch_score)
-        # The score_table is a view into the result's C buffer; the result
-        # object must stay referenced for as long as the table is read.
-        parasail_result = _parasail.nw_table(
-            qry_upper_text, ref_upper_text, -gap_score, -gap_score, matrix,
-        )
-        table = parasail_result.score_table
+    # parasail computes only the score TABLE (SIMD, same recurrence:
+    # +2/-3 matrix with open=extend=4 equals this DP's linear gap model);
+    # the traceback below recomputes this function's own tie-breaking
+    # (diagonal > delete > insert, strict ">") from the table values.
+    ref_upper_text = ref_seq.upper()
+    qry_upper_text = qry_seq.upper()
+    alphabet = ''.join(sorted(set(ref_upper_text) | set(qry_upper_text)))
+    matrix = _parasail_scoring_matrix(alphabet, match_score, mismatch_score)
+    # The score_table is a view into the result's C buffer; the result
+    # object must stay referenced for as long as the table is read.
+    parasail_result = _parasail.nw_table(
+        qry_upper_text, ref_upper_text, -gap_score, -gap_score, matrix,
+    )
+    table = parasail_result.score_table
 
-        def cell(i: int, j: int) -> int:
-            # Full-matrix accessor over parasail's boundary-free table:
-            # table[query-1, ref-1]; row/column zero follow the gap ramp.
-            if i == 0:
-                return j * gap_score
-            if j == 0:
-                return i * gap_score
-            return int(table[j - 1, i - 1])
+    def cell(i: int, j: int) -> int:
+        # Full-matrix accessor over parasail's boundary-free table:
+        # table[query-1, ref-1]; row/column zero follow the gap ramp.
+        if i == 0:
+            return j * gap_score
+        if j == 0:
+            return i * gap_score
+        return int(table[j - 1, i - 1])
 
-        rev_steps: List[Tuple[int, str, str]] = []
-        i = n
-        j = m
-        while i > 0 or j > 0:
-            if i > 0 and j > 0:
-                here = cell(i, j)
-                diag = cell(i - 1, j - 1) + (
-                    match_score
-                    if ref_upper_text[i - 1] == qry_upper_text[j - 1]
-                    else mismatch_score
-                )
-                delete = cell(i - 1, j) + gap_score
-                if here > diag and here > delete:
-                    bt = 2
-                elif here > diag:
-                    bt = 1
-                else:
-                    bt = 0
-            else:
-                bt = 1 if j == 0 else 2
-            if i > 0 and j > 0 and bt == 0:
-                rb = ref_seq[i - 1]
-                qb = qry_seq[j - 1]
-                if rb.upper() == qb.upper():
-                    rev_steps.append((1, '=', ''))
-                else:
-                    rev_steps.append((1, 'X', rb + qb))
-                i -= 1
-                j -= 1
-            elif i > 0 and (j == 0 or bt == 1):
-                rev_steps.append((1, 'D', ''))
-                i -= 1
-            elif j > 0:
-                rev_steps.append((1, 'I', qry_seq[j - 1]))
-                j -= 1
-            else:
-                break
-        ops = []
-        for n0, op, payload in reversed(rev_steps):
-            _tm_add_op(ops, n0, op, payload)
-        return (ops, 0, 0, n, m)
-    if _np is not None and n > 0 and m > 0:
-        ref_upper = _np.frombuffer(
-            ref_seq.upper().encode('latin-1'), dtype=_np.uint8,
-        )
-        qry_upper = _np.frombuffer(
-            qry_seq.upper().encode('latin-1'), dtype=_np.uint8,
-        )
-        trace = _np.zeros((n + 1, m + 1), dtype=_np.uint8)
-        trace[0, 1:] = 2
-        trace[1:, 0] = 1
-        prev = gap_score * _np.arange(m + 1, dtype=_np.int64)
-        decay = -gap_score * _np.arange(m + 1, dtype=_np.int64)
-        chain = _np.empty(m + 1, dtype=_np.int64)
-        for i in range(1, n + 1):
-            sub_row = _np.where(
-                qry_upper == ref_upper[i - 1], match_score, mismatch_score,
-            )
-            diag = prev[:-1] + sub_row
-            delete = prev[1:] + gap_score
-            cand = _np.maximum(diag, delete)
-            row_trace = trace[i]
-            row_trace[1:][delete > diag] = 1
-            chain[0] = i * gap_score
-            _np.add(cand, decay[1:], out=chain[1:])
-            _np.maximum.accumulate(chain, out=chain)
-            curr = chain - decay
-            row_trace[1:][curr[1:] > cand] = 2
-            prev = curr
-    else:
-        trace = [bytearray(m + 1) for _ in range(n + 1)]
-        prev = [j * gap_score for j in range(m + 1)]
-        for j in range(1, m + 1):
-            trace[0][j] = 2
-        for i in range(1, n + 1):
-            curr = [i * gap_score] + [0] * m
-            trace[i][0] = 1
-            rb = ref_seq[i - 1]
-            for j in range(1, m + 1):
-                qb = qry_seq[j - 1]
-                diag = prev[j - 1] + (match_score if rb.upper() == qb.upper() else mismatch_score)
-                delete = prev[j] + gap_score
-                insert = curr[j - 1] + gap_score
-                best = diag
-                bt = 0
-                if delete > best:
-                    best = delete
-                    bt = 1
-                if insert > best:
-                    best = insert
-                    bt = 2
-                curr[j] = best
-                trace[i][j] = bt
-            prev = curr
     rev_steps: List[Tuple[int, str, str]] = []
     i = n
     j = m
     while i > 0 or j > 0:
-        bt = trace[i][j]
-        if i > 0 and j > 0 and (bt == 0):
+        if i > 0 and j > 0:
+            here = cell(i, j)
+            diag = cell(i - 1, j - 1) + (
+                match_score
+                if ref_upper_text[i - 1] == qry_upper_text[j - 1]
+                else mismatch_score
+            )
+            delete = cell(i - 1, j) + gap_score
+            if here > diag and here > delete:
+                bt = 2
+            elif here > diag:
+                bt = 1
+            else:
+                bt = 0
+        else:
+            bt = 1 if j == 0 else 2
+        if i > 0 and j > 0 and bt == 0:
             rb = ref_seq[i - 1]
             qb = qry_seq[j - 1]
             if rb.upper() == qb.upper():
@@ -2505,10 +2426,10 @@ def _tm_global_insert_align_dp(ref_seq: str, qry_seq: str) -> Tuple[List[Tuple[i
             j -= 1
         else:
             break
-    ops: List[Tuple[int, str, str]] = []
+    ops = []
     for n0, op, payload in reversed(rev_steps):
         _tm_add_op(ops, n0, op, payload)
-    return (ops, 0, 0, len(ref_seq), len(qry_seq))
+    return (ops, 0, 0, n, m)
 
 def _tm_ops_from_cigar_on_sequences(ref_seq: str, qry_seq: str, cigar: str, ref_start: int=0, qry_start: int=0) -> List[Tuple[int, str, str]]:
     """Convert an aligner CIGAR into pairwise ops with payloads.
@@ -2661,7 +2582,7 @@ def swspy(ref_seq: str, qry_seq: str) -> List[Tuple[int, str, str]]:
         except Exception:
             BitwiseAlignmentFlag = None
     except ImportError as exc:
-        raise RuntimeError('Insertion-vs-insertion realignment for payloads >=100 bp requires the ssw / ssw-py package') from exc
+        raise ImportError('Insertion-vs-insertion realignment for payloads >=100 bp requires ssw-py; install it with `python install.py` or `python -m pip install ssw-py`') from exc
     if not ref_seq and (not qry_seq):
         return []
     if not ref_seq:
@@ -2835,9 +2756,7 @@ def minimap2_payload_ops(
             f'minimap2 payload alignment skipped: {len(ref_seq)} x '
             f'{len(qry_seq)} bp exceeds the length-product cap'
         )
-    if _mappy is not None and os.environ.get(
-        'GRAPH_CIGARTOREF_NO_MAPPY', '',
-    ) in {'', '0'}:
+    if os.environ.get('GRAPH_CIGARTOREF_NO_MAPPY', '') in {'', '0'}:
         # In-process minimap2 (same library the CLI wraps): no fork/exec, no
         # temp FASTA files, ~6 ms of fixed cost removed per call.  Set
         # GRAPH_CIGARTOREF_NO_MAPPY=1 to force the subprocess path.
@@ -2939,8 +2858,8 @@ def _tm_realign_insertion_payloads(ref_seq: str, qry_seq: str, out: List[Tuple[i
     Payloads shorter than 1000 bp use global affine alignment.
     Payloads of at least 1000 bp use minimap2.  Minimap2's local PAF alignment is
     expanded to a global pairwise CIGAR by retaining unaligned prefixes and
-    suffixes as D/I.  If minimap2 is unavailable or produces no usable forward
-    hit, retain the conservative D/I representation.  The later FASTA-backed
+    suffixes as D/I.  If minimap2 produces no usable forward hit, retain the
+    conservative D/I representation; a missing aligner stops the run.  The later FASTA-backed
     adjacent and anchored-window rescues remain independent safety nets.
     """
     if not ref_seq and (not qry_seq):
@@ -2956,10 +2875,9 @@ def _tm_realign_insertion_payloads(ref_seq: str, qry_seq: str, out: List[Tuple[i
             ops = _global_affine_payload_align(ref_seq, qry_seq)
         else:
             ops = minimap2_payload_ops(ref_seq, qry_seq)
-    except (FileNotFoundError, ImportError, RuntimeError):
-        # Keep the conservative pre-realignment representation when neither
-        # required external aligner is available.  This preserves the old D/I
-        # result instead of aborting an otherwise valid graph conversion.
+    except RuntimeError:
+        # No usable hit (or over the length-product cap): keep the
+        # conservative pre-realignment representation.
         _tm_add_op(out, len(ref_seq), 'D', '')
         _tm_add_op(out, len(qry_seq), 'I', qry_seq)
         return
@@ -3028,12 +2946,6 @@ _LARGE_ALIGN_GATE_CELLS = 20_000_000
 
 def _sv_window_affine_align(ref_win: str, qry_win: str) -> List[Tuple[int, str, str]]:
     """Affine SV candidate; acceptance uses the separate masked SV score."""
-    if _parasail is None and len(ref_win) * len(qry_win) > 4_000_000:
-        try:
-            ops = minimap2_payload_ops(ref_win, qry_win, score=MaskedSVScorer(ref_win, qry_win))
-        except (FileNotFoundError, RuntimeError, subprocess.SubprocessError):
-            return []
-        return [(n, 'M' if op == '=' else op, payload) for n, op, payload in ops]
     return [(n, 'M' if op == '=' else op, payload)
             for n, op, payload in _global_affine_payload_align(ref_win, qry_win)]
 
@@ -3042,7 +2954,7 @@ def _global_affine_payload_align(
     ref_win: str, qry_win: str, *, match_score=MATCH_SCORE,
     mismatch_score=MISMATCH_SCORE, gap_open=GAP_OPEN, gap_extend=1,
 ) -> List[Tuple[int, str, str]]:
-    """Generate a global affine candidate with the same native/fallback costs."""
+    """Generate a global affine candidate with parasail."""
     if not ref_win:
         out: List[Tuple[int, str, str]] = []
         if qry_win:
@@ -3052,9 +2964,6 @@ def _global_affine_payload_align(
         out = []
         _tm_add_op(out, len(ref_win), 'D', ref_win)
         return out
-    if _parasail is None:
-        return _affine_global_fallback(ref_win, qry_win, match_score,
-                                       mismatch_score, gap_open, gap_extend)
     ref_upper = ref_win.upper()
     qry_upper = qry_win.upper()
     alphabet = ''.join(sorted(set(ref_upper) | set(qry_upper)))
@@ -3391,7 +3300,7 @@ def _minimap2_tandem_hits(ref_seq: str, qry_seq: str) -> List[TandemAlignmentHit
     if len(ref_seq) * len(qry_seq) > _MINIMAP2_MAX_LENGTH_PRODUCT:
         return []
     raw_hits = []
-    if _mappy is not None and os.environ.get('GRAPH_CIGARTOREF_NO_MAPPY', '') in {'', '0'}:
+    if os.environ.get('GRAPH_CIGARTOREF_NO_MAPPY', '') in {'', '0'}:
         aligner = _mappy.Aligner(seq=ref_seq, preset='map-ont', best_n=50,
                                 n_threads=1, extra_flags=_MINIMAP_FOR_ONLY)
         if not aligner:
@@ -3402,7 +3311,10 @@ def _minimap2_tandem_hits(ref_seq: str, qry_seq: str) -> List[TandemAlignmentHit
     else:
         executable = _minimap2_executable()
         if executable is None:
-            return []
+            raise FileNotFoundError(
+                'minimap2 is not available; set GRAPH_CIGARTOREF_MINIMAP2 '
+                'to its executable path'
+            )
         timeout_text = os.environ.get('GRAPH_CIGARTOREF_MINIMAP2_TIMEOUT', '300')
         try:
             timeout = float(timeout_text)
@@ -3645,7 +3557,7 @@ def _realign_tandem_stage2(stage1, stage2, backbone, query_sequence, ref_reader)
         return stage2
     try:
         hits = _minimap2_tandem_hits(ref_sequence, query_sequence)
-    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired):
         return stage2
     if not hits:
         return stage2
@@ -3748,16 +3660,14 @@ def _tm_realign_secondary_sv_window(
         max(len(ref_win), len(qry_win)) <= _SV_SECONDARY_AFFINE_MAX_AXIS
         and len(ref_win) * len(qry_win) <= _SV_SECONDARY_AFFINE_MAX_CELLS
     )
-    if use_affine and _parasail is not None:
+    if use_affine:
         return normalize(_sv_window_affine_align(ref_win, qry_win))
     try:
         return normalize(minimap2_payload_ops(ref_win, qry_win, score=score))
-    except (FileNotFoundError, RuntimeError, subprocess.SubprocessError):
-        # A tiny window can still be handled safely by the legacy in-process
-        # fallback.  For a large repetitive window, preserving the original
-        # decomposition is safer than forcing a quadratic/linear-DP result.
-        if use_affine and max(len(ref_win), len(qry_win)) <= 1000:
-            return normalize(_sv_window_affine_align(ref_win, qry_win))
+    except (RuntimeError, subprocess.SubprocessError):
+        # For a large repetitive window without a usable minimap2 hit,
+        # preserving the original decomposition is safer than forcing a
+        # quadratic DP result.
         return None
 
 
@@ -5234,8 +5144,7 @@ def _realign_masked_repeat_windows(ops, reference, query, *, reverse=False):
     Returns ``(ops, windows)``; windows are ``(r0, r1, q0, q1)`` offsets in the
     supplied (traversal) orientation, empty when nothing was realigned.
     """
-    if (_parasail is None
-            or not any(op in 'ID' and n >= _MASKED_REPEAT_MIN_SV
+    if (not any(op in 'ID' and n >= _MASKED_REPEAT_MIN_SV
                        for n, op, _ in ops)
             or sum(n for n, op, _ in ops if op in 'M=XD') != len(reference)
             or sum(n for n, op, _ in ops if op in 'M=XI') != len(query)):
@@ -6756,9 +6665,9 @@ def _realign_long_di_sequences(ref_seq: str, qry_seq: str) -> Optional[List[Tupl
             ops = minimap2_payload_ops(
                 ref_seq, qry_seq, preset=None, score=di_repair_score,
             )
-        except (FileNotFoundError, RuntimeError, ValueError):
+        except (RuntimeError, ValueError):
             # Never send a >=1 kb rescue to quadratic DP/SSW.  The original
-            # D/I representation is conservative when minimap2 is unavailable.
+            # D/I representation is conservative when minimap2 finds no hit.
             return None
     matches = sum(n for n, op, _payload in ops if op == '=')
     aligned = sum(n for n, op, _payload in ops if op in {'=', 'X'})

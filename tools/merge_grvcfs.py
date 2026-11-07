@@ -84,8 +84,11 @@ def parse_args(argv=None):
     parser.add_argument('--reference-fasta', action='append', default=[], metavar='FASTA',
                         help='--exact: indexed reference FASTA; repeat for local reference templates')
     parser.add_argument('--no-realignment', action='store_true',
-                        help='--exact: do not realign shifted members onto their row\'s breakpoint; '
-                             'each keeps its own row')
+                        help='--exact: do not realign shifted members onto their row\'s breakpoint '
+                             '(the forced shift still moves deletions, and small insertion shifts, unless --no-shift)')
+    parser.add_argument('--no-shift', action='store_true',
+                        help='--exact: no forced shift (movement rule with edge I/D) of shifted '
+                             'members; with --no-realignment each keeps its own row')
     kinds = parser.add_mutually_exclusive_group()
     kinds.add_argument('--svonly', dest='mode', action='store_const', const='svonly',
                        help='only cohort.sv.vcf (SVs at or above --svcutoff)')
@@ -95,8 +98,23 @@ def parse_args(argv=None):
                        help='only cohort.snp.vcf')
     parser.add_argument('--svcutoff', type=int, default=20, help='SV size cutoff (default: 20)')
     parser.add_argument('--merge-distance', type=int, default=500)
-    parser.add_argument('--size-similarity', type=float, default=.7)
-    parser.add_argument('--sequence-similarity', type=float, default=.7)
+    parser.add_argument('--size-similarity', type=float, default=.5)
+    parser.add_argument('--sequence-similarity', type=float, default=.5)
+    parser.add_argument('--partial-merge', action='store_true',
+                        help='no size cutoff, and an --exact move maps at least 50%% of the shorter of '
+                             'its allele and the row\'s (default: of the row\'s); an insertion '
+                             'representative of at least --large-singleton-size whose largest other '
+                             'member is below --size-similarity of it keeps a row of its own; '
+                             'insertion similarity leaves trimmed edges out of its denominator')
+    parser.add_argument('--partial-merge-min-size', type=int, default=graphvcfmerge._PARTIAL_MERGE_MIN_SIZE,
+                        metavar='BP', help='with --partial-merge: pairs whose shorter insertion is at least BP '
+                                           'are scored partially and must also reach min(BP, half the shorter '
+                                           'insertion); shorter pairs are scored as without it [%(default)s]')
+    parser.add_argument('--merge-recurrent', action='store_true',
+                        help='--exact: at the end of the top level, an insertion row whose representative '
+                             'is at least --partial-merge-min-size merges into a longer nearby row '
+                             '(movement rule of its representative) whose representative passes the '
+                             'partial-merge score, every member force shifted onto it (off with --no-shift)')
     parser.add_argument('--var-in-insert', type=int, default=100,
                         help='call variants inside merged insertions (0: off)')
     parser.add_argument('--keep-full-locus-dup-insertions', action='store_true',
@@ -139,6 +157,10 @@ def parse_args(argv=None):
         parser.error('--reference-fasta is only used with --exact')
     if args.no_realignment and not args.exact:
         parser.error('--no-realignment applies to --exact only')
+    if args.no_shift and not args.exact:
+        parser.error('--no-shift applies to --exact only')
+    if args.merge_recurrent and not args.exact:
+        parser.error('--merge-recurrent applies to --exact only')
     if args.slurm_jobs < 1:
         parser.error('--slurm-jobs must be positive')
     if args.large_singleton_size < 0:
@@ -152,12 +174,95 @@ def parse_args(argv=None):
     return args
 
 
+MEMORY_REPORT_SECONDS = 60
+
+
+def _cgroup_memory_gb():
+    """(job cgroup usage, its anonymous part) in GB, as Slurm counts them; None off Linux."""
+    try:
+        lines = Path('/proc/self/cgroup').read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        _number, controllers, path = line.split(':', 2)
+        if controllers == '':                      # cgroup v2
+            folder, usage, anon = Path('/sys/fs/cgroup' + path), 'memory.current', 'anon '
+        elif 'memory' in controllers.split(','):   # cgroup v1
+            folder, usage, anon = Path('/sys/fs/cgroup/memory' + path), 'memory.usage_in_bytes', 'total_rss '
+        else:
+            continue
+        try:
+            total = int((folder / usage).read_text())
+            stat = (folder / 'memory.stat').read_text().splitlines()
+        except (OSError, ValueError):
+            continue
+        rss = next((int(entry.split()[1]) for entry in stat if entry.startswith(anon)), 0)
+        return total / 1e9, rss / 1e9
+    return None
+
+
+def _process_rss_gb():
+    """(this process's RSS, its descendants' summed RSS, largest descendant) in GB."""
+    page = os.sysconf('SC_PAGE_SIZE')
+    parents, rss = {}, {}
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+            resident = int((entry / 'statm').read_text().split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        parents[int(entry.name)], rss[int(entry.name)] = int(fields[1]), resident * page / 1e9
+    me = os.getpid()
+    children, frontier = [], [me]
+    while frontier:
+        parent = frontier.pop()
+        found = [pid for pid, ppid in parents.items() if ppid == parent]
+        children += found
+        frontier += found
+    sizes = [rss[pid] for pid in children]
+    return rss.get(me, 0.0), sum(sizes), max(sizes, default=0.0), len(sizes)
+
+
+def start_memory_report(label):
+    """Log the job's memory and the main thread's call stack every minute, so
+    an out-of-memory kill leaves what was running, and who held the memory, in
+    the log. Diagnostics only: the merge itself is unchanged."""
+    import threading
+    import traceback
+    if not Path('/proc/self/statm').is_file():
+        return
+    main = threading.get_ident()
+    started = time.monotonic()
+
+    def report():
+        while True:
+            time.sleep(MEMORY_REPORT_SECONDS)
+            try:
+                own, children, largest, count = _process_rss_gb()
+                cgroup = _cgroup_memory_gb()
+                frame = sys._current_frames().get(main)
+                stack = ' <- '.join(f'{os.path.basename(entry.filename)}:{entry.name}:{entry.lineno}'
+                                    for entry in reversed(traceback.extract_stack(frame)[-8:])) if frame else '?'
+                job = (f'cgroup={cgroup[0]:.1f} GB (anon {cgroup[1]:.1f}) ' if cgroup else '')
+                print(f'[merge:mem] {label} {time.monotonic() - started:.0f}s {job}main={own:.1f} GB '
+                      f'workers={children:.1f} GB in {count} (largest {largest:.1f}) in {stack}',
+                      file=sys.stderr, flush=True)
+            except Exception as error:   # never stops the merge
+                print(f'[merge:mem] {label}: report failed: {error!r}', file=sys.stderr, flush=True)
+
+    threading.Thread(target=report, daemon=True).start()
+
+
 def run_stage(args):
     """One stage of the plan, in this process."""
     plan = json.loads(Path(args.plan).read_text())
     threads = args.threads
     if args.stage in ('sv-chrom', 'snp-chrom') and not args.chrom:
         raise ValueError(f'--stage {args.stage} needs --chrom')
+    if args.stage == 'sv-chrom':
+        start_memory_report(args.chrom)
     {
         'sv-scan': lambda: cohort_vcf_merge.stage_sv_scan(plan, threads),
         'sv-chrom': lambda: cohort_vcf_merge.stage_sv_chrom(plan, [args.chrom], threads),
@@ -359,7 +464,9 @@ def main(argv=None):
         ignore_full_locus_dup_insertions=not args.keep_full_locus_dup_insertions,
         exact=str(Path(args.exact).resolve()) if args.exact else None,
         reference_fastas=[str(Path(path).resolve()) for path in args.reference_fasta],
-        realignment=not args.no_realignment)
+        realignment=not args.no_realignment, shift=not args.no_shift, partial_merge=args.partial_merge,
+        large_singleton_size=args.large_singleton_size,
+        partial_merge_min_size=args.partial_merge_min_size, merge_recurrent=args.merge_recurrent)
     plan['large_singleton_size'] = args.large_singleton_size     # read by the publish stage
     plan_path = Path(plan['root']) / 'plan.json'
     plan_path.write_text(json.dumps(plan, indent=1) + '\n')

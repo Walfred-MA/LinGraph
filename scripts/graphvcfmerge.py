@@ -33,7 +33,7 @@ Path coordination stays outside that pool; results retain stable path order.
 from __future__ import annotations
 
 import argparse
-from alignment_scoring import scoring_runs, run_score, cigar_score
+from alignment_scoring import scoring_runs, run_score
 import bisect
 from array import array
 import contextlib
@@ -46,6 +46,7 @@ import hashlib
 import json
 from pathlib import Path
 import heapq
+import itertools
 import io
 import math
 import multiprocessing as mp
@@ -64,15 +65,24 @@ from graphvcfmerge_kmer import DEFAULT_KMERMATCH
 import graphvcfmerge_checkpoints as checkpoints
 
 
+# Required packages: a missing one stops the job instead of silently
+# producing different merge alignments.
+def _missing_package(name):
+    return ImportError(
+        f"graphvcfmerge.py requires {name}; install it with `python install.py` "
+        f"or `python -m pip install {name}`"
+    )
+
+
 try:
     import numpy as np
-except ImportError:  # checked when the merge path actually runs
-    np = None
+except ImportError as _error:
+    raise _missing_package("numpy") from _error
 
 try:
     import parasail
-except ImportError:
-    parasail = None
+except ImportError as _error:
+    raise _missing_package("parasail") from _error
 import subprocess
 import sys
 import tempfile
@@ -85,8 +95,8 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 try:
     import edlib
-except ImportError:  # Exact Python Myers fallback remains available.
-    edlib = None
+except ImportError as _error:
+    raise _missing_package("edlib") from _error
 
 
 SV_EVENT_FIELDS_LEGACY = (
@@ -1007,7 +1017,7 @@ def write_vcf_header(handle, meta_lines: Sequence[str], sample_names: Sequence[s
                 f'Description="{description}">\n'
             )
     if kmer_method:
-        handle.write('##graphvcfmergeInsertionMethod="top-level clusters: longest-template alignment then sparse closest-size/closest-coordinate KmerMatch fallback; top-level and nested groups: each accepted query tests the closest member of every later group, with size gate before scoring and canonical 31-mer KmerMatch cosine >=0.5 with repeat-score 1/n before alignment; passing groups are unioned and moved members receive final-template CIGARs; size and alignment cutoffs use configured values (default 0.7); pairs <=50bp use direct comparison for selection; nested clusters exceeding 7200s restart Kmer-first with template alignment and later-group bridging"\n')
+        handle.write('##graphvcfmergeInsertionMethod="top-level clusters: longest-template alignment then sparse closest-size/closest-coordinate KmerMatch fallback; top-level and nested groups: each accepted query tests the closest member of every later group, with size gate before scoring and canonical 31-mer KmerMatch cosine >=0.5 with repeat-score 1/n before alignment; passing groups are unioned and moved members receive final-template CIGARs; size and alignment cutoffs use configured values (default 0.5); pairs <=50bp use direct comparison for selection; nested clusters exceeding 7200s restart Kmer-first with template alignment and later-group bridging"\n')
     handle.write(f"##source=merge_locus_vcfs_{mode}\n")
     handle.write("\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"] + list(sample_names)) + "\n")
 
@@ -2318,7 +2328,7 @@ def _dup_parent_spans(path: str, sample_indexes, sample_names):
 _EXACT_SNP_DTYPE = np.dtype([
     ("chrom", "<u4"), ("pos", "<u4"), ("alt", "u1"), ("contig", "<u4"),
     ("qpos", "<u4"), ("minus", "u1"),
-]) if np is not None else None
+])
 
 
 def _exact_dup_spans_path(records_dir: str, file_index: int) -> str:
@@ -2338,12 +2348,22 @@ def _exact_placement_chains(lines) -> Dict[str, list]:
     chain while they touch on the query and, in their orientation, on the
     reference. Copies (an INSERTION with a reference span or an alternative
     source) and orientation changes end a chain: query bases across them are
-    not the reference's neighbours."""
-    rows = sorted(
+    not the reference's neighbours. The reference span a grouped insertion
+    replaces still chains, as the deletion at its query start does."""
+    rows = [
         (contig, qs, qe, chrom, rs, re_, qstrand == rstrand)
         for category, contig, qs, qe, qstrand, chrom, rs, re_, rstrand in lines
         if category in ("PRIMARY", "DELETION") or (category == "INSERTION" and rs == re_)
-    )
+    ]
+    listed = {row[:6] for row in rows}
+    rows.extend(dict.fromkeys(
+        replaced
+        for category, contig, qs, _qe, qstrand, chrom, rs, re_, rstrand in lines
+        if category == "INSERTION" and rs < re_
+        for replaced in [(contig, qs, qs, chrom, rs, re_, qstrand == rstrand)]
+        if replaced[:6] not in listed
+    ))
+    rows.sort()
     chains: Dict[str, list] = defaultdict(list)
     for contig, qs, qe, chrom, rs, re_, same in rows:
         current = chains[contig][-1] if chains[contig] else None
@@ -2924,39 +2944,10 @@ def _observations_from_row(
 
 
 def _levenshtein_distance(first: str, second: str) -> int:
-    """Exact Myers bit-vector edit distance (the metric used by edlib)."""
+    """Exact edit distance computed by edlib."""
     first = (first or "").upper()
     second = (second or "").upper()
-    if edlib is not None:
-        return int(edlib.align(first, second, task="distance")["editDistance"])
-    if len(first) > len(second):
-        first, second = second, first
-    length = len(first)
-    if length == 0:
-        return len(second)
-    masks: Dict[str, int] = defaultdict(int)
-    for index, base in enumerate(first):
-        masks[base] |= 1 << index
-    all_bits = (1 << length) - 1
-    highest = 1 << (length - 1)
-    positive = all_bits
-    negative = 0
-    score = length
-    for base in second:
-        equal = masks.get(base, 0)
-        vertical = equal | negative
-        horizontal = (((equal & positive) + positive) ^ positive) | equal
-        ph = negative | ~(horizontal | positive)
-        mh = positive & horizontal
-        if ph & highest:
-            score += 1
-        elif mh & highest:
-            score -= 1
-        ph = ((ph << 1) | 1) & all_bits
-        mh = (mh << 1) & all_bits
-        positive = (mh | ~(vertical | ph)) & all_bits
-        negative = ph & vertical
-    return score
+    return int(edlib.align(first, second, task="distance")["editDistance"])
 
 
 # Similarity values are cached only for modest sequences: at cohort scale a
@@ -2988,6 +2979,178 @@ def _truvari_seqsim(first: str, second: str) -> float:
     if len(first) + len(second) <= _SEQSIM_CACHE_MAX_TOTAL_LEN:
         return _truvari_seqsim_cached(first, second)
     return _truvari_seqsim_uncached(first, second)
+
+
+def _gap_cost(length: int) -> int:
+    """A gap of LENGTH bases: -2 to open (its first base), -1 per further base."""
+    return 0 if length <= 0 else length + 1
+
+
+_PARTIAL_MERGE_MIN_SIZE = 300  # --partial-merge: score a pair must reach (at most half the shorter allele)
+_EDGE_TRIM_SCORE = 100         # edge trimming locks an edge above this standard score (graphcigartoref)
+
+
+def _base_runs(body: str, query: str, template: str) -> List[Tuple[int, str]]:
+    """(count, op) runs of an alignment BODY of QUERY on TEMPLATE, M split
+    into = and X by the bases, S as I and H as D."""
+    runs, q, t = [], 0, 0
+    for count_text, op in _FAST_CHUNK_OPS.findall(body or ""):
+        count = int(count_text)
+        if op == "M":
+            pairs = zip(query[q:q + count].upper(), template[t:t + count].upper())
+            for same, group in itertools.groupby(a == b for a, b in pairs):
+                runs.append((sum(1 for _ in group), "=" if same else "X"))
+        else:
+            runs.append((count, "I" if op == "S" else "D" if op == "H" else op))
+        if op in "=XM":
+            q, t = q + count, t + count
+        elif op in "IS":
+            q += count
+        elif op in "DH":
+            t += count
+    return runs
+
+
+def _edge_trim_bounds(runs: List[Tuple[int, str]]) -> Optional[Tuple[int, int]]:
+    """graphcigartoref.alignment_quality_operation_bounds on (count, op) runs,
+    the edge trimming of the earlier steps: from each end the standard
+    alignment score (+4/-8, gap 12 + 100*log2 n) is summed inward; where it
+    drops below 0 the edge is cut there and the sum restarts, and once it
+    passes _EDGE_TRIM_SCORE the edge is kept. (first, end) run indexes of the
+    kept middle; None without a match or when nothing is kept."""
+    scored = list(scoring_runs(runs))
+    matches = [index for index, run in enumerate(scored) if run[3] == "="]
+    if not matches:
+        return None
+    scored = scored[matches[0]:matches[-1] + 1]
+    left, right = scored[0][0], scored[-1][1]
+    score = 0.0
+    for _first, end, size, op in scored:
+        score += run_score(size, op)
+        if score < 0:
+            left, score = end, 0.0
+        elif score > _EDGE_TRIM_SCORE:
+            break
+    score = 0.0
+    for first, _end, size, op in reversed(scored):
+        score += run_score(size, op)
+        if score < 0:
+            right, score = first, 0.0
+        elif score > _EDGE_TRIM_SCORE:
+            break
+    return (left, right) if right > left else None
+
+
+def _trimmed_body(body: str, query: str, template: str) -> str:
+    """BODY with its edges trimmed as in _body_similarity (_edge_trim_bounds),
+    each trimmed edge written as one insertion of the query's bases and one
+    deletion of the template's (--merge-recurrent moves)."""
+    runs = _base_runs(body, query, template)
+    first, end = _edge_trim_bounds(runs) or (len(runs), len(runs))
+
+    def gaps(part):
+        q = sum(count for count, op in part if op in "=XI")
+        t = sum(count for count, op in part if op in "=XD")
+        return (f"{q}I" if q else "") + (f"{t}D" if t else "")
+
+    return gaps(runs[:first]) + "".join(f"{count}{op}" for count, op in runs[first:end]) \
+        + gaps(runs[end:])
+
+
+def _body_similarity(body: str, query: str, template: str,
+                     partial: Optional[bool] = None) -> float:
+    """Sequence similarity of an alignment BODY of QUERY (member) on TEMPLATE
+    (representative). The body's edges are trimmed as in the earlier steps
+    (_edge_trim_bounds): trimmed member bases count as an insertion, trimmed
+    representative bases as a deletion. Score: +1 per matched base, -2 per
+    mismatch, -2 per gap of any length (no extension penalty; adjacent runs
+    of one kind are one gap); the one gap the length difference forces is
+    not charged. Divided by the shorter length, capped at 1. With
+    --partial-merge, when the shorter length is at least
+    --partial-merge-min-size, the trimmed edges are left out of the
+    denominator (the shorter aligned middle) and the score must reach
+    min(--partial-merge-min-size, half the shorter length), else -1;
+    shorter pairs are scored as without --partial-merge. partial: that
+    scoring regardless of --partial-merge (--merge-recurrent)."""
+    if query.upper() == template.upper():
+        return 1.0
+    shorter = min(len(query), len(template))
+    if shorter == 0:
+        return 0.0
+    runs = _base_runs(body, query, template)
+    first, end = _edge_trim_bounds(runs) or (len(runs), len(runs))
+
+    def spans(part):
+        return (sum(count for count, op in part if op in "=XI"),
+                sum(count for count, op in part if op in "=XD"))
+
+    (q_left, t_left), (q_right, t_right) = spans(runs[:first]), spans(runs[end:])
+    score, gap = 0, None
+    for count, op in [(t_left, "D"), (q_left, "I"), *runs[first:end], (q_right, "I"), (t_right, "D")]:
+        if not count:
+            continue
+        if op == "=":
+            score, gap = score + count, None
+        elif op == "X":
+            score, gap = score - 2 * count, None
+        else:
+            if gap != op:
+                score -= 2
+            gap = op
+    if len(query) != len(template):
+        score += 2
+    min_size = int(_FAST_CONTEXT.get("partial_merge_min_size", _PARTIAL_MERGE_MIN_SIZE))
+    if partial is None:
+        partial = bool(_FAST_CONTEXT.get("partial_merge"))
+    if not partial or shorter < min_size:
+        return min(1.0, score / float(shorter))
+    middle = min(len(query) - q_left - q_right, len(template) - t_left - t_right)
+    minimum = min(min_size, 0.5 * shorter)
+    if middle <= 0 or score < minimum:
+        return -1.0
+    return min(1.0, score / float(middle))
+
+
+def _stitch_score(body: str, query: str, template: str) -> float:
+    """Score of an alignment BODY of QUERY on TEMPLATE that decides whether a
+    stitched stretch is aligned (_stitch_gap_body): +1 per matched base, -2
+    per mismatch, and a gap costs _gap_cost (adjacent runs of one kind are
+    one gap). The one gap the length difference forces is not charged; the
+    score is divided by the shorter length."""
+    if query.upper() == template.upper():
+        return 1.0
+    shorter = min(len(query), len(template))
+    if shorter == 0:
+        return 0.0
+    score, q, t, gap = 0, 0, 0, None
+    for count_text, op in _FAST_CHUNK_OPS.findall(body or ""):
+        count = int(count_text)
+        if op in "=XM":
+            if op == "=":
+                score += count
+            elif op == "X":
+                score -= 2 * count
+            else:
+                score += sum(1 if a == b else -2 for a, b in zip(
+                    query[q:q + count].upper(), template[t:t + count].upper()))
+            q, t, gap = q + count, t + count, None
+        elif op in "ISDH":
+            kind = "I" if op in "IS" else "D"
+            score -= count if gap == kind else _gap_cost(count)
+            gap = kind
+            if kind == "I":
+                q += count
+            else:
+                t += count
+    score += _gap_cost(abs(len(query) - len(template)))
+    return min(1.0, score / float(shorter))
+
+
+def _sequence_similarity(first: str, second: str, cache: Optional[dict] = None) -> float:
+    """Similarity of FIRST to SECOND exactly as the main merge decides it
+    (_fast_pair_alignment); 0 when they cannot be aligned."""
+    import graphreftovcf as core
+    return _fast_pair_alignment(first or "", second or "", {} if cache is None else cache, core)[0]
 
 
 def _merge_intervals(intervals: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
@@ -3272,8 +3435,6 @@ def _sample_alignment_cigar(body: Optional[str]) -> str:
 
 
 def _make_single_thread_insertion_aligner(core, target_sequence: str):
-    if core.mappy is None:
-        raise RuntimeError("mappy is unavailable")
     preset = "sr" if len(target_sequence) < 1000 else "asm10"
     return core.mappy.Aligner(
         seq=target_sequence, preset=preset, best_n=5, n_threads=1,
@@ -3357,9 +3518,11 @@ def _fast_record_id(file_index: int, offset: int, svtype: str) -> int:
 _FAST_CONTEXT: dict = {}
 
 
-def _init_fast_worker(context: dict) -> None:
-    global _FAST_CONTEXT
+def _init_fast_worker(context: dict, align_budget=None) -> None:
+    global _FAST_CONTEXT, _ALIGN_BUDGET
     _FAST_CONTEXT = context
+    if align_budget is not None:
+        _ALIGN_BUDGET = align_budget
 
 
 def _fast_scan_input_task(
@@ -3382,6 +3545,8 @@ def _fast_scan_input_task(
     # sample's mappings of its own QUERYCOORD strand.
     exact_intervals: Dict[Tuple[str, int, str], list] = {}
     placement_lines: list = []
+    substitutions: list = []
+    restated_deletions: set = set()
     dup_parents, dup_spans = (
         _dup_parent_spans(path, sample_indexes, sample_names)
         if exact else ({}, {})
@@ -3452,9 +3617,14 @@ def _fast_scan_input_task(
                             int(placed_reference.group(2)), int(placed_reference.group(3)),
                             placed_reference.group(4),
                         ))
-                    if (
-                        reference is not None
-                        and values.get("Category") in ("PRIMARY", "DELETION")
+                    substitution = (
+                        reference is not None and placed_query is not None
+                        and values.get("Category") == "INSERTION"
+                        and int(reference.group(3)) > int(reference.group(2))
+                    )
+                    if reference is not None and (
+                        values.get("Category") in ("PRIMARY", "DELETION")
+                        or substitution
                     ):
                         name = values.get("Sample", "")
                         if name not in file_samples:
@@ -3464,12 +3634,20 @@ def _fast_scan_input_task(
                                     f"{name!r} is not a column of this VCF"
                                 )
                             name = next(iter(file_samples))
-                        exact_intervals.setdefault(
-                            (reference.group(1), file_samples[name],
-                             placed_query.group(4) if placed_query is not None else ""), [],
-                        ).append((
-                            int(reference.group(2)), int(reference.group(3)),
-                        ))
+                        key = (reference.group(1), file_samples[name],
+                               placed_query.group(4) if placed_query is not None else "")
+                        span = (int(reference.group(2)), int(reference.group(3)))
+                        point = (key[:2], placed_query.group(1) if placed_query else "",
+                                 int(placed_query.group(2)) if placed_query else -1, span)
+                        if substitution:
+                            # A grouped insertion replacing a reference span:
+                            # called as a deletion's span is, where no
+                            # deletion line at its query start lists it.
+                            substitutions.append((point, key, span))
+                            continue
+                        if values.get("Category") == "DELETION":
+                            restated_deletions.add(point)
+                        exact_intervals.setdefault(key, []).append(span)
                 continue
             if length < 2:
                 continue
@@ -3574,11 +3752,27 @@ def _fast_scan_input_task(
                 ]
                 dup_dropped += len(observations) - len(kept)
                 observations = kept
+            # The insertion of a split substitution (DEL + INS from one
+            # record) is linked with other insertions by the interval its
+            # deletion replaces, not by its point (the record end below; the
+            # observation itself, and every merged row, keep the point).
+            replaced_end = {
+                (observation.source_row_id, observation.sample_index):
+                    observation.pos + observation.size
+                for observation in observations
+                if observation.svtype == "DEL"
+                and observation.row_id == f"{observation.source_row_id}_DEL"
+            }
             seen_types = set()
             for observation in observations:
+                record_end = observation.end
+                if (observation.svtype == "INS"
+                        and observation.row_id == f"{observation.source_row_id}_INS"):
+                    record_end = max(record_end, replaced_end.get(
+                        (observation.source_row_id, observation.sample_index), record_end))
                 if not (
                     0 <= observation.pos < _FAST_U32_LIMIT
-                    and 0 <= observation.end < _FAST_U32_LIMIT
+                    and 0 <= record_end < _FAST_U32_LIMIT
                     and 0 <= observation.size < _FAST_U32_LIMIT
                     and 0 <= observation.sample_index < _FAST_U32_LIMIT
                 ):
@@ -3601,7 +3795,7 @@ def _fast_scan_input_task(
                     (observation.chrom, kind), bytearray(),
                 ).extend(
                     _FAST_PACK.pack(
-                        observation.pos, observation.end,
+                        observation.pos, record_end,
                         observation.size, line_offset,
                         observation.sample_index,
                     ),
@@ -3636,6 +3830,9 @@ def _fast_scan_input_task(
             file=sys.stderr,
         )
     if exact:
+        for point, key, span in substitutions:
+            if point not in restated_deletions:
+                exact_intervals.setdefault(key, []).append(span)
         snp_index.write(records_dir, file_index)
         # The top-level planner does not see templated copies (they are
         # merged on their templates): it locks these query intervals.
@@ -4242,7 +4439,6 @@ def _fast_fetch_observation(
 
 _FAST_CHUNK_OPS = re.compile(r"(\d+)([A-Za-z=])")
 _FAST_ROW_POSITION_SHIFT = re.compile(r"^([<>])(\d+)H(?=[<>])")
-_PARASAIL_NW_MATRIX = None
 
 
 def _fast_split_row_position_shift(cigar: str) -> Tuple[int, str]:
@@ -4374,118 +4570,132 @@ def _fast_python_global_cigar(seq_a: str, seq_b: str) -> str:
     return "".join(body)
 
 
+# Pairs up to this length are aligned end to end with parasail under the
+# merge scoring; longer pairs are assembled from minimap2 hits with parasail
+# filling the stretches between them (_stitched_body), whose scores come
+# within 0.01 of the best alignment's at a fraction of the cost. A full
+# traceback needs about 4 bytes per cell (5 kb x 5 kb: 0.1 GB, 0.04 s).
+_GLOBAL_ALIGN_MAX = 5_000
+_SCHEME_MATRIX = None
+
+
+def _scheme_global_body(query: str, template: str) -> str:
+    """Best global alignment body of QUERY (member) on TEMPLATE
+    (representative) under the merge scoring: +1 per matched base, -2 per
+    mismatch, -2 to open a gap and -1 per further gap base."""
+    global _SCHEME_MATRIX
+    if not query or not template:
+        return (f"{len(template)}D" if template else "") + (f"{len(query)}I" if query else "")
+    if _SCHEME_MATRIX is None:
+        _SCHEME_MATRIX = parasail.matrix_create("ACGTN", 1, -2)
+    result = parasail.nw_trace_striped_32(
+        re.sub(r"[^ACGTN]", "N", query.upper()), re.sub(r"[^ACGTN]", "N", template.upper()),
+        2, 1, _SCHEME_MATRIX,
+    )
+    body = result.cigar.decode
+    return body.decode("ascii") if isinstance(body, bytes) else body
+
+
+def _stitch_gap_body(query_part: str, template_part: str, left: bool) -> str:
+    """Body of a stretch between or beyond the hits of a stitched alignment:
+    aligned end to end (_scheme_global_body) when both sides have bases, are
+    at most _GLOBAL_ALIGN_MAX long and the alignment scores at least 0
+    (_stitch_score: unrelated stretches score below); otherwise the
+    representative bases are deleted and the member bases inserted (D then I,
+    except after the last hit: I then D)."""
+    if (query_part and template_part
+            and max(len(query_part), len(template_part)) <= _GLOBAL_ALIGN_MAX):
+        body = _scheme_global_body(query_part, template_part)
+        if _stitch_score(body, query_part, template_part) >= 0:
+            return body
+    deleted = f"{len(template_part)}D" if template_part else ""
+    inserted = f"{len(query_part)}I" if query_part else ""
+    return deleted + inserted if left else inserted + deleted
+
+
+def _stitched_body(query: str, template: str, aligner) -> Optional[str]:
+    """Pseudo semi-global body of a long pair (as graphcigartoref assembles
+    minimap2 hits): the forward hits chained in order on both sequences with
+    the most matched bases, the stretches between and beyond them by
+    _stitch_gap_body. None without a forward hit."""
+    hits = sorted((hit for hit in aligner.map(query) if hit.strand == 1 and hit.cigar_str),
+                  key=lambda hit: (hit.q_st, hit.r_st, hit.q_en, hit.r_en))
+    if not hits:
+        return None
+    best = [hit.mlen for hit in hits]
+    previous = [-1] * len(hits)
+    for i, hit in enumerate(hits):
+        for j in range(i):
+            other = hits[j]
+            if (other.q_en <= hit.q_st and other.r_en <= hit.r_st
+                    and best[j] + hit.mlen > best[i]):
+                best[i], previous[i] = best[j] + hit.mlen, j
+    index = max(range(len(hits)), key=lambda k: (best[k], -k))
+    chain = []
+    while index >= 0:
+        chain.append(hits[index])
+        index = previous[index]
+    parts, q, t = [], 0, 0
+    for hit in reversed(chain):
+        parts.append(_stitch_gap_body(query[q:hit.q_st], template[t:hit.r_st], True))
+        parts.append(hit.cigar_str)
+        q, t = hit.q_en, hit.r_en
+    parts.append(_stitch_gap_body(query[q:], template[t:], False))
+    return "".join(parts)
+
+
+def _pair_body(query: str, template: str, aligner_factory) -> Optional[str]:
+    """Alignment body of QUERY (member) on TEMPLATE (representative): N= when
+    identical, the best global alignment up to _GLOBAL_ALIGN_MAX, otherwise
+    the stitched minimap2 hits (ALIGNER_FACTORY() gives the template's
+    index; None without a forward hit)."""
+    if query.upper() == template.upper():
+        return f"{len(query)}="
+    if max(len(query), len(template)) <= _GLOBAL_ALIGN_MAX:
+        return _scheme_global_body(query, template)
+    return _stitched_body(query, template, aligner_factory())
+
+
 def _fast_parasail_alignment(
     seq_a: str, seq_b: str,
 ) -> Tuple[float, Optional[str]]:
-    """Global member-to-representative CIGAR plus Truvari similarity."""
-    global _PARASAIL_NW_MATRIX
-    upper_a = seq_a.upper()
-    upper_b = seq_b.upper()
-    if parasail is None:
-        return (
-            _truvari_seqsim(seq_a, seq_b),
-            _fast_python_global_cigar(seq_a, seq_b),
-        )
-    if _PARASAIL_NW_MATRIX is None:
-        _PARASAIL_NW_MATRIX = parasail.matrix_create("ACGTN", 2, -3)
-    clean_a = re.sub(r"[^ACGTN]", "N", upper_a)
-    clean_b = re.sub(r"[^ACGTN]", "N", upper_b)
-    result = parasail.nw_trace_striped_16(
-        clean_a, clean_b, 4, 4, _PARASAIL_NW_MATRIX,
-    )
-    if result.saturated:
-        result = parasail.nw_trace_striped_32(
-            clean_a, clean_b, 4, 4, _PARASAIL_NW_MATRIX,
-        )
-    body = result.cigar.decode
-    if isinstance(body, bytes):
-        body = body.decode("ascii")
-    return _truvari_seqsim(seq_a, seq_b), body
+    """Best global alignment body under the merge scoring and its
+    similarity (_body_similarity)."""
+    body = _scheme_global_body(seq_a, seq_b)
+    return _body_similarity(body, seq_a, seq_b), body
 
 
 def _fast_pair_alignment(
-    seq_a: str, seq_b: str, aligner_cache: dict, core,
+    seq_a: str, seq_b: str, aligner_cache: dict, core, partial: Optional[bool] = None,
 ) -> Tuple[float, Optional[str]]:
-    """Align member seq_a against representative seq_b.
+    """Align member seq_a against representative seq_b (_pair_body).
 
-    Returns (Truvari sequence similarity, cigar body on the representative
-    axis).  Similarity is exactly ``(L1 + L2 - editDistance) / (L1 + L2)``;
-    mappy/parasail supplies only the CIGAR needed for the merged sample.
-    A failed alignment still keeps the member out because no valid output
-    CIGAR can be emitted.  Kernels: trivial N= for identical pairs, 1-to-1
-    runs for pairs both <=5bp, exact global alignment under 200bp, mappy from
-    200bp with an exact rescue on no-hit under 1kb (reverse-strand hits are
-    treated as failures).
+    Returns (sequence similarity, cigar body on the representative axis).
+    The similarity is the merge score of that body (_body_similarity): edges
+    trimmed, +1 per matched base, -2 per mismatch, -2 per gap, the gap the
+    length difference forces not charged, over the shorter length.
+    A pair without an alignment (long, no forward minimap2 hit) is (0, None)
+    and keeps the member out, as no output CIGAR can be emitted. partial:
+    passed to _body_similarity.
     """
     if not seq_a or not seq_b:
         return 0.0, None
-    if seq_a.upper() == seq_b.upper():
-        return 1.0, f"{len(seq_a)}="
-    if len(seq_a) == len(seq_b) <= 5:
-        # Equal short lengths: a base-by-base =/X run. Unequal short pairs
-        # need a real alignment to place the gap (ACG vs CG is 1I2=, not
-        # 2X1I), so they take the global aligner below.
-        upper_a = seq_a.upper()
-        upper_b = seq_b.upper()
-        body_parts = []
-        run_op = ""
-        run_len = 0
-        for x, y in zip(upper_a, upper_b):
-            op = "=" if x == y else "X"
-            if op == run_op:
-                run_len += 1
-            else:
-                if run_len:
-                    body_parts.append(f"{run_len}{run_op}")
-                run_op = op
-                run_len = 1
-        if run_len:
-            body_parts.append(f"{run_len}{run_op}")
-        return _truvari_seqsim(seq_a, seq_b), "".join(body_parts)
-    longest = max(len(seq_a), len(seq_b))
-    if longest < 200:
-        return _fast_parasail_alignment(seq_a, seq_b)
-    template = seq_b
-    query = seq_a
-    # Disk-backed pair tasks create temporary strings whose object IDs can be
-    # reused after the strings are freed. Cache by sequence content so an index
-    # can only be reused for the reference it was built from.
-    aligner = aligner_cache.get(template)
-    if aligner is None:
-        aligner = _make_single_thread_insertion_aligner(core, template)
-        aligner_cache[template] = aligner
-    best = None
-    best_score = float('-inf')
-    for hit in aligner.map(query):
-        if not hit.is_primary or hit.strand != 1 or not hit.cigar_str:
-            continue
-        # Compare the same complete allele pair; unaligned flanks cannot win
-        # merely because minimap2 reports a high native/local match count.
-        resolved = core.cigarextend(
-            hit.cigar_str, template[hit.r_st:hit.r_en], query[hit.q_st:hit.q_en],
-        )
-        padded = (f'{hit.r_st}D{hit.q_st}I' + resolved
-                  + f'{len(query) - hit.q_en}I{len(template) - hit.r_en}D')
-        score = cigar_score(padded)
-        if best is None or score > best_score:
-            best, best_score = hit, score
-    if best is None:
-        if longest < 1000:
-            return _fast_parasail_alignment(seq_a, seq_b)
+
+    def aligner():
+        # Disk-backed pair tasks create temporary strings whose object IDs
+        # can be reused after the strings are freed. Cache by sequence
+        # content so an index is only reused for the reference it was built
+        # from.
+        index = aligner_cache.get(seq_b)
+        if index is None:
+            index = _make_single_thread_insertion_aligner(core, seq_b)
+            aligner_cache[seq_b] = index
+        return index
+
+    body = _pair_body(seq_a, seq_b, aligner)
+    if body is None:
         return 0.0, None
-    body_parts = []
-    if best.r_st > 0:
-        body_parts.append(f"{best.r_st}D")
-    if best.q_st > 0:
-        body_parts.append(f"{best.q_st}I")
-    body_parts.append(best.cigar_str)
-    query_tail = len(query) - best.q_en
-    if query_tail > 0:
-        body_parts.append(f"{query_tail}I")
-    template_tail = len(template) - best.r_en
-    if template_tail > 0:
-        body_parts.append(f"{template_tail}D")
-    return _truvari_seqsim(seq_a, seq_b), "".join(body_parts)
+    return _body_similarity(body, seq_a, seq_b, partial), body
 
 
 def _final_pair_alignment(
@@ -4495,7 +4705,7 @@ def _final_pair_alignment(
     similarity, body = _fast_pair_alignment(
         seq_a, seq_b, aligner_cache, core,
     )
-    if body is not None or edlib is None:
+    if body is not None:
         return similarity, body
     if not seq_a or not seq_b:
         # edlib gives no path when one side is empty; the only alignment is
@@ -4509,12 +4719,7 @@ def _final_pair_alignment(
     cigar = result.get("cigar")
     if not cigar:
         raise RuntimeError("edlib returned no global alignment CIGAR")
-    total = len(seq_a or "") + len(seq_b or "")
-    distance = int(result.get("editDistance", total))
-    exact_similarity = (
-        1.0 if total == 0 else (total - distance) / float(total)
-    )
-    return exact_similarity, str(cigar)
+    return _body_similarity(str(cigar), seq_a or "", seq_b or ""), str(cigar)
 
 
 def _pure_insertion_alignment_body(
@@ -4542,6 +4747,9 @@ def _fast_winnowmap_enabled(context: dict, rep_seq: str, core) -> bool:
     bases exceed 1K - long repeats are what its weighted minimizer
     sampling is built for; everything else stays on the mappy ladder."""
     if not context.get("winnowmap"):
+        return False
+    if len(rep_seq) <= _GLOBAL_ALIGN_MAX:
+        # Aligned end to end with parasail like every pair of this size.
         return False
     masked = len(rep_seq) - core.count_unmasked_bases(rep_seq)
     return masked > _FAST_WINNOWMAP_MASKED
@@ -4638,9 +4846,23 @@ def _fast_winnowmap_align_batch(
                 body_parts.append(f"{query_len - q_en}I")
             if rep_len - t_en > 0:
                 body_parts.append(f"{rep_len - t_en}D")
-            similarity = (2.0 * matches) / max(
-                1, query_len + rep_len,
-            )
+            # Candidate sequences are not kept here (written to the batch
+            # FASTA only), so these ends stay a deletion plus an insertion.
+            # _body_similarity from the PAF: aligned bases that are not
+            # matches are mismatches; the unaligned ends are gaps.
+            score, aligned, gap = matches, 0, None
+            for count_text, op in _FAST_CHUNK_OPS.findall(cg):
+                count = int(count_text)
+                if op in "M=X":
+                    aligned, gap = aligned + count, None
+                elif op in "ID":
+                    score -= count if gap == op else _gap_cost(count)
+                    gap = op
+            score -= 2 * (aligned - matches)
+            score -= sum(_gap_cost(length) for length in (
+                t_st, q_st, query_len - q_en, rep_len - t_en))
+            score += _gap_cost(abs(query_len - rep_len))
+            similarity = min(1.0, score / float(max(1, min(query_len, rep_len))))
             verdicts[number] = (similarity, "".join(body_parts))
     except subprocess.CalledProcessError as error:
         detail = (
@@ -5603,13 +5825,7 @@ def _fast_refine_giant(
                 write_candidates, workers,
             )
             verdicts = []
-            for locator, (_alignment_score, body) in zip(
-                gated_locators, alignment_results,
-            ):
-                candidate_sequence = _fast_read_giant_sequence(locator)
-                similarity = _truvari_seqsim(
-                    candidate_sequence, rep_sequence,
-                )
+            for similarity, body in alignment_results:
                 verdicts.append((
                     similarity >= float(context["sequence_similarity"])
                     and body is not None,
@@ -5689,6 +5905,9 @@ _EXACT_READERS: Dict[str, object] = {}
 
 
 _EXACT_OPEN_FILES = 16      # open assembly FASTAs per thread
+# and per realignment thread (_exact_realign_all; closed after each task), so
+# a process keeps at most 16 + 8 x --processes FASTAs open (32: 272).
+_EXACT_ALIGN_THREAD_FILES = 8
 _EXACT_INDEXES = 256        # parsed .fai indexes kept per process
 _EXACT_INDEX_LOCK = threading.Lock()
 _EXACT_LOCAL = threading.local()
@@ -5730,7 +5949,7 @@ def _exact_reader(path: str, index: Optional[str] = None):
         # Shares the parsed index; __setstate__ opens this thread's file.
         reader = copy.copy(template)
     readers[path] = reader
-    while len(readers) > _EXACT_OPEN_FILES:
+    while len(readers) > getattr(_EXACT_LOCAL, "open_files", _EXACT_OPEN_FILES):
         os.close(readers.pop(next(iter(readers))).fd)
     return reader
 
@@ -5888,7 +6107,7 @@ def _exact_guard(function):
 @_exact_guard
 def _exact_realign_member(member, representative, exact, aligner_cache, core,
                           path_sequence=None, flank_gaps=False, others=(),
-                          flank_snps=False):
+                          flank_snps=False, prefer_pair=False):
     """Move a member inserted at another breakpoint onto the representative.
 
     Over the window between both breakpoints, the member's assembly bases are
@@ -5897,6 +6116,9 @@ def _exact_realign_member(member, representative, exact, aligner_cache, core,
     the representative (a gap at a junction counts as inside); the member's
     allele and QUERYCOORD are then the query bases aligned to the
     representative. Returns (moved observation, body) or (None, reason).
+    prefer_pair (--merge-recurrent): two pure insertions take the alignment
+    built from their pair alignment (below) whenever it walks, not only when
+    the window alignment fails.
     """
     s_m, e_m = member.pos, max(member.pos, member.end)
     s_r, e_r = representative.pos, max(representative.pos, representative.end)
@@ -5947,8 +6169,8 @@ def _exact_realign_member(member, representative, exact, aligner_cache, core,
     # the skipped reference bases join the moved allele at the junction and
     # are deleted from the flank. SNPs of the sample there travel with them.
     if (flank_gaps and all(other.svtype == "SNP" for other in others)
-            and s_m == e_m and s_r == e_r and s_m != s_r
-            and (isinstance(walked, str)
+            and s_m == e_m and s_r == e_r and (s_m != s_r or prefer_pair)
+            and (prefer_pair or isinstance(walked, str)
                  or any(edit[0] == "SNP" for edit in walked[2]))):
         shift = abs(s_m - s_r)
         _similarity, member_body = _final_pair_alignment(
@@ -5958,7 +6180,10 @@ def _exact_realign_member(member, representative, exact, aligner_cache, core,
             member_body = _pure_insertion_alignment_body(
                 member.sequence, representative.sequence,
             )
-        canonical = (f"{shift}I{member_body}{shift}D" if s_m > s_r
+        elif prefer_pair:
+            member_body = _trimmed_body(member_body, member.sequence, representative.sequence)
+        canonical = (member_body if not shift
+                     else f"{shift}I{member_body}{shift}D" if s_m > s_r
                      else f"{shift}D{member_body}{shift}I")
         canonical_walk = _exact_walk(canonical, window, target, first, last, w0, e_r,
                                      qa, qb, member.qry_strand, flank_gaps, flank_snps)
@@ -5988,7 +6213,7 @@ def _exact_realign_member(member, representative, exact, aligner_cache, core,
 
 @_exact_guard
 def _exact_realign_deletion(member, representative, exact, core, path_sequence=None,
-                            flank_gaps=False, others=(), flank_snps=False):
+                            flank_gaps=False, others=(), flank_snps=False, partner=None):
     """Express a member deletion as the representative deletion plus nested
     insertions of the reference bases the member keeps.
 
@@ -5998,6 +6223,9 @@ def _exact_realign_deletion(member, representative, exact, core, path_sequence=N
     (moved observation, [(offset, bases, query_start, query_end)]) or
     (None, reason). Offsets are on the deleted interval: kept bases before
     the member's deletion sit at 0, those after it at the deletion length.
+    partner: the insertion of the member's own substitution (a point at the
+    deletion's start); it stays its own record where it is, and the kept
+    bases are those around it.
     """
     s_m, e_m = member.pos, member.pos + member.size
     s_r, e_r = representative.pos, representative.pos + representative.size
@@ -6007,8 +6235,9 @@ def _exact_realign_deletion(member, representative, exact, core, path_sequence=N
     if bases is None:
         return None, "uncovered"
     left, right = bases[:s_r - w0], bases[e_r - w0:]
-    lead = s_m - w0 + _exact_query_shift(others, w0, s_m)
-    tail = w1 - e_m + _exact_query_shift(others, e_m, w1)
+    known = (*others, partner) if partner is not None else others
+    lead = s_m - w0 + _exact_query_shift(known, w0, s_m)
+    tail = w1 - e_m + _exact_query_shift(known, e_m, w1)
     fasta, fai = exact["queries"][member.sample_name]
     reader = _exact_reader(fasta, fai)
     point = member.qry_start
@@ -6028,12 +6257,39 @@ def _exact_realign_deletion(member, representative, exact, core, path_sequence=N
         window = core.revcomp(window)
     # No other variant of the sample inside the window besides its known
     # records (see member realignment).
-    expected = _exact_apply(bases, w0, [_exact_edit(member), *map(_exact_edit, others)])
+    expected = _exact_apply(bases, w0, [_exact_edit(member), *map(_exact_edit, known)])
     if window.upper() != expected.upper():
         return None, "other_variant"
 
     def query_interval(f0, f1):
         return (qb - f1, qb - f0) if member.qry_strand == "-" else (qa + f0, qa + f1)
+
+    if partner is not None and not others:
+        # The window is the reference up to the deletion, the partner's
+        # bases, then the reference after it (purity): kept bases before
+        # the partner are a nested insertion at 0, those after it one at
+        # the deletion length; member bases deleted outside the
+        # representative are flank deletions at the point after the partner.
+        if not (flank_gaps and s_m < e_r and s_r < e_m):
+            return None, "flank_edit"
+        before, after = max(0, s_m - s_r), max(0, e_r - e_m)
+        if before and after:
+            return None, "partner_inside"
+        a = s_m - w0                     # partner's place in the window
+        b = a + len(partner.sequence)    # the deletion point after it
+        nested, flank_edits = [], []
+        if before:
+            nested.append((0, window[a - before:a], *query_interval(a - before, a)))
+        if after:
+            nested.append((e_r - s_r, window[b:b + after], *query_interval(b, b + after)))
+        if s_m < s_r:
+            flank_edits.append(("DEL", s_m, s_r, "", *query_interval(b, b)))
+        if e_m > e_r:
+            flank_edits.append(("DEL", e_r, e_m, "", *query_interval(b, b)))
+        span = query_interval(*((a - before, a) if before else (b, b + after)))
+        moved = _exact_with(member, pos=s_r, end=representative.end,
+                            qry_start=span[0], qry_end=span[1])
+        return moved, (nested, flank_edits, (qa, qb))
 
     if others:
         if not flank_gaps:
@@ -6114,11 +6370,16 @@ def _exact_realign_deletion(member, representative, exact, core, path_sequence=N
 
 
 def _exact_split_shifted(row_id, observations, rep_slot, bodies, exact, decisions,
-                         extras=(), flank_rows=(), separate_extras=()):
+                         extras=(), flank_rows=(), separate_extras=(), flank_names=None):
     """Rows for one refined INS/DEL group under --exact, from the locus plan
     (see _exact_plan_moves): the kept group with moved members, one row per
-    distinct separated member, and one row per flank gap; superseded
-    members are dropped (their bases are in another move's flank gaps)."""
+    distinct separated member not merged again, and one row per flank row
+    (new SVs and separated members merged again, _exact_place_leftovers; a
+    flank row in flank_names is a new group with that ID, the others are
+    <row ID>_F<n>); superseded members are dropped (their bases are in
+    another move's flank gaps). A row merged into a longer one
+    (--merge-recurrent: every member _RECURRENT_MERGED) keeps only its
+    separated and flank rows."""
     if decisions[rep_slot] == ("drop",):
         # A superseded single-record group has no row (it owns no flank SVs:
         # only groups with a moved member do).
@@ -6132,9 +6393,12 @@ def _exact_split_shifted(row_id, observations, rep_slot, bodies, exact, decision
                 else (observation.pos, max(observation.pos, observation.end)))
 
     rep_span = span(representative)
+    merged_away = decisions[rep_slot] is not None and decisions[rep_slot][0] == _RECURRENT_MERGED
     for slot, (observation, body, decision) in enumerate(
         zip(observations, bodies, decisions),
     ):
+        if decision is not None and decision[0] == _RECURRENT_MERGED:
+            continue
         if (slot != rep_slot and decision is None and span(observation) == rep_span
                 and _size_similarity(abs(observation.size), abs(representative.size))
                 < _EXACT_SAME_BREAKPOINT_SIZE):
@@ -6153,7 +6417,9 @@ def _exact_split_shifted(row_id, observations, rep_slot, bodies, exact, decision
         elif decision[0] == "drop":
             continue
         elif decision[0] == "separate":
-            separate.append(observation)
+            if len(decision) < 3:
+                separate.append(observation)
+            # else merged again: on a flank row of the locus plan
         else:
             _move, moved, result, _edits = decision
             kept.append(moved)
@@ -6164,7 +6430,12 @@ def _exact_split_shifted(row_id, observations, rep_slot, bodies, exact, decision
         kept_bodies.append(body)
     # Leftover SVs identical to a separated member share its row.
     separate.extend(separate_extras)
-    groups = [(row_id, kept, kept.index(representative), kept_bodies, None)]
+    if merged_away:
+        if kept:
+            raise ValueError(f"--merge-recurrent: row {row_id!r} merged away keeps members")
+        groups = []
+    else:
+        groups = [(row_id, kept, kept.index(representative), kept_bodies, None)]
     # Separated members identical in position, span and bases share a row.
     identical: Dict[tuple, list] = {}
     for observation in separate:
@@ -6179,14 +6450,22 @@ def _exact_split_shifted(row_id, observations, rep_slot, bodies, exact, decision
         ]
         groups.append((separate_id, members, 0, bodies_same,
                        (separate_id, members[0].size)))
-    # Flank SVs not relinked: one row per distinct allele (all its samples).
-    for number, members in enumerate(flank_rows, 1):
-        flank_id = f"{row_id}_F{number}"
+    # Flank SVs not relinked: one row per distinct allele (all its samples);
+    # a (member, body) entry is a member moved onto the row's allele.
+    flank_number = 0
+    for index, entries in enumerate(flank_rows):
+        if flank_names and index in flank_names:
+            flank_id = flank_names[index]
+        else:
+            flank_number += 1
+            flank_id = f"{row_id}_F{flank_number}"
+        members = [entry[0] if isinstance(entry, tuple) else entry for entry in entries]
         bodies_same = [None] + [
-            (f"{len(member.sequence)}=" if member.sequence else None)
-            for member in members[1:]
+            entry[1] if isinstance(entry, tuple)
+            else (f"{len(entry.sequence)}=" if entry.sequence else None)
+            for entry in entries[1:]
         ]
-        groups.append((flank_id, list(members), 0, bodies_same,
+        groups.append((flank_id, members, 0, bodies_same,
                        (flank_id, members[0].size)))
     return groups
 
@@ -6245,7 +6524,7 @@ def _fast_emit_task_rows(
                 row_id, observations, rep_slot, list(member_bodies), exact,
                 [group_plan.get(ref) for ref in member_refs],
                 group_plan.get("__extra__", ()), group_plan.get("__flank__", ()),
-                group_plan.get("__separate__", ()),
+                group_plan.get("__separate__", ()), group_plan.get("__names__"),
             )
         for row_id, observations, rep_slot, member_bodies, extra in groups:
             representative = observations[rep_slot]
@@ -6501,11 +6780,12 @@ def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
 
     Nested variants are not realigned: a shifted member only moves onto its
     group's row by the top level's movement rule (_exact_movement_interval),
-    with the parent path's bases as the reference. Its breakpoint is at most
-    10% of its size and less than 50 bp from the representative's, the
-    sample has no other call (candidate or INS_SNP) between both breakpoints
-    and no other allele on that row, and the moved allele maps at least 70%
-    of the row's; the shift is written as edge I/D (flank SVs, placed by
+    with the parent path's bases as the reference. A deletion moves whatever
+    its breakpoint distance; an insertion only when its breakpoint is at most
+    10% of its size and less than 50 bp from the representative's and the
+    moved allele maps at least 50% of the row's. Either only when the sample
+    has no other call (candidate or INS_SNP) between both breakpoints and no
+    other allele on that row; the shift is written as edge I/D (flank SVs, placed by
     _exact_round_relink) and flank mismatches (new INS_SNPs, records for the
     SNP concat stage). Nothing is superseded. Any other shifted member stays
     its own nested row. Each accepted move locks its moved allele and flank
@@ -6606,6 +6886,8 @@ def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
     locked: Dict[int, _ExactLocks] = defaultdict(_ExactLocks)
     new_spans: Dict[int, _ExactSpans] = defaultdict(_ExactSpans)
     flank_owned: List[tuple] = []     # (owning group number, flank candidate)
+    # Moved index -> (flank_owned range, SNP adds range, superseded others).
+    move_products: Dict[int, tuple] = {}
     reasons: Dict[str, int] = defaultdict(int)
     cache: dict = {}
     for w0, w1, number, index, pick, svtype in moves:
@@ -6623,7 +6905,10 @@ def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
         inside = [record for record in by_sample[sample].near(w0, w1)
                   if record[2] != index and inside_window(record)]
         reason = None
-        if any(record[0] < w0 or record[1] > w1 for record in inside):
+        if _FAST_CONTEXT.get("shift") is False:
+            # --no-shift: every shifted nested member keeps its own row.
+            reason = "shift_disabled"
+        elif any(record[0] < w0 or record[1] > w1 for record in inside):
             reason = "other_crosses_window"
         elif any(record[4] for record in inside):
             reason = "other_is_representative"
@@ -6653,7 +6938,7 @@ def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
             # When the larger allele is below the SV size cutoff, a line takes
             # only exact matches (same breakpoint and bases): never moved.
             reason = "exact_small"
-        if reason is None:
+        if reason is None and svtype != "DEL":
             distance = max(abs(own[0] - row[0]), abs(own[1] - row[1]))
             size = max(own[1] - own[0] + len(own[2]), row[1] - row[0] + len(row[2]))
             if distance > _EXACT_MOVEMENT_SHARE * size or distance >= _EXACT_MOVEMENT_MAX:
@@ -6673,14 +6958,9 @@ def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
                 reason = result
             else:
                 qa, qb = result[2]
-                body = result[0]
-                if svtype == "DEL":
-                    share = 1.0 - sum(len(piece[1]) for piece in body) / max(1, row[1] - row[0])
-                else:
-                    share = _exact_body_score_matches(
-                        body, moved_item.sequence, representative.sequence,
-                    ) / max(1, len(representative.sequence))
-                if share < _EXACT_MIN_MAPPED:
+                if svtype != "DEL" and _exact_mapped_share(_exact_body_score_matches(
+                        result[0], moved_item.sequence, representative.sequence,
+                ), moved_item.sequence, representative.sequence) < _EXACT_MIN_MAPPED:
                     reason = "low_mapped"
                 elif locked[sample[0]].overlaps(member.qry_contig, qa, qb):
                     reason = "locked"
@@ -6689,6 +6969,7 @@ def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
             reasons[reason] += 1
             continue
         body, edits, _window = result
+        products_start = (len(flank_owned), len(snp_records["adds"]))
         decisions[number][index] = ("move", moved_item, body, [])
         reasons["moved_with_flank_edits" if edits else "moved"] += 1
         moved.add(index)
@@ -6711,6 +6992,33 @@ def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
                 continue
             flank_owned.append((number, _exact_round_flank_candidate(
                 source, (kind, start, end, bases, query_start, query_end))))
+        move_products[index] = ((products_start[0], len(flank_owned)),
+                                (products_start[1], len(snp_records["adds"])), bool(inside))
+    if _FAST_CONTEXT.get("merge_recurrent") and _FAST_CONTEXT.get("shift") is not False:
+        _exact_round_merge_recurrent(groups, decisions, candidates, path_sequence, exact, {
+            "owner_of": owner_of, "record_snps": record_snps, "flank_owned": flank_owned,
+            "snp_records": snp_records, "superseded": superseded,
+            "move_products": move_products, "cache": cache,
+        }, reasons)
+    if _FAST_CONTEXT.get("shift") is not False:
+        # Separated members are merged again with this round's flank SVs
+        # (_exact_round_relink): a similar group at the same span, else rows
+        # merged around representatives; one left alone is its own row.
+        for number, (svtype, pick, chosen) in enumerate(groups):
+            rep_span = span(pick)
+            for index, _body in chosen:
+                if index == pick:
+                    continue
+                decision = decisions.get(number, {}).get(index)
+                if (decision is None and span(index) == rep_span
+                        and _size_similarity(abs(candidates[index][3]), abs(candidates[pick][3]))
+                        < _EXACT_SAME_BREAKPOINT_SIZE):
+                    decision = ("separate", "same_breakpoint_size")
+                if decision is None or decision[0] != "separate":
+                    continue
+                decisions[number][index] = (*decision[:2], "regrouped")
+                flank_owned.append((number, candidates[index]))
+                reasons["separated_merged_again"] += 1
     _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequence, exact, {
         "by_sample": by_sample, "moved": moved, "superseded": superseded,
         "locked": locked, "new_spans": new_spans, "cache": cache,
@@ -6722,6 +7030,124 @@ def _exact_round_plan(groups, candidates, path_sequence, exact, path_id=None):
               + ", ".join(f"{key}={value}" for key, value in sorted(reasons.items())),
               file=sys.stderr)
     return dict(decisions), snp_records
+
+
+def _exact_round_merge_recurrent(groups, decisions, candidates, path_sequence, exact, state,
+                                 reasons):
+    """--merge-recurrent at the end of one nested round on one path, before
+    its flank SVs are placed: the top level's rule (_exact_merge_recurrent)
+    on this round's insertion groups, in path coordinates. A group merged
+    into a longer one disappears (its members _RECURRENT_MERGED, moved into
+    the longer group's "__extra__"; its separated and flank rows stay). A
+    member this round moved onto the group is shifted from its own
+    breakpoint instead, that move's flank SVs and SNP records taken back;
+    one whose move superseded other records keeps the group."""
+    import graphreftovcf as core
+    context = _FAST_CONTEXT
+    min_size = int(context.get("partial_merge_min_size", _PARTIAL_MERGE_MIN_SIZE))
+    sequence_cut = float(context["sequence_similarity"])
+    owner_of, flank_owned = state["owner_of"], state["flank_owned"]
+    adds, move_products, cache = state["snp_records"]["adds"], state["move_products"], state["cache"]
+    heads = [(number, pick) for number, (svtype, pick, _chosen) in enumerate(groups)
+             if svtype == "INS" and candidates[pick][3] >= min_size
+             and pick not in decisions.get(number, {})]
+    if len(heads) < 2:
+        return
+    retracted = (set(), set())        # flank_owned, SNP adds taken back
+
+    def owners_on(number):
+        group = decisions.get(number, {})
+        return {owner_of(candidates[index][5]) for index, _body in groups[number][2]
+                if group.get(index, ("keep",))[0] not in ("drop", "separate", _RECURRENT_MERGED)
+                } | {owner_of(candidate[5]) for candidate, _body in group.get("__extra__", [])}
+
+    def move_group(number, target_number):
+        """Force shift every member on group number onto target_number's
+        representative; None or the reason it stays."""
+        target_candidate = candidates[groups[target_number][1]]
+        target = _exact_round_namespace(target_candidate)
+        on_target = owners_on(target_number)
+        results = []
+        for index, _body in groups[number][2]:
+            decision = decisions.get(number, {}).get(index)
+            if decision is not None:
+                if decision[0] != "move":
+                    continue      # separated and superseded members are not on the row
+                if move_products[index][2]:
+                    return "moved_member_superseded"
+            if owner_of(candidates[index][5]) in on_target:
+                return "sample_on_row"
+            member = _exact_round_item(candidates, index)
+            moved, result = _exact_realign_member(
+                member, target, exact, cache, core, path_sequence, flank_gaps=True, others=(),
+                flank_snps=True, prefer_pair=True)
+            if moved is None:
+                return result
+            results.append((index, member, moved, result))
+        for index, member, moved, (body, edits, _window) in results:
+            if index in move_products and decisions[number].get(index) is not None:
+                # Its move's results are replaced by this one's.
+                for retract, (first, last) in zip(retracted, move_products[index][:2]):
+                    retract.update(range(first, last))
+                reasons["recurrent_moves_replaced"] += 1
+            decisions[number][index] = (_RECURRENT_MERGED, target_number)
+            source = candidates[index][5]
+            decisions.setdefault(target_number, {}).setdefault("__extra__", []).append((
+                ("INS", target_candidate[1], target_candidate[2], moved.size, moved.sequence,
+                 (*source[:4], moved.qry_start, moved.qry_end, *source[6:])),
+                body or None))
+            state["record_snps"](source[0], member.qry_contig, member.qry_strand, [], edits)
+            for edit in edits:
+                if edit[0] == "SNP":
+                    reasons["recurrent_flank_snp"] += 1
+                else:
+                    flank_owned.append((target_number, _exact_round_flank_candidate(source, edit)))
+                    reasons["recurrent_flank_sv"] += 1
+        reasons["recurrent_members_moved"] += len(results)
+        return None
+
+    # Longest first; ties by position and group, so every run takes the same order.
+    order = sorted(heads, key=lambda item: (-candidates[item[1]][3], candidates[item[1]][1],
+                                            item[0]))
+    alive_starts: List[int] = []
+    alive: List[tuple] = []          # (start, number), sorted by start
+    for number, pick in order:
+        candidate = candidates[pick]
+        size = candidate[3]
+        reach = min(_EXACT_MOVEMENT_MAX - 1, int(_EXACT_MOVEMENT_SHARE * size))
+        best = None
+        for _start, target_number in alive[
+                bisect.bisect_left(alive_starts, candidate[1] - reach):
+                bisect.bisect_right(alive_starts, candidate[1] + reach)]:
+            target = candidates[groups[target_number][1]]
+            if target[3] <= size:
+                continue
+            distance = max(abs(candidate[1] - target[1]),
+                           abs(max(candidate[1], candidate[2]) - max(target[1], target[2])))
+            if distance > _EXACT_MOVEMENT_SHARE * size or distance >= _EXACT_MOVEMENT_MAX:
+                continue
+            reasons["recurrent_pairs_aligned"] += 1
+            similarity, _body = _fast_pair_alignment(
+                candidate[4], target[4], cache, core, partial=True)
+            if similarity < sequence_cut:
+                continue
+            key = (-similarity, distance, -target[3], target[1], target_number)
+            if best is None or key < best[0]:
+                best = (key, target_number)
+        if best is not None:
+            reason = move_group(number, best[1])
+            if reason is None:
+                # Its group has no row: flank SVs are never relinked into it.
+                state["superseded"].add(pick)
+                reasons["recurrent_groups_merged"] += 1
+                continue
+            reasons[f"recurrent_group_kept_{reason}"] += 1
+        position = bisect.bisect_right(alive_starts, candidate[1])
+        alive_starts.insert(position, candidate[1])
+        alive.insert(position, (candidate[1], number))
+    for values, taken in zip((flank_owned, adds), retracted):
+        if taken:
+            values[:] = [value for index, value in enumerate(values) if index not in taken]
 
 
 def _exact_round_flank_candidate(source, edit):
@@ -6736,12 +7162,16 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
                         exact, state, reasons):
     """Nested F4: place one round's flank SVs (the edge I/D of its moves).
 
-    Nested variants are not realigned: a flank SV only joins a similar group
-    of this round with the same type, position and span (no shifted joins;
-    when the larger allele is below the SV size cutoff, only an identical
-    allele); otherwise it is its
-    sample's own nested row, one row per identical allele. Decision entries:
-    "__extra__" -> [(candidate, body)], "__flank__" -> [[candidate, ...]].
+    As the top level places its leftovers (_exact_place_leftovers), without
+    realignment: a flank SV joins a similar group of this round with the same
+    type, position and span (when the larger allele is below the SV size
+    cutoff, only an identical allele); otherwise it is a new row, one per
+    identical allele. Each pass's new rows are then merged among themselves
+    (_exact_merge_leftover_rows' rule, deletions by the --exact line rule): a
+    row joins a similar one as its allele plus new SVs, and those new SVs are
+    placed the same way in the next pass. Decision entries: "__extra__" ->
+    [(candidate, body)], "__flank__" -> [[candidate, ...]]; a merged row
+    becomes a new group appended to GROUPS.
     """
     if not flank_owned:
         return
@@ -6756,11 +7186,19 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
         return (pos, pos + size) if kind == "DEL" else (pos, max(pos, end))
 
     by_type: Dict[str, list] = defaultdict(list)
-    for number, (svtype, pick, chosen) in enumerate(groups):
-        by_type[svtype].append((*span_of(candidates[pick]), number, pick, chosen))
-    for items in by_type.values():
-        items.sort(key=lambda item: (item[0], item[1], item[2]))
-    type_starts = {svtype: [item[0] for item in items] for svtype, items in by_type.items()}
+    type_starts: Dict[str, list] = {}
+
+    def index_groups():
+        """Group spans by type, including the groups merged rows became."""
+        by_type.clear()
+        for number, (svtype, pick, chosen) in enumerate(groups):
+            by_type[svtype].append((*span_of(candidates[pick]), number, pick, chosen))
+        for items in by_type.values():
+            items.sort(key=lambda item: (item[0], item[1], item[2]))
+        type_starts.clear()
+        type_starts.update({svtype: [item[0] for item in items]
+                            for svtype, items in by_type.items()})
+
     # Samples of each group, built once and kept up to date (see add_extra).
     group_samples: Dict[int, set] = {}
 
@@ -6769,7 +7207,7 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
             group = decisions.get(number, {})
             group_samples[number] = {
                 candidates[index][5][0] for index, _body in chosen
-                if group.get(index, ("keep",))[0] not in ("drop", "separate")
+                if group.get(index, ("keep",))[0] not in ("drop", "separate", _RECURRENT_MERGED)
             } | {candidate[5][0] for candidate, _body in group.get("__extra__", [])}
         return group_samples[number]
 
@@ -6792,15 +7230,161 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
             return None
         if candidate[0] != "INS":
             return 1.0
-        value = _truvari_seqsim(candidate[4], rep_candidate[4])
+        value = _sequence_similarity(candidate[4], rep_candidate[4], state["cache"])
         return value if value >= sequence_similarity else None
 
+    def similar_row(rep_candidate, candidate, sequence=True):
+        """The leftover-merge rule between two new rows' alleles; an
+        insertion also within the movement rule. The sequence similarity
+        last, and only with SEQUENCE."""
+        first, second = rep_candidate[3], candidate[3]
+        if max(first, second) < minsvsize or _size_similarity(first, second) < size_similarity:
+            return False
+        if candidate[0] == "DEL":
+            shared = (min(rep_candidate[1] + first, candidate[1] + second)
+                      - max(rep_candidate[1], candidate[1]))
+            return shared >= _EXACT_DEL_OVERLAP * first
+        if abs(rep_candidate[1] - candidate[1]) > merge_distance:
+            return False
+        own, row = span_of(candidate), span_of(rep_candidate)
+        distance = max(abs(own[0] - row[0]), abs(own[1] - row[1]))
+        if (distance > _EXACT_MOVEMENT_SHARE * max(own[1] - own[0] + second, row[1] - row[0] + first)
+                or distance >= _EXACT_MOVEMENT_MAX):
+            return False
+        return not sequence or _sequence_similarity(
+            candidate[4], rep_candidate[4], state["cache"]) >= sequence_similarity
+
+    def move_onto(candidate, rep_candidate):
+        """(moved, body, edits) of CANDIDATE as REP_CANDIDATE's allele plus new
+        SVs (the movement rule, no realignment), or (None, reason)."""
+        member = _exact_round_namespace(candidate)
+        representative = _exact_round_namespace(rep_candidate)
+        if candidate[0] == "DEL":
+            moved, result = _exact_realign_deletion(
+                member, representative, exact, core, path_sequence,
+                flank_gaps=True, others=(), flank_snps=True)
+        else:
+            own, row = _exact_edit(member), _exact_edit(representative)
+            distance = max(abs(own[0] - row[0]), abs(own[1] - row[1]))
+            size = max(own[1] - own[0] + len(own[2]), row[1] - row[0] + len(row[2]))
+            if distance > _EXACT_MOVEMENT_SHARE * size or distance >= _EXACT_MOVEMENT_MAX:
+                return None, "beyond_movement"
+            moved, result = _exact_realign_member(
+                member, representative, exact, state["cache"], core, path_sequence,
+                flank_gaps=True, others=(), flank_snps=True)
+        if moved is None:
+            return None, result
+        body, edits, _window = result
+        if candidate[0] != "DEL" and _exact_mapped_share(_exact_body_score_matches(
+                body, moved.sequence, representative.sequence,
+        ), moved.sequence, representative.sequence) < _EXACT_MIN_MAPPED:
+            return None, "low_mapped"
+        return (moved, body, edits), None
+
+    def row_to_group(key):
+        """Turn new row KEY into a group of this round (its carriers share
+        the allele), for members moved onto it."""
+        row = rows.pop(key)
+        flank = decisions[row_owner.pop(key)]["__flank__"]
+        flank[:] = [entry for entry in flank if entry is not row]
+        indexes = []
+        for candidate in row:
+            candidates.append(candidate)
+            indexes.append(len(candidates) - 1)
+        svtype = key[0]
+        groups.append((svtype, indexes[0], [(indexes[0], None)] + [
+            (index, None if svtype == "DEL" else f"{candidates[index][3]}=")
+            for index in indexes[1:]]))
+        return len(groups) - 1
+
+    def merge_rows(keys, produced):
+        """Merge one pass's new rows (_exact_merge_leftover_rows' rule): in
+        size order (the smallest deletion or largest insertion first), each
+        row is tested against the representatives found so far, in that
+        order; another sample's allele moves onto the first one it passes,
+        and a row with samples left becomes the next representative. The
+        sequence similarity is checked last (it aligns)."""
+        by_kind: Dict[str, list] = defaultdict(list)
+        for key in keys:
+            if rows.get(key):
+                by_kind[key[0]].append(key)
+        for svtype, kind_keys in sorted(by_kind.items()):
+            if len(kind_keys) < 2:
+                continue
+            order = sorted(kind_keys, key=lambda key: (
+                -_representative_size(svtype, rows[key][0][3]), key[1], key[2], key[3]))
+            rep_starts: List[int] = []
+            reps: List[tuple] = []        # (start, rank, key), sorted by start
+            found: Dict[tuple, list] = {}  # key -> [candidate, owners, group number]
+            for rank, key in enumerate(order):
+                row = rows[key]
+                first = row[0]
+                # A deletion representative (no larger) overlapping half of
+                # itself starts at most this row's size before it; an
+                # insertion one lies within the merge distance.
+                if svtype == "DEL":
+                    low, high = key[1] - first[3] - 1, key[2]
+                else:
+                    low, high = key[1] - merge_distance, key[1] + merge_distance
+                nearby = sorted(reps[bisect.bisect_left(rep_starts, low):
+                                     bisect.bisect_right(rep_starts, high)],
+                                key=lambda item: item[1])
+                for _start, _rank, rep_key in nearby:
+                    if not row:
+                        break
+                    rep_candidate, owners, number = found[rep_key]
+                    if not similar_row(rep_candidate, first, sequence=False):
+                        continue
+                    if all(state["owner_of"](candidate[5]) in owners for candidate in row):
+                        continue
+                    if svtype != "DEL" and _sequence_similarity(
+                            first[4], rep_candidate[4], state["cache"]) < sequence_similarity:
+                        continue
+                    for candidate in list(row):
+                        owner = state["owner_of"](candidate[5])
+                        if owner in owners:
+                            continue
+                        moved, reason = move_onto(candidate, rep_candidate)
+                        if moved is None:
+                            reasons[f"flank_merge_{reason}"] += 1
+                            continue
+                        moved_item, body, edits = moved
+                        if number is None:
+                            number = found[rep_key][2] = row_to_group(rep_key)
+                        candidates.append(candidate)
+                        groups[number][2].append((len(candidates) - 1, None))
+                        decisions[number][len(candidates) - 1] = ("move", moved_item, body, [])
+                        row.remove(candidate)
+                        owners.add(owner)
+                        source = candidate[5]
+                        state["record_snps"](source[0], source[1], source[6], [], edits)
+                        for edit in edits:
+                            if edit[0] == "SNP":
+                                reasons["flank_ins_snp"] += 1
+                            else:
+                                produced.append((number, _exact_round_flank_candidate(source, edit)))
+                        reasons["flank_sv_merged"] += 1
+                if row:
+                    # Samples left: the next representative.
+                    slot = bisect.bisect_right(rep_starts, key[1])
+                    rep_starts.insert(slot, key[1])
+                    reps.insert(slot, (key[1], rank, key))
+                    found[key] = [first, {state["owner_of"](candidate[5]) for candidate in row},
+                                  None]
+                else:
+                    flank = decisions[row_owner.pop(key)]["__flank__"]
+                    flank[:] = [entry for entry in flank if entry is not row]
+                    del rows[key]
+
     rows: Dict[tuple, list] = {}
+    row_owner: Dict[tuple, int] = {}
     queue = list(flank_owned)
-    for _round in range(8):
+    for _round in range(256):
         if not queue:
             break
+        index_groups()
         produced = []
+        new_keys = []
         for owner, candidate in queue:
             span = span_of(candidate)
             sample = candidate[5][0]
@@ -6846,9 +7430,12 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
             key = (candidate[0], span[0], span[1], candidate[4].upper())
             if key not in rows:
                 rows[key] = []
+                row_owner[key] = owner
+                new_keys.append(key)
                 decisions.setdefault(owner, {}).setdefault("__flank__", []).append(rows[key])
             rows[key].append(candidate)
             reasons["flank_sv_row"] += 1
+        merge_rows(new_keys, produced)
         queue = produced
     for owner, candidate in queue:    # recursion limit: keep as rows
         span = span_of(candidate)
@@ -6862,7 +7449,8 @@ def _exact_round_relink(groups, decisions, flank_owned, candidates, path_sequenc
 def _exact_round_apply(svtype, pick, chosen, candidates, decisions):
     """Apply one nested group's decisions: (kept chosen, separated indexes,
     {index: kept pieces}, flank candidates), or None when the group's own
-    representative was superseded. Moved members replace their candidate."""
+    representative was superseded. Moved members replace their candidate.
+    A group merged into a longer one (--merge-recurrent) keeps no member."""
     if decisions.get(pick) == ("drop",):
         return None
     rep_event = candidates[pick]
@@ -6873,6 +7461,8 @@ def _exact_round_apply(svtype, pick, chosen, candidates, decisions):
 
     for index, body in chosen:
         decision = decisions.get(index)
+        if decision is not None and decision[0] == _RECURRENT_MERGED:
+            continue      # its group merged into a longer one (--merge-recurrent)
         if (index != pick and decision is None
                 and span(candidates[index]) == span(rep_event)
                 and _size_similarity(abs(candidates[index][3]), abs(rep_event[3]))
@@ -6885,7 +7475,9 @@ def _exact_round_apply(svtype, pick, chosen, candidates, decisions):
         elif decision[0] == "drop":
             continue
         elif decision[0] == "separate":
-            separated.append(index)
+            if len(decision) < 3:
+                separated.append(index)
+            # else merged again: placed by _exact_round_relink
         else:
             _move, moved, result, _edits = decision
             event = candidates[index]
@@ -7002,6 +7594,20 @@ def _fast_round_call(
 
     def emit_formed(svtype, pick, chosen, separated, pieces, flank):
         """Emit one formed group, then its separated members and flank gaps."""
+        if not chosen:
+            # --merge-recurrent: merged into a longer group; only its
+            # separated members and flank gaps keep rows.
+            _exact_round_separate(
+                separated, svtype, path_id, used_children, sample_count,
+                path_samples, minsvsize, emit_small, main_rows,
+                small_rows, candidates, promoted,
+            )
+            _exact_round_flank(
+                flank, path_id, used_children, sample_count, path_samples,
+                minsvsize, emit_small, main_rows, small_rows, candidates,
+                promoted,
+            )
+            return
         rep_event = candidates[pick]
         child_pos = rep_event[1] + 1
         child_id = _nested_variant_id(used_children, svtype, path_id, child_pos, rep_event[3])
@@ -7128,6 +7734,11 @@ def _fast_round_call(
             selection = sorted(local, key=lambda i: (
                 _representative_size(svtype, candidates[i][3]), -candidates[i][1], -i,
             ), reverse=True)
+            # --exact: a deletion joins a representative it overlaps (at least
+            # half of the representative's deletion), so it is the row's
+            # deletion plus new SVs by intervals; size alone would let a far
+            # deletion of similar size take it.
+            overlap_gate = svtype == "DEL" and exact is not None and path_sequence is not None
             absorbed = set()
             for pick in selection:
                 if pick in absorbed:
@@ -7146,6 +7757,10 @@ def _fast_round_call(
                     smaller = min(rep_event[3], candidate[3])
                     larger = max(rep_event[3], candidate[3])
                     if smaller / float(max(1, larger)) < size_similarity:
+                        continue
+                    if overlap_gate and (
+                            min(rep_event[1] + rep_event[3], candidate[1] + candidate[3])
+                            - max(rep_event[1], candidate[1])) < _EXACT_DEL_OVERLAP * rep_event[3]:
                         continue
                     body = None
                     if svtype == "INS":
@@ -7172,19 +7787,14 @@ def _fast_round_call(
                                 f">c{number}\n{sequence}\n",
                             )
 
-                    for other, candidate_sequence, (
-                        _alignment_score, body,
-                    ) in zip(
-                        gated_wm, wm_seqs,
+                    for other, (similarity, body) in zip(
+                        gated_wm,
                         _fast_winnowmap_align_batch(
                             _FAST_CONTEXT, rep_event[4],
                             [len(s) for s in wm_seqs],
                             write_candidates, 1,
                         ),
                     ):
-                        similarity = _truvari_seqsim(
-                            candidate_sequence, rep_event[4],
-                        )
                         if (
                             similarity >= sequence_similarity
                             and body is not None
@@ -7215,9 +7825,34 @@ def _fast_round_call(
     return main_rows, small_rows, groups_out, promoted
 
 
+class _NestedResultSpool:
+    """A round's path results, appended to one file and read back by ordinal.
+    One file per round instead of one per path: a round can have hundreds of
+    thousands of paths, each file a create and an unlink on network storage."""
+
+    def __init__(self, path):
+        self._handle = open(path, "w+b")
+        self._lock = threading.Lock()
+        self._starts = {}
+
+    def put(self, ordinal, result):
+        with self._lock:
+            start = self._handle.seek(0, os.SEEK_END)
+            pickle.dump(result, self._handle, protocol=pickle.HIGHEST_PROTOCOL)
+            self._starts[ordinal] = start
+
+    def take(self, ordinal):
+        with self._lock:
+            self._handle.seek(self._starts.pop(ordinal))
+            return pickle.load(self._handle)
+
+    def close(self):
+        self._handle.close()
+
+
 def _fast_nested_path_task(task, alignment_scheduler=None):
     """Coordinate one path and spool its rows; alignments use shared CPU slots."""
-    ordinal, call_args, result_path, chrom, depth = task[:5]
+    ordinal, call_args, spool, chrom, depth = task[:5]
     options = task[5] if len(task) > 5 else {}
     import graphreftovcf as core
     from graphvcfmerge_nested import close_session
@@ -7244,11 +7879,8 @@ def _fast_nested_path_task(task, alignment_scheduler=None):
                       if alignment_scheduler is None
                       else _fast_round_call(*call_args, core, None, alignment_scheduler.workers,
                                             alignment_scheduler=alignment_scheduler, **options))
-        temporary = result_path + ".tmp"
-        with open(temporary, "wb") as out:
-            pickle.dump(result, out, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(temporary, result_path)
-        return ordinal, result_path, time.monotonic() - started
+        spool.put(ordinal, result)
+        return ordinal, time.monotonic() - started
     except Exception as error:
         raise RuntimeError(f"nested path {path_id!r} failed: {error}") from error
     finally:
@@ -7309,9 +7941,11 @@ def _fast_nested_path_results(
             yield path_id, result
         return
 
-    with tempfile.TemporaryDirectory(prefix="nested-paths-", dir=spool_dir) as directory:
+    # The spool closes after the path threads are joined, before its folder goes.
+    with tempfile.TemporaryDirectory(prefix="nested-paths-", dir=spool_dir) as directory, \
+            contextlib.closing(_NestedResultSpool(os.path.join(directory, "results.pkl"))) as spool:
         tasks = [
-            (ordinal, arguments(path_id), os.path.join(directory, f"{ordinal}.pkl"), chrom, depth)
+            (ordinal, arguments(path_id), spool, chrom, depth)
             + ((extra(path_id),) if options is not None else ())
             for ordinal, path_id in enumerate(paths)
         ]
@@ -7330,7 +7964,7 @@ def _fast_nested_path_results(
             with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as coordinators:
                 task_stream = iter(tasks)
                 live = set()
-                pending = {}
+                pending = set()
                 seen = set()
                 next_output = completed = 0
                 started = time.monotonic()
@@ -7355,23 +7989,21 @@ def _fast_nested_path_results(
                             )
                         for future in done:
                             live.remove(future)
-                            ordinal, result_path, seconds = future.result()
+                            ordinal, seconds = future.result()
                             if ordinal in seen or not 0 <= ordinal < len(paths):
                                 raise ValueError("Unexpected or duplicate nested path result")
                             seen.add(ordinal)
-                            pending[ordinal] = result_path
+                            pending.add(ordinal)
                             completed += 1
                             print(
                                 f"[merge:nested] {chrom}: round={depth} completed={completed}/{len(paths)} "
                                 f"path={paths[ordinal]} seconds={seconds:.1f}", file=sys.stderr, flush=True,
                             )
                             submit_next()
-                        # Buffer only filenames behind a slow earlier path.
+                        # Results behind a slow earlier path wait in the spool.
                         while next_output in pending:
-                            path = pending.pop(next_output)
-                            with open(path, 'rb') as source:
-                                result = pickle.load(source)
-                            os.unlink(path)
+                            pending.remove(next_output)
+                            result = spool.take(next_output)
                             yield paths[next_output], result
                             next_output += 1
                 finally:
@@ -8176,6 +8808,42 @@ class _ExactRecords:
         return self.records[first:last]
 
 
+class _ExactSpooledGroups:
+    """A locus's refined groups without their members in memory (--exact
+    plan): load() streams (slot, type, representative, members) from the
+    refinement spool once, keeping only (slot, type, representative);
+    iterating then yields those with members None, and members(slot) reads
+    one group back at its spool offset."""
+
+    def __init__(self, path, descriptors):
+        self.path = path
+        self.offsets = [descriptor[2] for descriptor in descriptors]
+        self.heads = []
+        self.handle = None
+
+    def load(self):
+        with open(self.path, "rb") as handle:
+            for slot, offset in enumerate(self.offsets):
+                handle.seek(offset)
+                svtype, rep, members = pickle.load(handle)
+                self.heads.append((slot, svtype, rep))
+                yield slot, svtype, rep, members
+
+    def __iter__(self):
+        return ((slot, svtype, rep, None) for slot, svtype, rep in self.heads)
+
+    def members(self, slot):
+        if self.handle is None:
+            self.handle = open(self.path, "rb")
+        self.handle.seek(self.offsets[slot])
+        return pickle.load(self.handle)[2]
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
 _EXACT_SNP_CACHE: "OrderedDict[tuple, object]" = OrderedDict()
 
 
@@ -8357,14 +9025,14 @@ def _exact_interval_walk(body, window, template, segments, pieces, qa, qb, stran
     return results, edits
 
 
-_EXACT_PIECE_MAPPY = 10_000         # longer pieces: mappy; up to this: parasail global
+_EXACT_PIECE_MAPPY = _GLOBAL_ALIGN_MAX  # longer pieces: mappy; up to this: parasail global
 _EXACT_PIECE_MATRIX = None
 
 
 def _exact_piece_alignment(query, template, cache, core):
     """Alignment body (=XID, query vs template) of one stretch between the
     anchors of an interval realignment. The identical prefix and suffix are
-    matches; the rest, when neither side is longer than 10 kb, is aligned
+    matches; the rest, when neither side is longer than 5 kb, is aligned
     globally by parasail with assembly-like scores (match 1, mismatch 9, gap
     open 16, extend 2), so isolated differences stay mismatches and a shifted
     block becomes one gap pair. Longer pieces (or without parasail) use
@@ -8387,7 +9055,7 @@ def _exact_piece_alignment(query, template, cache, core):
     if not middle_q or not middle_t:
         middle = ((f"{len(middle_q)}I" if middle_q else "")
                   + (f"{len(middle_t)}D" if middle_t else ""))
-    elif parasail is not None and max(len(middle_q), len(middle_t)) <= _EXACT_PIECE_MAPPY:
+    elif max(len(middle_q), len(middle_t)) <= _EXACT_PIECE_MAPPY:
         if _EXACT_PIECE_MATRIX is None:
             _EXACT_PIECE_MATRIX = parasail.matrix_create("ACGTN", 1, -9)
         clean_q = re.sub(r"[^ACGTN]", "N", middle_q)
@@ -8404,10 +9072,220 @@ def _exact_piece_alignment(query, template, cache, core):
     return (f"{prefix}=" if prefix else "") + middle + (f"{suffix}=" if suffix else "")
 
 
-_EXACT_MIN_MAPPED = 0.7     # share of a row's allele a moved allele must map
-_EXACT_MOVEMENT_SHARE = 0.1  # breakpoint shift (share of variant size) accepted as a movement
-_EXACT_MOVEMENT_MAX = 50     # and a movement shifts a breakpoint by less than this many bases
+_EXACT_MIN_MAPPED = 0.5     # share of a row's allele a moved allele must map
+_EXACT_MOVEMENT_SHARE = 0.1  # insertion breakpoint shift (share of variant size) accepted as a movement
+_EXACT_MOVEMENT_MAX = 50     # and an insertion movement shifts a breakpoint by less than this many bases
 _EXACT_SAME_BREAKPOINT_SIZE = 0.5  # size ratio a member at the representative's span needs to stay
+_EXACT_DEL_OVERLAP = 0.5  # share of its representative's deletion a nested deletion must overlap
+_EXACT_ALIGNER_CACHE = 256  # minimap2 indexes (~1 MB each) a chromosome-wide merge keeps
+_EXACT_ALIGNER_CACHE_BASES = 32_000_000  # and their target bases (~10 bytes of index per base)
+
+
+class _BoundedCache(OrderedDict):
+    """Aligner cache keeping only its newest MAXSIZE entries, of at most
+    MAXBASES target bases together (the newest is always kept): a dropped
+    minimap2 index is rebuilt identically when needed (a build costs less
+    than one alignment; an index holds ~1 MB plus ~10 bytes per base)."""
+
+    def __init__(self, maxsize: int, maxbases: int):
+        super().__init__()
+        self.maxsize, self.maxbases, self.bases = maxsize, maxbases, 0
+
+    def __setitem__(self, key, value):
+        if key in self:
+            self.bases -= len(key)
+        super().__setitem__(key, value)
+        self.bases += len(key)
+        while len(self) > 1 and (len(self) > self.maxsize or self.bases > self.maxbases):
+            old, _index = self.popitem(last=False)
+            self.bases -= len(old)
+
+
+_PARALLEL_ALIGN_MAX = 20_000            # realignments with every sequence shorter run in threads
+_PARALLEL_ALIGN_BYTES = 16 * 10 ** 9    # alignment memory in flight per stage (_realign_bytes)
+
+
+def _realign_bytes(query_length: int, target_length: int) -> int:
+    """Memory of one realignment: a parasail traceback (~4 B per cell) of
+    at most _GLOBAL_ALIGN_MAX per side (longer pairs: minimap2 hits, the
+    stretches between them by parasail) plus a minimap2 index (~1 MB and
+    ~10 B per target base)."""
+    cells = min(query_length, _GLOBAL_ALIGN_MAX) * min(target_length, _GLOBAL_ALIGN_MAX)
+    return 4 * cells + 10 * target_length + 10 ** 6
+
+
+class _AlignBudget:
+    """Threaded realignments of every process of a stage (one shared
+    budget, given to the pool workers at start): at most SLOTS at once
+    and at most LIMIT bytes of traceback together (one larger alignment
+    runs alone). Without a multiprocessing context it holds this process
+    only."""
+
+    def __init__(self, ctx, slots: int, limit: int):
+        self.slots, self.limit = max(1, int(slots)), int(limit)
+        if ctx is None:
+            self.cond, self.state = threading.Condition(), [0, 0]
+        else:
+            self.cond, self.state = ctx.Condition(), ctx.RawArray("q", 2)   # running, bytes
+
+    def acquire(self, cost: int) -> None:
+        with self.cond:
+            self.cond.wait_for(lambda: self.state[0] == 0 or (
+                self.state[0] < self.slots and self.state[1] + cost <= self.limit))
+            self.state[0] += 1
+            self.state[1] += cost
+
+    def release(self, cost: int) -> None:
+        with self.cond:
+            self.state[0] -= 1
+            self.state[1] -= cost
+            self.cond.notify_all()
+
+
+_ALIGN_BUDGET: Optional[_AlignBudget] = None
+_ALIGN_THREADS = None                   # (pid, executor): a forked worker makes its own
+
+
+def _align_threads():
+    global _ALIGN_BUDGET, _ALIGN_THREADS
+    if _ALIGN_BUDGET is None:
+        _ALIGN_BUDGET = _AlignBudget(None, os.cpu_count() or 1, _PARALLEL_ALIGN_BYTES)
+    if _ALIGN_THREADS is None or _ALIGN_THREADS[0] != os.getpid():
+        import concurrent.futures
+        _ALIGN_THREADS = (os.getpid(), concurrent.futures.ThreadPoolExecutor(
+            max_workers=_ALIGN_BUDGET.slots))
+    return _ALIGN_THREADS[1]
+
+
+def _exact_realign_all(members, representative, realign):
+    """[realign(member, cache) for member in members], the same results as
+    one by one: realignments whose query window and target are both
+    shorter than _PARALLEL_ALIGN_MAX run in threads within the stage's
+    budget (minimap2 and parasail release the GIL), each with its own
+    aligner cache (an index is rebuilt identically); longer ones run one by
+    one in this thread meanwhile, with one shared cache. A raised error
+    surfaces at its member's turn."""
+    sizes = []
+    for member in members:
+        w0 = min(member.pos, representative.pos)
+        w1 = max(member.pos, member.end, representative.pos, representative.end)
+        if member.svtype == "DEL":
+            sizes.append((w1 - w0, w1 - w0))
+        else:
+            sizes.append((w1 - w0 + len(member.sequence),
+                          w1 - w0 + len(representative.sequence)))
+    threaded = [index for index, (lq, lt) in enumerate(sizes)
+                if max(lq, lt) < _PARALLEL_ALIGN_MAX]
+    if len(threaded) < 2:
+        cache: dict = {}
+        return [realign(member, cache) for member in members]
+    # Filled once here: threads only read it (_exact_placed callers).
+    _exact_file_of_sample(members[0].sample_index)
+    executor = _align_threads()
+    budget = _ALIGN_BUDGET
+
+    def run(member, cost):
+        _EXACT_LOCAL.open_files = _EXACT_ALIGN_THREAD_FILES
+        budget.acquire(cost)
+        try:
+            return realign(member, {})
+        finally:
+            budget.release(cost)
+            # The pool's threads live on: their open FASTAs would otherwise
+            # stay open for the rest of the merge (32 threads x 16 files
+            # exhausted the descriptors of chr1's job, 11-03).
+            readers = getattr(_EXACT_LOCAL, "readers", None)
+            while readers:
+                os.close(readers.popitem()[1].fd)
+
+    futures = {index: executor.submit(run, members[index], _realign_bytes(*sizes[index]))
+               for index in threaded}
+    serial = {}
+    cache = {}
+    for index, member in enumerate(members):
+        if index not in futures:
+            try:
+                serial[index] = (True, realign(member, cache))
+            except Exception as error:
+                serial[index] = (False, error)
+    results = []
+    try:
+        for index in range(len(members)):
+            if index in futures:
+                results.append(futures[index].result())
+                continue
+            done, value = serial[index]
+            if not done:
+                raise value
+            results.append(value)
+    except BaseException:
+        for future in futures.values():
+            future.cancel()
+        raise
+    return results
+
+
+_EXACT_PLAN_SPOOL_MIN = 10_000  # realigned intervals from which a locus keeps its plan on disk
+_SPOOLED_MOVE = "__spooled_move__"
+_RECURRENT_MERGED = "merged"  # plan decision: the member's row merged into a longer one (--merge-recurrent)
+
+
+class _ExactPlanSpool:
+    """The --exact plan of one large locus on disk, in one file next to the
+    refined groups: each move decision (moved member and body) as soon as
+    it is planned, the plan keeping a ("move", _SPOOLED_MOVE, offset) stub
+    (the leftover merge reads only decision kinds); then, once the plan is
+    done, each group's plan. Emission reads it like the plan dict, one
+    group's plan at a time, stubs replaced by their decisions again (as the
+    workers receive them: pickled)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.handle = open(path, "w+b")
+        self.offsets: Dict[int, int] = {}
+        self.moves = 0
+
+    def _dump(self, value) -> int:
+        # Always append: a _load in between (--merge-recurrent reads moves
+        # back while planning) leaves the handle inside the file.
+        offset = self.handle.seek(0, os.SEEK_END)
+        pickle.dump(value, self.handle, protocol=pickle.HIGHEST_PROTOCOL)
+        return offset
+
+    def _load(self, offset):
+        self.handle.seek(offset)
+        return pickle.load(self.handle)
+
+    def move(self, decision):
+        self.moves += 1
+        return ("move", _SPOOLED_MOVE, self._dump(decision))
+
+    def finish(self, plan):
+        for slot in sorted(plan):
+            self.offsets[slot] = self._dump(plan[slot])
+        plan.clear()
+        self.handle.flush()
+        return self
+
+    def __contains__(self, slot):
+        return slot in self.offsets
+
+    def get(self, slot, default=None):
+        if slot not in self.offsets:
+            return default
+        decisions = self._load(self.offsets[slot])
+        for ref, decision in decisions.items():
+            if (type(decision) is tuple and len(decision) == 3 and decision[0] == "move"
+                    and isinstance(decision[1], str) and decision[1] == _SPOOLED_MOVE):
+                decisions[ref] = self._load(decision[2])
+        return decisions
+
+    def close(self):
+        self.handle.close()
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
 
 
 def _exact_body_score(body, window, template):
@@ -8450,7 +9328,7 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
     as its own allele (an exact anchor). The result is kept only when its
     alignment scores at least as well as the sample's own calls
     (_exact_body_score vs _exact_calls_score) and every moved allele maps at
-    least 70% of its row's allele. Returns (key, None, reason) when the interval is
+    least 50% of its row's allele. Returns (key, None, reason) when the interval is
     left unchanged, else (key, decisions {ref: decision}, leftover SV
     observations, SNP drops, SNP adds, counts)."""
     key, file_index, w0, w1, records = item
@@ -8580,7 +9458,12 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
                                 qry_start=span[0], qry_end=span[1])
             body_out = nested
             deleted = _exact_edit(representative)
-            share = 1.0 - (f1 - f0) / max(1, deleted[1] - deleted[0])
+            if _FAST_CONTEXT.get("partial_merge"):
+                # Of the shorter of the two deletions.
+                share = (deleted[1] - deleted[0] - (f1 - f0)) / max(
+                    1, min(deleted[1] - deleted[0], abs(member.size)))
+            else:
+                share = 1.0 - (f1 - f0) / max(1, deleted[1] - deleted[0])
             unchanged = (not nested and member.pos == representative.pos
                          and member.end == representative.end
                          and (member.qry_start, member.qry_end) == span)
@@ -8597,7 +9480,7 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
             moved = _exact_with(member, pos=representative.pos, end=representative.end,
                                 size=f1 - f0, sequence=window[f0:f1],
                                 qry_start=span[0], qry_end=span[1])
-            share = matches / max(1, len(representative.sequence))
+            share = _exact_mapped_share(matches, moved.sequence, representative.sequence)
             unchanged = ((member.pos, member.end, member.sequence.upper(),
                           member.qry_start, member.qry_end)
                          == (moved.pos, moved.end, moved.sequence.upper(), *span))
@@ -8663,7 +9546,7 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
     # Keep the realignment only when (1) its alignment of the window against
     # the template scores at least as well as the sample's own calls do
     # (matches - 4 mismatches - 4 gap opens - gap bases), and (2) every moved
-    # allele maps at least 70% of its row's allele. Otherwise the movement
+    # allele maps at least 50% of its row's allele. Otherwise the movement
     # fallback (_exact_movement_interval) may still move single members.
     shifted_edits = [_exact_edit(members[index]) for index, record in enumerate(records)
                      if record[4]]
@@ -8679,50 +9562,84 @@ def _exact_realign_interval(chrom, exact, item, cache, core):
     return key, decisions, leftovers, drops, adds, counts
 
 
-def _exact_movement_interval(chrom, exact, item, cache, core, reason):
-    """Movement fallback for an interval whose realignment was not kept.
+def _exact_movement_interval(chrom, exact, item, cache, core, reason,
+                             deletions_only=False):
+    """Movement of an interval's shifted members onto their rows: the
+    member becomes the row's allele plus new SVs.
 
-    Each shifted member whose breakpoint is at most 10% of its size and
-    less than 50 bp away from its row's is moved onto the row on its own,
-    with the shift written as edge I/D: an insertion takes the reference bases between both
+    Each shifted member is moved onto the row on its own, with the shift
+    written as edge I/D: an insertion takes the reference bases between both
     breakpoints into its allele and leaves their deletion as a leftover; a
     deletion keeps the row's interval, the bases it keeps inside become a
     nested insertion and the bases it deletes outside a leftover deletion
-    (_exact_realign_member / _exact_realign_deletion). Only when the
-    sample has no other call between the breakpoints (checked against its
-    assembly), no other allele on that row, and the moved allele maps at
-    least 70% of the row's. Other shifted members stay separate rows."""
+    (_exact_realign_member / _exact_realign_deletion). A deletion moves
+    whatever its breakpoint distance; an insertion only when its breakpoint
+    is at most 10% of its size and less than 50 bp away from its row's and
+    the moved allele maps at least 50% of the row's. Only when the sample
+    has no other call between the breakpoints (checked against its
+    assembly) and no other allele on that row. Other shifted members stay
+    separate rows. deletions_only: (key, None, reason) unless every shifted
+    member's row is a deletion."""
     key, file_index, _w0, _w1, records = item
     if reason == "locked":
         return key, None, reason
     fetched = _fast_fetch_observations(
         sorted({record[0] for record in records} | {record[2] for record in records}))
+    if deletions_only and any(fetched[record[2]].svtype != "DEL"
+                              for record in records if record[4]):
+        return key, None, reason
     on_slot = Counter(record[1] for record in records)
     decisions, leftovers, adds, counts = {}, [], [], Counter()
-    for ref, slot, rep_ref, _protected, shifted, _size in records:
-        if not shifted:
+
+    def partner_of(ref):
+        # The other half of the member's own substitution (DEL and INS split
+        # from one record): judged separately, so it does not block a move.
+        member = fetched[ref]
+        if member.row_id == member.source_row_id:
+            return None
+        for other_ref, *_rest in records:
+            other = fetched[other_ref]
+            if (other_ref != ref and other.source_row_id == member.source_row_id
+                    and other.sample_index == member.sample_index
+                    and other.svtype != member.svtype and other.pos == member.pos):
+                return other_ref
+        return None
+
+    held = set()    # partners a moved deletion keeps where they are
+    for ref, slot, rep_ref, _protected, shifted, _size in sorted(
+            records, key=lambda record: fetched[record[2]].svtype != "DEL"):
+        if not shifted or ref in held:
             continue
         member, representative = fetched[ref], fetched[rep_ref]
         own, row = _exact_edit(member), _exact_edit(representative)
-        distance = max(abs(own[0] - row[0]), abs(own[1] - row[1]))
-        size = max(own[1] - own[0] + len(own[2]), row[1] - row[0] + len(row[2]))
-        if (on_slot[slot] > 1 or distance > _EXACT_MOVEMENT_SHARE * size
-                or distance >= _EXACT_MOVEMENT_MAX):
+        partner_ref = partner_of(ref)
+        if partner_ref is not None and partner_ref in decisions:
             continue
+        if on_slot[slot] > 1:
+            continue
+        if representative.svtype != "DEL":
+            distance = max(abs(own[0] - row[0]), abs(own[1] - row[1]))
+            size = max(own[1] - own[0] + len(own[2]), row[1] - row[0] + len(row[2]))
+            if distance > _EXACT_MOVEMENT_SHARE * size or distance >= _EXACT_MOVEMENT_MAX:
+                continue
         # The helpers below see only this member: the sample must have no
         # other call (another record, e.g. the other half of a replacement,
         # or a SNP) touching the stretch between both breakpoints.
         low, high = min(own[0], row[0]) - 1, max(own[1], row[1]) + 1
-        if any(other_ref != ref and _exact_touches(_exact_edit(fetched[other_ref]), low, high)
+        if any(other_ref not in (ref, partner_ref)
+               and _exact_touches(_exact_edit(fetched[other_ref]), low, high)
                for other_ref, *_rest in records):
             continue
         if _exact_window_snps(exact["records_dir"], chrom, file_index, member.qry_contig,
                               max(0, low), high):
             continue
+        partner = (fetched[partner_ref] if partner_ref is not None
+                   and representative.svtype == "DEL" and member.svtype == "DEL"
+                   and _exact_touches(_exact_edit(fetched[partner_ref]), low, high) else None)
         if representative.svtype == "DEL":
             moved, result = _exact_realign_deletion(
                 member, representative, exact, core, flank_gaps=True, others=(),
-                flank_snps=True)
+                flank_snps=True, partner=partner)
         else:
             moved, result = _exact_realign_member(
                 member, representative, exact, cache, core, flank_gaps=True, others=(),
@@ -8733,14 +9650,13 @@ def _exact_movement_interval(chrom, exact, item, cache, core, reason):
         if any(start < qb and qa < end for start, end in _exact_dup_copy_spans_cached(
                 exact["records_dir"], file_index).get(member.qry_contig, ())):
             continue
-        if representative.svtype == "DEL":
-            share = 1.0 - sum(len(piece[1]) for piece in body) / max(1, row[1] - row[0])
-        else:
-            share = _exact_body_score_matches(body, moved.sequence, representative.sequence) \
-                / max(1, len(representative.sequence))
-        if share < _EXACT_MIN_MAPPED:
+        if representative.svtype != "DEL" and _exact_mapped_share(_exact_body_score_matches(
+                body, moved.sequence, representative.sequence,
+        ), moved.sequence, representative.sequence) < _EXACT_MIN_MAPPED:
             continue
         decisions[ref] = ("move", moved, body, [])
+        if partner is not None:
+            held.add(partner_ref)
         for kind, start, end, bases, query_start, query_end in edits:
             if kind == "SNP":
                 qpos = query_start if member.qry_strand == "+" else query_end
@@ -8768,6 +9684,15 @@ def _exact_touches(edit, low, high):
     return low <= start <= high if start == end else (start <= high and low <= end)
 
 
+def _exact_mapped_share(matches, moved_sequence, representative_sequence):
+    """Share of the row's allele a moved insertion maps (_EXACT_MIN_MAPPED);
+    --partial-merge: of the shorter of the two alleles."""
+    length = len(representative_sequence)
+    if _FAST_CONTEXT.get("partial_merge"):
+        length = min(length, len(moved_sequence))
+    return matches / max(1, length)
+
+
 def _exact_body_score_matches(body, query, template):
     """Matched bases of an alignment body (query vs template)."""
     matches = q = t = 0
@@ -8792,18 +9717,48 @@ def _exact_interval_task(args):
     cache: dict = {}
     output = []
     for item in items:
+        if _FAST_CONTEXT.get("shift") is not False:
+            # Deletions first as their row's allele plus new SVs (the forced
+            # shift; off with --no-shift): an interval whose shifted members
+            # are all deletions is realigned only when none can move that way.
+            try:
+                result = _exact_movement_interval(chrom, exact, item, cache, core,
+                                                  "not_moved", deletions_only=True)
+            except (RuntimeError, ValueError, KeyError, IndexError):
+                result = (item[0], None, "not_moved")
+            if result[1] is not None:
+                output.append(result)
+                continue
         try:
             result = _exact_realign_interval(chrom, exact, item, cache, core)
         except (RuntimeError, ValueError, KeyError, IndexError) as error:
             result = (item[0], None, f"error_{type(error).__name__}")
-        if result[1] is None:
-            # The realignment did not keep the members on their rows: try a
-            # movement for each one shifted by at most 10% of its size and
-            # less than 50 bp.
+        if result[1] is None and _FAST_CONTEXT.get("shift") is not False:
+            # The realignment did not keep the members on their rows: move
+            # each one onto its row (insertions shifted by at most 10% of
+            # their size and less than 50 bp; deletions at any distance).
             try:
                 result = _exact_movement_interval(chrom, exact, item, cache, core, result[2])
             except (RuntimeError, ValueError, KeyError, IndexError):
                 pass
+        output.append(result)
+    return output
+
+
+def _exact_movement_task(args):
+    """--no-realignment: only the forced shift (_exact_movement_interval) for
+    a batch of per-sample intervals; members it does not move keep their own
+    rows (reason realign_disabled)."""
+    import graphreftovcf as core
+    chrom, exact, items = args
+    cache: dict = {}
+    output = []
+    for item in items:
+        try:
+            result = _exact_movement_interval(chrom, exact, item, cache, core,
+                                              "realign_disabled")
+        except (RuntimeError, ValueError, KeyError, IndexError):
+            result = (item[0], None, "realign_disabled")
         output.append(result)
     return output
 
@@ -8878,24 +9833,31 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
     """
     import graphreftovcf as core
     context = _FAST_CONTEXT
-    groups = []
-    with open(refined_spool_path, "rb") as handle:
-        for slot, descriptor in enumerate(refined_descriptors):
-            handle.seek(descriptor[2])
-            groups.append((slot, *pickle.load(handle)))
+    # Members stay in the refinement spool: only representatives are kept.
+    groups = _ExactSpooledGroups(refined_spool_path, refined_descriptors)
 
     def span(item, svtype):
-        return ((item[0], item[0] + item[2]) if svtype == "DEL"
-                else (item[0], max(item[0], item[1])))
+        # An insertion is at its point: a substitution's insertion records
+        # the replaced interval's end only for linking.
+        return (item[0], item[0] + item[2]) if svtype == "DEL" else (item[0], item[0])
 
     by_sample: Dict[int, list] = defaultdict(list)
     candidates = []
     shifts: Dict[tuple, int] = {}      # shifted member -> breakpoint distance to its rep
     rep_spans = {}
-    for slot, svtype, rep, members in groups:
+    plan: Dict[int, dict] = defaultdict(dict)
+    group_sizes, rep_refs = {}, {}
+    for slot, svtype, rep, members in groups.load():
         rep_span = rep_spans[slot] = span(rep, svtype)
+        group_sizes[slot], rep_refs[slot] = len(members), rep[3]
         for member in members:
             member_span = span(member, svtype)
+            if (member[3] != rep[3] and member_span == rep_span
+                    and _size_similarity(abs(member[2]), abs(rep[2]))
+                    < _EXACT_SAME_BREAKPOINT_SIZE):
+                # Same span as the representative but under half (or over
+                # twice) its size: separated, merged again with the others.
+                plan[slot][member[3]] = ("separate", "same_breakpoint_size")
             # A representative is protected only when others depend on it.
             by_sample[member[3][0]].append(
                 (member_span[0], member_span[1], member[3], slot,
@@ -8909,20 +9871,19 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
                     slot, member[3], rep[3], svtype,
                 ))
     snp_records = {"chrom": chrom, "drops": [], "adds": []}
-    if not candidates:
+    if not candidates and not plan:
         _write_exact_snp_records(exact, chrom, snp_records)
         return {}
     # Sorted per sample: window queries do not scan the whole chromosome.
     by_sample = {file_index: _ExactRecords(records) for file_index, records in by_sample.items()}
     sample_names = context["sample_names"]
-    group_sizes = {slot: len(members) for slot, _svtype, _rep, members in groups}
     candidate_refs = {candidate[3] for candidate in candidates}
     seeds: Dict[int, list] = defaultdict(list)
     for w0, w1, _slot, ref, _rep_ref, _svtype in candidates:
         seeds[ref[0]].append((w0, w1))
-    rep_refs = {slot: rep[3] for slot, _svtype, rep, _members in groups}
-    plan: Dict[int, dict] = defaultdict(dict)
     reasons: Dict[str, int] = defaultdict(int)
+    if plan:
+        reasons["same_breakpoint_size"] = sum(len(decisions) for decisions in plan.values())
     items, interval_records = [], {}
     for file_index in sorted(seeds):
         if len(context["file_sample_indexes"][file_index]) != 1:
@@ -8950,21 +9911,36 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
                   f"{sample_names[context['file_sample_indexes'][file_index][0]]}\t"
                   f"{sum(1 for record in records if record[4])}",
                   file=sys.stderr)
+    # The per-sample record indexes (every member of the chromosome) are
+    # done: freed before the realignment results and the leftover merge.
+    del by_sample, seeds, candidate_refs, rep_refs
+    # A large locus keeps its moved members on disk until they are emitted.
+    spool = (_ExactPlanSpool(os.path.join(os.path.dirname(refined_spool_path), "exact-plan.pkl"))
+             if len(items) >= _EXACT_PLAN_SPOOL_MIN else None)
+    task = _exact_interval_task
     if not _FAST_CONTEXT.get("realignment", True):
-        # --no-realignment: every shifted member keeps its own row.
-        for key, records in interval_records.items():
-            for ref, slot, _rep_ref, _protected, shifted, _size in records:
-                if shifted:
-                    plan[slot][ref] = ("separate", "realign_disabled")
-                    reasons["realign_disabled"] += 1
-        items = []
+        if _FAST_CONTEXT.get("shift") is not False:
+            # --no-realignment: only the forced shift moves shifted members.
+            task = _exact_movement_task
+        else:
+            # --no-realignment --no-shift: every shifted member keeps its own row.
+            for key, records in interval_records.items():
+                for ref, slot, _rep_ref, _protected, shifted, _size in records:
+                    if shifted:
+                        plan[slot][ref] = ("separate", "realign_disabled")
+                        reasons["realign_disabled"] += 1
+            items = []
     started = time.monotonic()
     batch = max(1, min(64, -(-len(items) // max(1, 4 * int(workers)))))
     tasks = [(chrom, exact, items[start:start + batch])
              for start in range(0, len(items), batch)]
     leftovers: List[tuple] = []           # (owner slot, observation)
-    for results in (pooled_imap(_exact_interval_task, tasks) if pooled_imap is not None
-                    else map(_exact_interval_task, tasks)):
+    recurrent = context.get("merge_recurrent") and context.get("shift") is not False
+    # --merge-recurrent: an interval whose only decision is one move, as
+    # moved ref -> (leftovers, SNP drops, SNP adds) index ranges it added.
+    single_moves: Dict[tuple, tuple] = {}
+    for results in (pooled_imap(task, tasks) if pooled_imap is not None
+                    else map(task, tasks)):
         for result in results:
             key, decisions = result[0], result[1]
             records = interval_records[key]
@@ -8977,10 +9953,17 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
                         reasons[reason] += 1
                 continue
             _key, decisions, interval_leftovers, drops, adds, counts = result
-            reasons["intervals_realigned"] += 1
+            reasons["intervals_realigned" if task is _exact_interval_task
+                    else "intervals_shifted"] += 1
             slot_of = {record[0]: record[1] for record in records}
+            if recurrent and len(decisions) == 1 and next(iter(decisions.values()))[0] == "move":
+                single_moves[next(iter(decisions))] = (
+                    (len(leftovers), len(leftovers) + len(interval_leftovers)),
+                    (len(snp_records["drops"]), len(snp_records["drops"]) + len(drops)),
+                    (len(snp_records["adds"]), len(snp_records["adds"]) + len(adds)))
             for ref, decision in decisions.items():
-                plan[slot_of[ref]][ref] = decision
+                plan[slot_of[ref]][ref] = (spool.move(decision) if spool is not None
+                                           and decision[0] == "move" else decision)
             # Leftover rows are emitted with a shifted member's row: its
             # representative has other members, so that row is never dropped.
             owner = max((record for record in records if record[4]),
@@ -8991,16 +9974,31 @@ def _exact_plan_moves(chrom, refined_spool_path, refined_descriptors, exact,
             snp_records["adds"].extend(adds)
             for name, count in counts.items():
                 reasons[name] += count
-    _exact_place_leftovers(groups, plan, leftovers, reasons)
+    # Interval planning is done: only groups and plan go on to the leftover
+    # merge.
+    interval_count = len(items)
+    del items, tasks, interval_records, group_sizes, rep_spans
+    if recurrent:
+        _exact_merge_recurrent(chrom, groups, plan, leftovers, snp_records, exact, spool,
+                               single_moves)
+    _exact_place_leftovers(groups, plan, leftovers, reasons, exact,
+                           getattr(pooled_imap, "pool", None))
+    groups.close()
     _exact_report_rescue(chrom, candidates, shifts, plan)
     print(
-        f"[merge:exact] {chrom}: shifted member(s) in {len(items)} interval(s): "
+        f"[merge:exact] {chrom}: shifted member(s) in {interval_count} interval(s): "
         + ", ".join(f"{key}={value}" for key, value in sorted(reasons.items()))
         + f"; planned {len(candidates)} in {time.monotonic() - started:.1f}s",
         file=sys.stderr,
     )
     _write_exact_snp_records(exact, chrom, snp_records)
-    return dict(plan)
+    if spool is None:
+        return dict(plan)
+    spool.finish(plan)
+    print(f"[merge:exact] {chrom}: plan on disk: {spool.moves} move(s), "
+          f"{len(spool.offsets)} group plan(s), "
+          f"{spool.handle.tell() / 1e9:.2f} GB in {spool.path}", file=sys.stderr)
+    return spool
 
 
 def _exact_report_rescue(chrom, candidates, shifts, plan):
@@ -9012,7 +10010,7 @@ def _exact_report_rescue(chrom, candidates, shifts, plan):
         distance = shifts.get(ref, 0)
         label = next(name for limit, name in bins if limit is None or distance <= limit)
         decision = plan.get(slot, {}).get(ref)
-        outcome = ("moved" if decision and decision[0] == "move" else
+        outcome = ("moved" if decision and decision[0] in ("move", _RECURRENT_MERGED) else
                    f"not:{decision[1]}" if decision and decision[0] == "separate" else
                    "not:superseded" if decision and decision[0] == "drop" else "not:none")
         tally[label][outcome] += 1
@@ -9030,54 +10028,231 @@ def _exact_report_rescue(chrom, candidates, shifts, plan):
         print(f"[merge:exact-rescue] {chrom}: " + "; ".join(parts), file=sys.stderr)
 
 
-def _exact_place_leftovers(groups, plan, leftovers, reasons):
-    """Leftover SVs of the interval realignment: each joins a row whose
+def _exact_merge_recurrent(chrom, groups, plan, leftovers, snp_records, exact, spool=None,
+                           single_moves=None):
+    """--merge-recurrent at the end of the top level (--exact): rows whose
+    insertion representative is at least --partial-merge-min-size are taken
+    longest first; each is tested against the longer representatives taken
+    before it that are still rows, within the movement rule of its own
+    representative (breakpoints at most 10% of its size and less than 50 bp
+    apart). The representative is aligned to each with the partial-merge
+    score (_body_similarity); the best passing one (highest similarity,
+    then nearest, then longest) takes the row: every member on the row is
+    force shifted onto that representative (_exact_realign_member, its
+    edge I/D and mismatches as new SVs and SNPs) and the row disappears
+    (plan decision _RECURRENT_MERGED; its separated and flank rows stay).
+    A row moves whole or not at all: it stays when any member cannot move,
+    and then remains a representative for shorter ones. A member the
+    interval realignment moved onto the row is shifted from its own
+    breakpoint instead, its interval's leftovers and SNP records taken back
+    (single_moves: only an interval whose one decision is that move); one
+    sharing its interval with other decisions keeps the row."""
+    import graphreftovcf as core
+    context = _FAST_CONTEXT
+    min_size = int(context.get("partial_merge_min_size", _PARTIAL_MERGE_MIN_SIZE))
+    sequence_cut = float(context["sequence_similarity"])
+    sample_of_file = context["file_sample_indexes"]
+    started = time.monotonic()
+    # A row whose representative has a decision (realigned or superseded
+    # single-member row) keeps out of this merge.
+    heads = [(slot, rep) for slot, svtype, rep, _members in groups
+             if svtype == "INS" and rep[2] >= min_size and rep[3] not in plan.get(slot, {})]
+    if len(heads) < 2:
+        return
+    reps = _fast_fetch_observations(sorted({rep[3] for _slot, rep in heads}))
+    cache = _BoundedCache(_EXACT_ALIGNER_CACHE, _EXACT_ALIGNER_CACHE_BASES)
+    reasons: Dict[str, int] = defaultdict(int)
+    single_moves = {} if single_moves is None else single_moves
+    retracted = (set(), set(), set())     # leftovers, SNP drops, SNP adds taken back
+
+    def decision_of(slot, ref):
+        decision = plan.get(slot, {}).get(ref)
+        if (decision is not None and decision[0] == "move" and isinstance(decision[1], str)
+                and decision[1] == _SPOOLED_MOVE):
+            decision = spool._load(decision[2])
+        return decision
+
+    def row_samples(slot):
+        decisions = plan.get(slot, {})
+        return {
+            sample
+            for member in groups.members(slot)
+            if decisions.get(member[3], ("keep",))[0] not in ("drop", "separate", _RECURRENT_MERGED)
+            for sample in sample_of_file[member[3][0]]
+        } | {observation.sample_index for observation, _body in decisions.get("__extra__", [])}
+
+    def move_row(slot, target_slot, target):
+        """Force shift every member on row slot onto target; None or the reason it stays."""
+        on_target = row_samples(target_slot)
+        members = groups.members(slot)
+        moving = []
+        for member in members:
+            decision = decision_of(slot, member[3])
+            if decision is None:
+                moving.append(member[3])
+            elif decision[0] == "move":
+                if member[3] not in single_moves:
+                    return "moved_member_shared_interval"
+                moving.append(member[3])
+            # separated and superseded members are not on the row
+        fetched = _fast_fetch_observations(sorted(moving))
+        observations = [fetched[ref] for ref in moving]
+        # Members before the first that fails a check below realign
+        # together (_exact_realign_all); the checks then run in order.
+        stop = next((index for index, (ref, observation) in enumerate(zip(moving, observations))
+                     if len(sample_of_file[ref[0]]) != 1
+                     or observation.sample_index in on_target), len(moving))
+        realigned = _exact_realign_all(
+            observations[:stop], target,
+            lambda observation, cache: _exact_realign_member(
+                observation, target, exact, cache, core, flank_gaps=True, others=(),
+                flank_snps=True, prefer_pair=True))
+        results = []
+        for index, ref in enumerate(moving):
+            observation = observations[index]
+            if len(sample_of_file[ref[0]]) != 1:
+                return "multi_sample_input"
+            if observation.sample_index in on_target:
+                return "sample_on_row"
+            moved, result = realigned[index]
+            if moved is None:
+                return result
+            body, edits, (qa, qb) = result
+            if any(start < qb and qa < end for start, end in _exact_dup_copy_spans_cached(
+                    exact["records_dir"], ref[0]).get(observation.qry_contig, ())):
+                return "locked"
+            results.append((ref, observation, moved, body, edits))
+        for ref, observation, moved, body, edits in results:
+            if ref in single_moves:
+                # Its interval's results are replaced by this move's.
+                for retract, (first, last) in zip(retracted, single_moves.pop(ref)):
+                    retract.update(range(first, last))
+                reasons["interval_moves_replaced"] += 1
+            plan[slot][ref] = (_RECURRENT_MERGED, target_slot)
+            plan[target_slot].setdefault("__extra__", []).append((moved, body or None))
+            for kind, start, end, bases, query_start, query_end in edits:
+                if kind == "SNP":
+                    qpos = query_start if observation.qry_strand == "+" else query_end
+                    base = _exact_fetch(exact["references"], chrom, start, start + 1) or "N"
+                    snp_records["adds"].append((
+                        observation.sample_name, start + 1, base.upper(), bases,
+                        observation.qry_contig, qpos, observation.qry_strand))
+                    reasons["flank_snp"] += 1
+                else:
+                    leftovers.append((target_slot, _exact_with(_exact_flank_observation(
+                        observation, (kind, start, end, bases, query_start, query_end), exact),
+                        liftover_category=".")))
+                    reasons["flank_sv"] += 1
+        reasons["members_moved"] += len(results)
+        return None
+
+    # Longest first; ties by position and row, so every run takes the same order.
+    order = sorted(heads, key=lambda item: (-item[1][2], item[1][0], item[0]))
+    alive_starts: List[int] = []
+    alive: List[tuple] = []          # (start, slot, rep), sorted by start
+    for slot, rep in order:
+        observation = reps[rep[3]]
+        size = rep[2]
+        reach = min(_EXACT_MOVEMENT_MAX - 1, int(_EXACT_MOVEMENT_SHARE * size))
+        best = None
+        for _start, target_slot, target_rep in alive[
+                bisect.bisect_left(alive_starts, observation.pos - reach):
+                bisect.bisect_right(alive_starts, observation.pos + reach)]:
+            if target_rep[2] <= size:
+                continue
+            target = reps[target_rep[3]]
+            distance = max(abs(observation.pos - target.pos),
+                           abs(max(observation.pos, observation.end)
+                               - max(target.pos, target.end)))
+            if distance > _EXACT_MOVEMENT_SHARE * size or distance >= _EXACT_MOVEMENT_MAX:
+                continue
+            reasons["pairs_aligned"] += 1
+            similarity, _body = _fast_pair_alignment(
+                observation.sequence, target.sequence, cache, core, partial=True)
+            if similarity < sequence_cut:
+                continue
+            key = (-similarity, distance, -target_rep[2], target.pos, target_slot)
+            if best is None or key < best[0]:
+                best = (key, target_slot, target)
+        if best is not None:
+            reason = move_row(slot, best[1], best[2])
+            if reason is None:
+                reasons["rows_merged"] += 1
+                continue
+            reasons[f"row_kept_{reason}"] += 1
+        position = bisect.bisect_right(alive_starts, observation.pos)
+        alive_starts.insert(position, observation.pos)
+        alive.insert(position, (observation.pos, slot, rep))
+    for values, taken in zip((leftovers, snp_records["drops"], snp_records["adds"]), retracted):
+        if taken:
+            values[:] = [value for index, value in enumerate(values) if index not in taken]
+    print(f"[merge:recurrent] {chrom}: {len(heads)} insertion row(s) >= {min_size} bp: "
+          + ", ".join(f"{key}={value}" for key, value in sorted(reasons.items()))
+          + f" in {time.monotonic() - started:.1f}s", file=sys.stderr)
+
+
+def _exact_place_leftovers(groups, plan, leftovers, reasons, exact=None, pool=None):
+    """Leftover SVs of the interval realignment and separated members (shifted
+    members that could not move onto their row): each joins a row whose
     representative allele is exactly the same (type, interval, bases) and
     that holds no allele of its sample yet; otherwise one new row per
-    distinct allele, shared by every sample with it."""
-    if not leftovers:
-        return
+    distinct allele, shared by every sample with it. With exact, each
+    round's new rows are merged again (_exact_merge_leftover_rows): a row
+    joins a similar one as its allele plus new SVs, and those new SVs are
+    placed the same way in the next round, until none is left. A new row
+    whose representative is a separated member is a new group: it is named
+    after that member (plan "__names__": flank row index -> (row ID, type)),
+    not after the group it was separated from. With --no-shift (no moves)
+    and for multi-sample inputs, separated members keep their own rows."""
     context = _FAST_CONTEXT
     sample_of_file = context["file_sample_indexes"]
-
-    def rep_span(svtype, rep):
-        return ((rep[0], rep[0] + rep[2]) if svtype == "DEL"
-                else (rep[0], max(rep[0], rep[1])))
-
-    wanted = {(observation.svtype, *_exact_edit(observation)[:2])
-              for _owner, observation in leftovers}
-    matching: Dict[tuple, list] = defaultdict(list)
-    for slot, svtype, rep, members in groups:
-        span = rep_span(svtype, rep)
-        # A realigned or dropped single-member row no longer has rep's allele.
-        if (svtype, *span) in wanted and rep[3] not in plan.get(slot, {}):
-            matching[(svtype, *span)].append((slot, rep, members))
-    reps = _fast_fetch_observations(sorted({rep[3] for values in matching.values()
-                                             for _slot, rep, _members in values}))
-    slot_samples: Dict[int, set] = {}
-
-    def samples_in(slot, members):
-        if slot not in slot_samples:
-            decisions = plan.get(slot, {})
-            slot_samples[slot] = {
-                sample
-                for member in members
-                if decisions.get(member[3], ("keep",))[0] not in ("drop", "separate")
-                for sample in sample_of_file[member[3][0]]
-            } | {observation.sample_index for observation, _body in decisions.get("__extra__", [])}
-        return slot_samples[slot]
-
-    # Separated members keep their own allele on a row of their group
-    # (_exact_split_shifted, keyed like identical separated members there).
-    def separate_key(observation):
-        return (observation.svtype, observation.pos, observation.end, observation.size,
-                observation.sequence.upper())
-
+    pooled = context.get("shift") is not False
     separated_refs = {slot: [ref for ref, decision in decisions.items()
                              if isinstance(ref, tuple) and decision[0] == "separate"]
                       for slot, decisions in plan.items()}
     separated_obs = _fast_fetch_observations(sorted(
         {ref for refs in separated_refs.values() for ref in refs}))
+    regrouped: List[tuple] = []          # (slot, separated observation)
+    if pooled:
+        for slot, refs in sorted(separated_refs.items()):
+            for ref in sorted(refs):
+                if plan[slot][ref][1] == "multi_sample_input":
+                    continue
+                plan[slot][ref] = (*plan[slot][ref][:2], "regrouped")
+                regrouped.append((slot, separated_obs[ref]))
+        separated_refs = {slot: [ref for ref in refs if len(plan[slot][ref]) == 2]
+                          for slot, refs in separated_refs.items()}
+    if not leftovers and not regrouped:
+        return
+    if regrouped:
+        reasons["separated_merged_again"] += len(regrouped)
+
+    def rep_span(svtype, rep):
+        return (rep[0], rep[0] + rep[2]) if svtype == "DEL" else (rep[0], rep[0])
+
+    slot_samples: Dict[int, set] = {}
+
+    def samples_in(slot, members):
+        if slot not in slot_samples:
+            if members is None:
+                members = groups.members(slot)
+            decisions = plan.get(slot, {})
+            slot_samples[slot] = {
+                sample
+                for member in members
+                if decisions.get(member[3], ("keep",))[0] not in ("drop", "separate",
+                                                                 _RECURRENT_MERGED)
+                for sample in sample_of_file[member[3][0]]
+            } | {observation.sample_index for observation, _body in decisions.get("__extra__", [])}
+        return slot_samples[slot]
+
+    # Separated members not merged again keep their own allele on a row of
+    # their group (_exact_split_shifted, keyed like identical separated
+    # members there).
+    def separate_key(observation):
+        return (observation.svtype, observation.pos, observation.end, observation.size,
+                observation.sequence.upper())
+
     separated: Dict[tuple, list] = defaultdict(list)    # key -> [(slot, samples)]
     for slot, refs in sorted(separated_refs.items()):
         by_key: Dict[tuple, set] = defaultdict(set)
@@ -9085,47 +10260,365 @@ def _exact_place_leftovers(groups, plan, leftovers, reasons):
             by_key[separate_key(separated_obs[ref])].add(separated_obs[ref].sample_index)
         for key, samples in by_key.items():
             separated[key].append((slot, samples))
+    # The pooled ones live on in regrouped; the others only as keys above.
+    del separated_obs
 
     rows: Dict[tuple, list] = {}
     row_samples: Dict[tuple, set] = {}    # key -> samples of rows[key]
-    for owner, observation in sorted(
-            leftovers, key=lambda item: (item[1].pos, item[1].end, item[1].svtype,
-                                         item[1].sample_index, item[1].qry_start)):
-        start, end, bases = _exact_edit(observation)
-        placed = False
-        for slot, rep, members in matching.get((observation.svtype, start, end), ()):
-            if reps[rep[3]].sequence.upper() != bases.upper():
-                continue
-            if observation.sample_index in samples_in(slot, members):
-                continue
-            body = f"{len(bases)}=" if observation.svtype == "INS" else None
-            plan.setdefault(slot, {}).setdefault("__extra__", []).append((observation, body))
-            slot_samples[slot].add(observation.sample_index)
-            reasons["leftover_sv_joined_row"] += 1
-            placed = True
+    pending = list(leftovers) + regrouped
+    for _round in range(256):
+        if not pending:
             break
-        if placed:
-            continue
-        for slot, samples in separated.get(separate_key(observation), ()):
-            if observation.sample_index in samples:
+        wanted = {(observation.svtype, *_exact_edit(observation)[:2])
+                  for _owner, observation in pending}
+        matching: Dict[tuple, list] = defaultdict(list)
+        for slot, svtype, rep, members in groups:
+            span = rep_span(svtype, rep)
+            # A realigned or dropped single-member row no longer has rep's allele.
+            if (svtype, *span) in wanted and rep[3] not in plan.get(slot, {}):
+                matching[(svtype, *span)].append((slot, rep, members))
+        reps = _fast_fetch_observations(sorted({rep[3] for values in matching.values()
+                                                 for _slot, rep, _members in values}))
+        new_rows = []
+        for owner, observation in sorted(
+                pending, key=lambda item: (item[1].pos, item[1].end, item[1].svtype,
+                                           item[1].sample_index, item[1].qry_start)):
+            start, end, bases = _exact_edit(observation)
+            placed = False
+            for slot, rep, members in matching.get((observation.svtype, start, end), ()):
+                if reps[rep[3]].sequence.upper() != bases.upper():
+                    continue
+                if observation.sample_index in samples_in(slot, members):
+                    continue
+                body = f"{len(bases)}=" if observation.svtype == "INS" else None
+                plan.setdefault(slot, {}).setdefault("__extra__", []).append((observation, body))
+                slot_samples[slot].add(observation.sample_index)
+                reasons["leftover_sv_joined_row"] += 1
+                placed = True
+                break
+            if placed:
                 continue
-            plan.setdefault(slot, {}).setdefault("__separate__", []).append(observation)
-            samples.add(observation.sample_index)
-            reasons["leftover_sv_joined_separate_row"] += 1
-            placed = True
+            for slot, samples in separated.get(separate_key(observation), ()):
+                if observation.sample_index in samples:
+                    continue
+                plan.setdefault(slot, {}).setdefault("__separate__", []).append(observation)
+                samples.add(observation.sample_index)
+                reasons["leftover_sv_joined_separate_row"] += 1
+                placed = True
+                break
+            if placed:
+                continue
+            key = (observation.svtype, start, end, bases.upper())
+            if key in rows and observation.sample_index not in row_samples[key]:
+                rows[key].append(observation)
+                row_samples[key].add(observation.sample_index)
+                reasons["leftover_sv_shared_row"] += 1
+                continue
+            if key in rows:
+                # The sample already has this allele on the row: a second
+                # copy gets its own row.
+                key = (*key, len(new_rows), _round)
+            rows[key] = [observation]
+            row_samples[key] = {observation.sample_index}
+            plan.setdefault(owner, {}).setdefault("__flank__", []).append(rows[key])
+            new_rows.append((owner, key))
+            reasons["leftover_sv_row"] += 1
+        if exact is None:
             break
-        if placed:
-            continue
-        key = (observation.svtype, start, end, bases.upper())
-        if key in rows and observation.sample_index not in row_samples[key]:
-            rows[key].append(observation)
-            row_samples[key].add(observation.sample_index)
-            reasons["leftover_sv_shared_row"] += 1
-            continue
-        rows[key] = [observation]
-        row_samples[key] = {observation.sample_index}
-        plan.setdefault(owner, {}).setdefault("__flank__", []).append(rows[key])
-        reasons["leftover_sv_row"] += 1
+        pending = _exact_merge_leftover_rows(new_rows, rows, row_samples, plan, exact, reasons,
+                                             pool)
+    else:
+        raise RuntimeError("--exact leftover merge did not converge in 256 rounds")
+    # A row represented by a separated member is a new group of its own.
+    separated_ids = {id(observation) for _slot, observation in regrouped}
+    for slot, decisions in plan.items():
+        names = {number: (row[0].row_id, row[0].svtype)
+                 for number, row in enumerate(decisions.get("__flank__", ()))
+                 if id(row[0]) in separated_ids}
+        if names:
+            decisions["__names__"] = names
+
+
+_EXACT_LEFTOVER_PARENT_ROWS = 10_000  # a neighbourhood of at least this many new rows is merged in the parent
+_EXACT_LEFTOVER_TASK_ROWS = 2_000     # new rows per worker task (whole smaller neighbourhoods)
+
+
+def _exact_leftover_size(key):
+    return key[2] - key[1] if key[0] == "DEL" else len(key[3])
+
+
+def _exact_leftover_window(key, distance):
+    """Starts of the representatives a new row is tested against: they come
+    first in size order, so a deletion one is no larger and starts at most
+    its size plus the distance before."""
+    if key[0] == "DEL":
+        return key[1] - _exact_leftover_size(key) - distance - 1, key[2] + distance
+    return key[1] - distance, key[1] + distance
+
+
+def _exact_leftover_neighbourhoods(order, distance):
+    """Ranks (indexes into order) of the new rows of one type, split into
+    neighbourhoods that never test each other: a row only meets
+    representatives starting in its window, which holds its own start, so
+    the rows are cut where no window spans two neighbouring starts."""
+    by_start = sorted(range(len(order)), key=lambda rank: order[rank][1])
+    starts = [order[rank][1] for rank in by_start]
+    linked = [0] * (len(order) + 1)      # +1/-1 over pairs (i, i + 1) of by_start
+    for key in order:
+        low, high = _exact_leftover_window(key, distance)
+        first = bisect.bisect_left(starts, low)
+        last = bisect.bisect_right(starts, high) - 1
+        if first < last:
+            linked[first] += 1
+            linked[last] -= 1
+    output, current, depth = [], [], 0
+    for index, rank in enumerate(by_start):
+        current.append(rank)
+        depth += linked[index]
+        if depth == 0:
+            output.append(sorted(current))
+            current = []
+    return output
+
+
+def _exact_merge_leftover_rows(new_rows, rows, row_samples, plan, exact, reasons, pool=None):
+    """One round of the merge of new rows (--exact): leftover SVs and
+    separated members. The round's new rows are taken in size order (the
+    largest insertion or the smallest deletion first). Each is tested
+    against the representatives found so far, in that order: same type,
+    size ratio at least the size cutoff, a deletion overlapping or within
+    the merge distance of it, an insertion within the merge distance and
+    shifted by at most 10% of its size and less than 50 bp, and last (it
+    aligns) an insertion's partial similarity (as --merge-recurrent) at
+    least the sequence cutoff; when both are below the SV size cutoff only
+    exact matches, already shared. Each sample of the row moves onto the
+    first representative it passes as its allele plus new SVs
+    (_exact_realign_deletion / _exact_realign_member; an insertion maps at
+    least 50% of it). An insertion stops at the first representative it
+    maps to: samples that cannot move stay on its row, which is not a
+    representative. Any other row with samples left becomes the next
+    representative. Rows only meet
+    representatives near them, so the round is merged per neighbourhood
+    (_exact_leftover_neighbourhoods), each in that same order: smaller ones
+    in the pool's workers while the parent merges the large ones. Returns
+    the new SVs, (owner, observation), for the next round, in the order one
+    pass over the round makes them."""
+    import graphreftovcf as core
+    distance = int(_FAST_CONTEXT["merge_distance"])
+    owners = {key: owner for owner, key in new_rows}
+    by_type: Dict[str, list] = defaultdict(list)
+    for _owner, key in new_rows:
+        by_type[key[0]].append(key)
+    small, large = [], []
+    for svtype, keys in sorted(by_type.items()):
+        order = sorted(keys, key=lambda key: (
+            -_representative_size(svtype, _exact_leftover_size(key)), key[1], key[2], key[3]))
+        for ranks in _exact_leftover_neighbourhoods(order, distance):
+            if len(ranks) < 2:
+                continue
+            unit = (svtype, [(rank, order[rank]) for rank in ranks])
+            (large if pool is None or len(ranks) >= _EXACT_LEFTOVER_PARENT_ROWS
+             else small).append(unit)
+    started = time.monotonic()
+    new_svs: List[tuple] = []            # (svtype, rank, key, observation)
+    emptied: List[tuple] = []
+    collected = {"reasons": defaultdict(int), "error": None}
+
+    def tasks():
+        batch, size = [], 0
+        for svtype, unit in small:
+            batch.append((svtype, [(rank, key, rows[key], row_samples[key])
+                                   for rank, key in unit]))
+            size += len(unit)
+            if size >= _EXACT_LEFTOVER_TASK_ROWS:
+                yield exact, batch
+                batch, size = [], 0
+        if batch:
+            yield exact, batch
+
+    def collect(results):
+        # Only the small neighbourhoods' rows change here; the parent merges
+        # the large ones meanwhile.
+        try:
+            for output in results:
+                for svtype, unit, unit_svs, counts in output:
+                    for _rank, key, entries, samples in unit:
+                        row = rows[key]
+                        original = list(row)
+                        row[:] = [original[entry] if isinstance(entry, int) else entry
+                                  for entry in entries]
+                        row_samples[key] = samples
+                        if not row:
+                            emptied.append(key)
+                    new_svs.extend((svtype, *item) for item in unit_svs)
+                    for name, count in counts.items():
+                        collected["reasons"][name] += count
+        except BaseException as error:     # raised again in the parent
+            collected["error"] = error
+
+    collector = None
+    if small:
+        collector = threading.Thread(
+            target=collect, args=(pool.imap_unordered(_exact_leftover_task, tasks()),),
+            daemon=True)
+        collector.start()
+    # Representatives' indexes for the sequence similarity: a large
+    # neighbourhood can span much of the chromosome, so only the newest are kept.
+    cache = _BoundedCache(_EXACT_ALIGNER_CACHE, _EXACT_ALIGNER_CACHE_BASES)
+    parent_svs = []
+    for svtype, unit in large:
+        parent_svs.extend((svtype, *item) for item in _exact_merge_leftover_unit(
+            svtype, unit, rows, row_samples, exact, reasons, cache, core))
+        emptied.extend(key for _rank, key in unit if not rows[key])
+    if collector is not None:
+        collector.join()
+        if collected["error"] is not None:
+            raise collected["error"]
+        for name, count in collected["reasons"].items():
+            reasons[name] += count
+    # A row whose samples all moved is dropped.
+    by_owner: Dict[int, set] = defaultdict(set)
+    for key in emptied:
+        by_owner[owners[key]].add(id(rows[key]))
+    for owner, ids in by_owner.items():
+        flank = plan[owner]["__flank__"]
+        flank[:] = [entry for entry in flank if id(entry) not in ids]
+    for key in emptied:
+        del rows[key], row_samples[key]
+    new_svs.extend(parent_svs)
+    new_svs.sort(key=lambda item: (item[0], item[1]))
+    print(f"[merge:exact] leftover merge round: {len(new_rows)} new row(s), "
+          f"{sum(len(unit) for _svtype, unit in small)} in {len(small)} neighbourhood(s) "
+          f"in workers, {sum(len(unit) for _svtype, unit in large)} in {len(large)} in the "
+          f"parent (largest {max((len(unit) for _svtype, unit in small + large), default=0)}), "
+          f"{len(new_svs)} new SV(s) in {time.monotonic() - started:.1f}s", file=sys.stderr)
+    return [(owners[key], observation) for _svtype, _rank, key, observation in new_svs]
+
+
+def _exact_leftover_task(args):
+    """Worker side of _exact_merge_leftover_rows: whole neighbourhoods of
+    pickled rows. A row comes back as indexes of its own (kept) members
+    plus the members that moved onto it."""
+    import graphreftovcf as core
+    exact, units = args
+    cache = _BoundedCache(_EXACT_ALIGNER_CACHE, _EXACT_ALIGNER_CACHE_BASES)
+    output = []
+    for svtype, members in units:
+        rows = {key: row for _rank, key, row, _samples in members}
+        row_samples = {key: samples for _rank, key, _row, samples in members}
+        originals = {key: list(row) for key, row in rows.items()}
+        indexes = {key: {id(entry): index for index, entry in enumerate(row)}
+                   for key, row in originals.items()}
+        reasons: Dict[str, int] = defaultdict(int)
+        unit_svs = _exact_merge_leftover_unit(
+            svtype, [(rank, key) for rank, key, _row, _samples in members],
+            rows, row_samples, exact, reasons, cache, core)
+        output.append((
+            svtype,
+            [(rank, key, [indexes[key].get(id(entry), entry) for entry in rows[key]],
+              row_samples[key]) for rank, key, _row, _samples in members],
+            unit_svs, dict(reasons)))
+    return output
+
+
+def _exact_merge_leftover_unit(svtype, unit, rows, row_samples, exact, reasons, cache, core):
+    """One neighbourhood of _exact_merge_leftover_rows, [(rank, key)] in
+    merge order: moves samples between the rows in place (a row left empty
+    stays for the caller to drop) and returns the new SVs, [(rank, key,
+    observation)], in the order they are made."""
+    context = _FAST_CONTEXT
+    size_cut = float(context["size_similarity"])
+    sequence_cut = float(context["sequence_similarity"])
+    distance = int(context["merge_distance"])
+    minsvsize = int(context["minsvsize"])
+    new_svs = []
+    rep_starts: List[int] = []
+    reps: List[tuple] = []           # (start, rank, key), sorted by start
+    for rank, key in unit:
+        member_row = rows[key]
+        size = _exact_leftover_size(key)
+        low, high = _exact_leftover_window(key, distance)
+        nearby = sorted(reps[bisect.bisect_left(rep_starts, low):
+                             bisect.bisect_right(rep_starts, high)],
+                        key=lambda item: item[1])
+        matched = False
+        for _start, _rank, rep_key in nearby:
+            if not member_row:
+                break
+            rep_size = _exact_leftover_size(rep_key)
+            if max(size, rep_size) < minsvsize or _size_similarity(size, rep_size) < size_cut:
+                continue
+            if max(rep_key[1], key[1]) - min(rep_key[2], key[2]) > distance:
+                continue
+            if svtype != "DEL":
+                shift = max(abs(key[1] - rep_key[1]), abs(key[2] - rep_key[2]))
+                span = max(key[2] - key[1] + size, rep_key[2] - rep_key[1] + rep_size)
+                if shift > _EXACT_MOVEMENT_SHARE * span or shift >= _EXACT_MOVEMENT_MAX:
+                    reasons["leftover_merge_beyond_movement"] += 1
+                    continue
+            if all(member.sample_index in row_samples[rep_key] for member in member_row):
+                continue
+            if svtype != "DEL":
+                if _fast_pair_alignment(key[3] or "", rep_key[3] or "", cache, core,
+                                        partial=True)[0] < sequence_cut:
+                    continue
+                # The first (largest) representative the insertion maps to
+                # takes it: smaller ones are not tested, and samples that
+                # cannot move stay on a row later rows are not tested against.
+                matched = True
+            representative = rows[rep_key][0]
+            # The row's samples realign independently (in threads when
+            # short, _exact_realign_all); their minimap2 indexes (~1 MB
+            # each) are dropped with the row instead of kept for the
+            # whole chromosome.
+            if svtype == "DEL":
+                def realign(member, _cache):
+                    return _exact_realign_deletion(
+                        member, representative, exact, core, flank_gaps=True, others=())
+            else:
+                def realign(member, cache):
+                    return _exact_realign_member(
+                        member, representative, exact, cache, core,
+                        flank_gaps=True, others=())
+            todo = [member for member in member_row
+                    if member.sample_index not in row_samples[rep_key]]
+            for member, (moved, result) in zip(
+                    todo, _exact_realign_all(todo, representative, realign)):
+                if member.sample_index in row_samples[rep_key]:
+                    continue
+                if moved is None:
+                    reasons[f"leftover_merge_{result}"] += 1
+                    continue
+                body, edits, (qa, qb) = result
+                if any(start < qb and qa < end for start, end in _exact_dup_copy_spans_cached(
+                        exact["records_dir"], _exact_file_of_sample(member.sample_index),
+                ).get(member.qry_contig, ())):
+                    reasons["leftover_merge_locked"] += 1
+                    continue
+                if svtype != "DEL" and _exact_mapped_share(_exact_body_score_matches(
+                        body, moved.sequence, representative.sequence,
+                ), moved.sequence, representative.sequence) < _EXACT_MIN_MAPPED:
+                    reasons["leftover_merge_low_mapped"] += 1
+                    continue
+                rows[rep_key].append((moved, body or None))
+                row_samples[rep_key].add(member.sample_index)
+                member_row.remove(member)
+                row_samples[key].discard(member.sample_index)
+                new_svs.extend(
+                    (rank, key, _exact_with(_exact_flank_observation(member, edit, exact),
+                                            liftover_category="."))
+                    for edit in edits)
+                reasons["leftover_sv_moved"] += 1
+            if matched:
+                break
+        if member_row and matched:
+            reasons["leftover_row_kept_mapped"] += 1
+        elif member_row:
+            # Samples left: the next representative.
+            slot = bisect.bisect_right(rep_starts, key[1])
+            rep_starts.insert(slot, key[1])
+            reps.insert(slot, (key[1], rank, key))
+    return new_svs
 
 
 def _write_exact_snp_records(exact, chrom, records) -> None:
@@ -9362,6 +10855,7 @@ def _fast_emit_refined(
         ])
         entries = []
         metadata = {}
+        batch_plans = {}   # loaded once: a spooled plan reads as a new copy each time
         for emit_index, svtype, rep, members, _cost in raw_groups:
             token = _safe_variant_token(rep_observations[rep[3]].row_id)
             if token and token != "locus":
@@ -9372,6 +10866,17 @@ def _fast_emit_refined(
                     f"{rep[0]}_{emit_index + 1}"
                 )
             row_id = _unique_variant_id(used_variant_ids, base_id)
+            # --exact: rows of separated members merged again are new groups,
+            # named after their representative like any row (after this
+            # group's own ID, which they may share as a token).
+            group_plan = batch_plans[emit_index] = move_plan.get(emit_index, {})
+            names = group_plan.get("__names__")
+            for index in sorted(names or ()):
+                source_id, name_type = names[index]
+                token = _safe_variant_token(source_id)
+                names[index] = _unique_variant_id(used_variant_ids, (
+                    _chrom_variant_id(name_type, token, chrom)
+                    if token and token != "locus" else f"{base_id}_{index + 1}"))
             uncertain_samples = _fast_uncertain_samples(
                 members, windows[svtype],
                 merge_distance, size_similarity, svtype == "INS",
@@ -9387,7 +10892,7 @@ def _fast_emit_refined(
         exact_task = _FAST_DUP_STATE.get("exact")
         if exact_task is not None:
             exact_task = dict(exact_task, plan={
-                entry[0]: move_plan[entry[0]] for entry in entries if entry[0] in move_plan
+                entry[0]: batch_plans[entry[0]] for entry in entries if entry[0] in move_plan
             })
         return (entries, coverage, exact_task), metadata
 
@@ -9460,6 +10965,8 @@ def _fast_emit_refined(
             )
         main_rows += dup_main
         small_rows += dup_small
+    if isinstance(move_plan, _ExactPlanSpool):
+        move_plan.close()
     # Keep immutable top-level rows separate from nested append output.
     base_part = os.path.join(spool_dir, "top-level.part")
     shutil.copyfile(part_work_path, base_part)
@@ -9761,12 +11268,19 @@ def _fast_stage_scan(
     """Stage 1 for split SLURM runs: scan every input VCF once and
     persist the record shards plus a manifest under --shards-dir."""
     input_paths = [os.path.abspath(path) for path in input_paths]
+    reference_paths = [os.path.abspath(path) for path in reference_paths]
+    if exact_query_paths and not snp_shards_dir:
+        # Realignment rewrites the samples' SNPs (realign records for the SNP
+        # stage) and needs their SNPs indexed, which the SNP shards provide.
+        raise ValueError("--exact requires --snp-shards-dir (SNPs merged with the SVs)")
+    # Taken before reading: later stages refuse the scan if one changes.
+    scanned_stamps = checkpoints.source_stamps(
+        [*input_paths, *reference_paths, *(path + ".fai" for path in reference_paths)])
     (
         meta_lines, sample_names, file_sample_indexes,
         sample_index_by_name,
     ) = _fast_prepare_inputs(input_paths)
     exact_queries: Dict[str, Tuple[str, str]] = {}
-    reference_paths = [os.path.abspath(path) for path in reference_paths]
     rebuilt_dir = None
     if exact_query_paths:
         exact_queries = read_query_paths(exact_query_paths)
@@ -9970,6 +11484,12 @@ def _fast_stage_scan(
         "reference_paths": list(reference_paths),
         "snp_shards_dir": os.path.abspath(snp_shards_dir) if snp_shards_dir else None,
         "rebuilt_assemblies": rebuilt_dir,
+        "source_stamps": {
+            **scanned_stamps,
+            **checkpoints.source_stamps(
+                path for name in sample_names if exact_queries
+                for path in exact_queries[name]),
+        },
     }
     with open(_fast_manifest_path(shards_dir), "wb") as handle:
         pickle.dump(manifest, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -9979,7 +11499,7 @@ def _fast_stage_scan(
             "version", "input_paths", "sample_names",
             "file_sample_indexes", "sample_index_by_name",
             "ignore_full_locus_dup_insertions", "exact_queries",
-            "reference_paths", "snp_shards_dir",
+            "reference_paths", "snp_shards_dir", "source_stamps",
         )
     }
     with open(
@@ -10169,12 +11689,24 @@ def _fast_stage_chrom(
     kmermatch: str = DEFAULT_KMERMATCH,
     insertion_snps: Optional[str] = None,
     realignment: bool = True,
+    shift: bool = True,
+    partial_merge: bool = False,
+    large_singleton_size: int = 10_000,
+    partial_merge_min_size: int = _PARTIAL_MERGE_MIN_SIZE,
+    merge_recurrent: bool = False,
 ) -> None:
     """Stage 2 for split SLURM runs: process the named chromosome(s)
     end to end from the saved shards, writing per-chrom parts.
 
     ``realignment`` False (--no-realignment; also GRAPHVCFMERGE_EXACT_REALIGN=0)
-    keeps an --exact scan's shifted members on their own rows."""
+    does not realign an --exact scan's shifted members; ``shift`` False
+    (--no-shift) turns off the forced shift (movement rule, top level and
+    nested). With both off every shifted member keeps its own row.
+    ``partial_merge`` (--partial-merge) drops the size cutoff (size similarity 0)
+    and judges an --exact move's 50% mapped share on the shorter allele; an
+    insertion representative of at least ``large_singleton_size`` whose
+    largest other member is below the size cutoff of it keeps a row of its
+    own (graphvcfmerge_kmer._split_partial_singletons)."""
     core_path = os.path.join(shards_dir, "manifest_core.pkl")
     if os.path.isfile(core_path):
         # Slim manifest: chrom jobs need inputs/samples only; the big
@@ -10186,11 +11718,8 @@ def _fast_stage_chrom(
     else:
         with open(_fast_manifest_path(shards_dir), "rb") as handle:
             manifest = pickle.load(handle)
+    checkpoints.check_sources(manifest, "chrom")
     import graphreftovcf as core
-    if core.mappy is None:
-        raise RuntimeError("chrom stage requires the mappy bindings")
-    if np is None:
-        raise RuntimeError("chrom stage requires numpy")
     from graphvcfmerge_kmer import resolve_kmermatch
     kmermatch = resolve_kmermatch(kmermatch)
     effective_min = int(svcutoff) if svcutoff is not None else int(minsvsize)
@@ -10221,14 +11750,32 @@ def _fast_stage_chrom(
     if not realignment or os.environ.get("GRAPHVCFMERGE_EXACT_REALIGN", "1") == "0":
         # Recorded in the chromosome checkpoints: never reuses realigned ones.
         context["realignment"] = False
-    _init_fast_worker(context)
+    if not shift:
+        context["shift"] = False
+    if partial_merge:
+        context["partial_merge"] = True
+        if large_singleton_size:
+            # The singleton test keeps the configured size cutoff.
+            context["partial_merge_singleton"] = (int(large_singleton_size), float(size_similarity))
+        # Insertion similarity: the score a pair must reach (_body_similarity).
+        context["partial_merge_min_size"] = int(partial_merge_min_size)
+        context["size_similarity"] = 0.0
+    if merge_recurrent:
+        # --exact: rows merged into longer nearby ones (_exact_merge_recurrent),
+        # scored like --partial-merge pairs.
+        context["merge_recurrent"] = True
+        context["partial_merge_min_size"] = int(partial_merge_min_size)
     workers = max(1, int(processes))
+    # Threaded realignments of the parent and every worker share one budget.
+    align_budget = _AlignBudget(mp_context() if workers > 1 else None, workers,
+                                _PARALLEL_ALIGN_BYTES)
+    _init_fast_worker(context, align_budget)
     pool = None
     if workers > 1:
         pool = mp_context().Pool(
             processes=workers,
             initializer=_init_fast_worker,
-            initargs=(context,),
+            initargs=(context, align_budget),
         )
     pooled_map, pooled_imap, pooled_imap_unordered = (
         _fast_pool_helpers(pool)
@@ -10581,6 +12128,7 @@ def _fast_stage_concat(
     """Stage 3: concatenate main parts and optionally small-SV parts."""
     with open(_fast_manifest_path(shards_dir), "rb") as handle:
         manifest = pickle.load(handle)
+    checkpoints.check_sources(manifest, "concat")
     parts_dir = os.path.join(shards_dir, "parts")
     chroms = sorted(manifest["chrom_sections"])
     # Row IDs carry their chromosome's token: two chromosomes must not share one.
@@ -10601,6 +12149,14 @@ def _fast_stage_concat(
             f"{len(missing)} locus/loci have no part output yet "
             f"(chrom stage not run?): {missing[:6]}"
         )
+    suffixes = (".part", ".promoted.tsv") + ((".small.part",) if output_small else ())
+    unready = [(chrom, reason) for chrom in chroms
+               for reason in [checkpoints.check_concat_ready(shards_dir, chrom, suffixes)]
+               if reason]
+    if unready:
+        raise RuntimeError(
+            f"{len(unready)} locus/loci are not checked complete (rerun their chrom stage): "
+            + "; ".join(f"{chrom}: {reason}" for chrom, reason in unready[:6]))
     promoted_lengths: Dict[str, int] = {}
     for chrom in chroms:
         promoted_path = os.path.join(
@@ -10761,15 +12317,6 @@ def merge_sample_vcfs_fast(
             indexes.append(sample_index_by_name[name])
         file_sample_indexes.append(indexes)
     import graphreftovcf as core
-    if core.mappy is None:
-        raise RuntimeError(
-            "multi-VCF insertion merging requires the mappy minimap2 "
-            "Python bindings"
-        )
-    if np is None:
-        raise RuntimeError(
-            "multi-VCF merging requires numpy (pip install numpy)"
-        )
     from graphvcfmerge_kmer import resolve_kmermatch
     kmermatch = resolve_kmermatch(kmermatch)
     effective_min = int(svcutoff) if svcutoff is not None else int(minsvsize)
@@ -10806,14 +12353,16 @@ def merge_sample_vcfs_fast(
             "legacy_fast": bool(legacy_fast),
             "kmermatch": kmermatch,
         }
-        _init_fast_worker(context)
         workers = max(1, int(processes))
+        align_budget = _AlignBudget(mp_context() if workers > 1 else None, workers,
+                                    _PARALLEL_ALIGN_BYTES)
+        _init_fast_worker(context, align_budget)
         pool = None
         if workers > 1:
             pool = mp_context().Pool(
                 processes=workers,
                 initializer=_init_fast_worker,
-                initargs=(context,),
+                initargs=(context, align_budget),
             )
 
         def pooled_map(task, items):
@@ -11264,6 +12813,10 @@ def merge_locus_vcfs(args) -> None:
                 kmermatch=args.kmermatch,
                 insertion_snps=args.insertion_snps,
                 realignment=not args.no_realignment,
+                shift=not args.no_shift,
+                partial_merge=args.partial_merge,
+                partial_merge_min_size=args.partial_merge_min_size,
+                merge_recurrent=args.merge_recurrent,
             )
         else:
             if not args.output:
@@ -11449,8 +13002,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--size-similarity", type=float, default=0.7, metavar="FRACTION",
-        help="minimum min(size)/max(size) for merging [0.7]",
+        "--size-similarity", type=float, default=0.5, metavar="FRACTION",
+        help="minimum min(size)/max(size) for merging [0.5]",
     )
     parser.add_argument(
         "--exact", metavar="QUERY_PATHS", default=None,
@@ -11465,16 +13018,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-realignment", action="store_true",
         help="chrom stage of an --exact scan: do not realign shifted members "
-             "onto their row's breakpoint; each keeps its own row",
+             "onto their row's breakpoint (the forced shift still moves "
+             "deletions, and insertions shifted by <=10%% of their size and "
+             "<50 bp, unless --no-shift)",
+    )
+    parser.add_argument(
+        "--no-shift", action="store_true",
+        help="chrom stage of an --exact scan: no forced shift (movement rule with "
+             "edge I/D) of shifted members, top level or nested; with "
+             "--no-realignment every shifted member keeps its own row",
+    )
+    parser.add_argument(
+        "--partial-merge", action="store_true",
+        help="chrom stage: no size cutoff (size similarity 0), and an --exact "
+             "move maps at least 50%% of the shorter of its allele and the "
+             "row's (default: of the row's); an insertion representative of "
+             "at least 10 kb whose largest other member is below "
+             "--size-similarity of it keeps a row of its own; insertion "
+             "similarity leaves the trimmed edges out of its denominator",
+    )
+    parser.add_argument(
+        "--partial-merge-min-size", type=int, default=_PARTIAL_MERGE_MIN_SIZE, metavar="BP",
+        help="with --partial-merge: pairs whose shorter insertion is at least BP are "
+             "scored partially and must also reach min(BP, half the shorter insertion); "
+             "shorter pairs are scored as without it [%(default)s]",
+    )
+    parser.add_argument(
+        "--merge-recurrent", action="store_true",
+        help="chrom stage of an --exact scan: at the end of the top level, an "
+             "insertion row whose representative is at least "
+             "--partial-merge-min-size merges into a longer nearby row (movement "
+             "rule of its representative) whose representative passes the "
+             "partial-merge score, every member force shifted onto it; longest "
+             "first (off with --no-shift)",
     )
     parser.add_argument("--kmermatch", default=DEFAULT_KMERMATCH,
                         help="KmerMatch executable for longest-first INS partitioning [beside this script]")
     parser.add_argument(
-        "--sequence-similarity", type=float, default=0.7,
+        "--sequence-similarity", type=float, default=0.5,
         metavar="FRACTION",
         help=(
             "insertion alignment and <=50-bp direct-comparison similarity "
-            "cutoff [0.7]; KmerMatch candidate selection uses a fixed "
+            "cutoff [0.5]; KmerMatch candidate selection uses a fixed "
             "cosine cutoff of 0.5"
         ),
     )

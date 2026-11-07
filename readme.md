@@ -1,110 +1,193 @@
 # LinGraph
 
-LinGraph is a variant-guided **pangenome graph builder** and an
-**assembly-based structural variant (SV) caller**. It takes haplotype-resolved
-genome assemblies and produces:
+LinGraph is a variants-guided **pangenome graph builder** and an
+**assembly-based structural variant caller**. It records variant sequences and
+assembly coordinates in **grVCF (Graph Recursive VCF)** to preserve assembly
+sequence information losslessly, and can export merged cohort calls as a
+pangenome graph with per-haplotype paths.
 
-- **VCFs** (in grVCF, a lossless graph-aware VCF) of SNPs, indels, and SVs for
-  each haplotype, or merged across a cohort;
-- a **pangenome graph** (`cohort.gfa`) with one GAF path file per sample, built
-  from the merged cohort calls.
+The main purpose of grVCF is lossless representation of assembly sequences.
+Its recursive representation also makes shared variants unambiguous: every
+carrier of a row shares the same sequence change at the same parent-relative
+coordinates. Differences between carriers are represented by additional rows,
+including **variants on insertions**. Reconstruction checks cover the assembly
+regions represented by the calls; coverage reports identify regions that are
+not represented.
 
-LinGraph has two run modes:
-
-| I want to... | Mode | What I need |
+| Your goal | Command | Starting point |
 | --- | --- | --- |
-| Call variants in my own assemblies against an existing graph | `individual` | Prepared assemblies, a reference FASTA, and a graph (download the precomputed **Win50KGraph**) |
-| Build a new pangenome graph and call a cohort together | `graph` | Prepared assemblies for the whole cohort and a reference FASTA |
+| Call variants in new assemblies | `individual` | Prepared haplotypes and an existing LinGraph graph, such as Win50KGraph |
+| Build a graph and call a cohort | `graph` | Prepared cohort assemblies and a reference |
+| Soft-mask, rename, and index FASTAs | `prepare` | Raw assembly FASTAs |
 
-New users who just want VCFs: follow
-[Quick start A](#quick-start-a-call-variants-in-your-assemblies).
+## Getting started
 
-## Contents
+**Start with the worked examples in [demo/](demo/).** They include data
+downloads, preparation, complete commands, and validation steps. Choose the
+example closest to your task:
 
-1. [Quick start A: call variants in your assemblies](#quick-start-a-call-variants-in-your-assemblies)
-2. [Quick start B: build a cohort pangenome graph](#quick-start-b-build-a-cohort-pangenome-graph)
-3. [Commands at a glance](#commands-at-a-glance)
-4. [Workflow overview](#workflow-overview)
-5. [Installation and requirements](#installation-and-requirements)
-6. [Prepare assembly FASTAs](#prepare-assembly-fastas)
-7. [Individual mode: call samples independently](#individual-mode-call-samples-independently)
-8. [Graph mode: build a pangenome graph from a cohort](#graph-mode-build-a-pangenome-graph-from-a-cohort)
-9. [Output files](#output-files)
-10. [Running on SLURM, resuming, and recovering](#running-on-slurm-resuming-and-recovering)
-11. [grVCF format and standard VCF conversion](#grvcf-format-and-standard-vcf-conversion)
-12. [Build a pangenome GFA from grVCF](#build-a-pangenome-gfa-from-grvcf)
-13. [Benchmark trio consistency](#benchmark-trio-consistency)
-14. [Questions and answers](#questions-and-answers)
-15. [Repository layout and more help](#repository-layout)
+| Demo | What it covers |
+| --- | --- |
+| [HG002 on CHM13](demo/HG002_CHM13/README.md) | Individual calling with Win50KGraph, benchmarking, and reusing alignments |
+| [HG002 on HG19](demo/HG002_HG19/README.md) | Preparing another reference and building its reference cache |
+| [NA19240 trio SV calling](demo/NA19240trio_SVcall/README.md) | Calling a trio with the precomputed graph |
+| [NA19240 trio graph](demo/NA19240trio_graph/README.md) | Building a cohort graph, exporting GFA/GAF, and checking the results |
 
-## Quick start A: call variants in your assemblies
+The commands below are a shorter route through the current workflow. Run them
+from the LinGraph repository root, and replace `/data/...` paths with your own.
+Each demo states its own working-directory layout.
 
-This route calls one diploid sample (two haplotype assemblies) against CHM13
-using the precomputed Win50KGraph. Run every command from the LinGraph
-repository root. Replace the paths under `/data/...` with your own files.
-For a complete, step-by-step individual-calling walkthrough, see the
-[HG002 on CHM13 demo](demo/HG002_CHM13/README.md), which also shows how to
-reuse graph alignments when switching references.
+- [Install](#installation-and-requirements)
+- [Prepare assemblies](#prepare-assembly-fastas)
+- [Quick start A: individual calling](#quick-start-a-call-variants-in-your-assemblies)
+- [Quick start B: cohort graph](#quick-start-b-build-a-cohort-pangenome-graph)
+- [Reference selection and reuse](#choose-or-change-the-reference-backbone)
+- [Outputs and large singleton insertions](#output-files)
+- [grVCF and standard VCF conversion](#grvcf-format-and-standard-vcf-conversion)
+- [GFA and GAF export](#build-a-pangenome-gfa-from-grvcf)
+- [SLURM and restarting](#running-on-slurm-resuming-and-recovering)
+- [Validation and benchmarking](#validation-and-benchmarking)
 
-**Before you start**, you need:
+## Installation and requirements
 
-- your two haplotype assemblies (FASTA, plain or compressed);
-- the CHM13 reference FASTA used to build Win50KGraph, with its `.fai` index
-  (`samtools faidx chm13.fa`);
-- about 2.5 GB for the download, plus disk space for the extracted package and
-  the reconstructed graphs.
-
-**Step 1. Install** (once; see [Installation](#installation-and-requirements)):
+You need Python **3.9 or later**, Conda, `make`, and a C++17-capable compiler.
+LinGraph uses Unix command-line tools and runs locally or on SLURM.
 
 ```bash
+git clone https://github.com/Walfred-MA/LinGraph.git
+cd LinGraph
 python3 install.py --conda-env lingraph -j 8
-```
-
-```bash
 conda activate lingraph
+python install.py --check-only
 ```
 
-After activation, use `python` for every LinGraph command. It is the
-environment's interpreter, and SLURM stages inherit it.
+If you already have the repository, start from its root. Activate the
+`lingraph` environment in each new shell and use its `python` interpreter for
+subsequent commands; submitted SLURM stages inherit it.
 
-**Step 2. List your assemblies** in a two-column file, `raw_assemblies.list`
-(haplotype name, FASTA path; no header):
+The installer installs dependencies, builds the native tools under
+`scripts/src/`, and places executables in `scripts/` or `tools/` as appropriate.
+Run it again after updating native source code.
+
+| Dependency | Purpose |
+| --- | --- |
+| Snakemake **6.15.1**, tabulate **0.8.10** | Workflow execution with pinned versions |
+| HTSlib **≥1.19**, samtools | Indexed sequence access |
+| BLAST+ **≥2.14.0**, including WindowMasker | Alignment and repeat masking |
+| sdust | Faster, optional low-complexity masking |
+| minimap2, Winnowmap2, meryl | Mapping and k-mer processing |
+| bcftools | VCF processing |
+| numpy, polars ≥1.0, mappy, parasail, edlib, ssw-py | Analysis and alignment libraries |
+
+Use `--check-only` to check runtime dependencies, or `--no-install-deps` to
+build against an environment you manage yourself. Advanced installation and
+helper-path settings are covered in the [command guide](scripts/LinGraph.md).
+
+Graph construction requires at least **4 CPUs**. For a cohort run, plan for
+**32 CPUs and at least 64 GB RAM**, with additional memory and temporary space
+for larger cohorts. Preparation examples below use **16 threads**.
+
+## Prepare assembly FASTAs
+
+Each haplotype must be an **uncompressed, soft-masked FASTA with an adjacent
+`.fai` index**. Query contigs use the prefix **`SAMPLE#N#`**, which makes contig
+names unique across assemblies. For example, `HG002_h1` corresponds to
+`HG002#1#chr1`.
+
+### 1. List the raw assemblies
+
+Create `raw_assemblies.list` with one haplotype per row, two columns, and no
+header:
 
 ```text
-HG002_h1 /data/raw/HG002.h1.fasta
-HG002_h2 /data/raw/HG002.h2.fasta
+HG002_h1 /data/raw/HG002.h1.fasta.gz
+HG002_h2 /data/raw/HG002.h2.fasta.gz
 ```
 
-Name each haplotype `SAMPLE_h1`, `SAMPLE_h2`, and so on. Each name must be
-unique in the list.
+Haplotype names must be unique. Relative FASTA paths are resolved from the
+list's directory, and paths cannot contain whitespace.
 
-**Step 3. Prepare the assemblies.** This soft-masks them, renames contigs to the
-required `SAMPLE#N#CONTIG` form, and indexes them:
+### 2. Prepare with 16 threads
 
 ```bash
 python scripts/LinGraph.py prepare \
-  -q raw_assemblies.list -O prepared_assemblies --contignamefix -t 16
+  -q raw_assemblies.list -O prepared_assemblies \
+  --contignamefix -t 16
 ```
 
-For inputs that are not already soft-masked, most preparation time is spent
-masking repeats with WindowMasker, so this step can take a while for
-whole-genome assemblies.
+This writes prepared copies and indexes, plus the input list for subsequent
+calling: **`prepared_assemblies/query_paths.prepared.txt`**. The source FASTAs
+are preserved. The same options work with `python tools/prepare_assemblies.py`.
 
-With two haplotypes, `-t 16` prepares both at once with about 8 WindowMasker
-processes each. The prepared list is written to
-`prepared_assemblies/query_paths.prepared.txt`.
+**Most preparation time is spent repeat masking with WindowMasker, which can
+be slow for whole genomes.** Without `-j`, `-t 16` is a total CPU budget shared
+across assemblies: two haplotypes are prepared concurrently with about eight
+masking processes each. Existing soft masking is retained unless you pass
+`--remask`.
 
-**Step 4. Download and unpack Win50KGraph** (once):
+### Faster masking with sdust
+
+You can try **sdust** by adding `--masker sdust`. It is much faster than
+WindowMasker, but masks low-complexity sequence while leaving transposons
+unmasked. **Using sdust reduces trio consistency by about 0.3–0.6
+percentage points compared with WindowMasker**, due to the unmasked
+transposons. WindowMasker remains the default; use it when trio consistency
+is the priority.
+
+```bash
+python scripts/LinGraph.py prepare \
+  -q raw_assemblies.list -O prepared_sdust \
+  --contignamefix --masker sdust -t 16
+```
+
+To compare maskers on already soft-masked inputs, also pass `--remask` and
+use a separate output folder. Selecting `--masker sdust` alone does not
+replace existing masking.
+
+| Option | Effect |
+| --- | --- |
+| `-q LIST` | Prepare every assembly in a list |
+| `-i FASTA --name HG002_h1` | Prepare one haplotype |
+| `--contignamefix` | Add the expected contig prefix where it is missing |
+| `--remask` | Regenerate masking, including on already masked inputs |
+| `--masker windowmasker` / `--masker sdust` | Select the masker; WindowMasker is the default |
+| `-t 16` | Share a 16-CPU budget across inputs when `-j` is omitted |
+| `-j JOBS -t THREADS` | Prepare JOBS assemblies at once with THREADS masking processes each, using about JOBS × THREADS CPUs |
+
+`CHM13_h1` and `HG38_h1` keep native reference contig names; index their
+uncompressed FASTAs with `samtools faidx`. Other references follow the prefix
+rules. Do not nest haplotype prefixes or reuse a name for different assemblies.
+
+Calling checks preparation before starting. `--force-prepare` can make
+prepared copies under `OUTPUT/PreparedAssemblies/`, which are removed after a
+successful run. For a cohort, prepare once beforehand so later runs can reuse
+the same files. See the [assembly-preparation guide](tools/assembly_preparation.md)
+for name-only fixes, masking details, and additional options.
+
+## Quick start A: call variants in your assemblies
+
+Use `individual` to call each haplotype against an existing LinGraph graph.
+The [HG002 on CHM13 demo](demo/HG002_CHM13/README.md) provides the complete
+example, including reference download and benchmarking.
+
+### 1. Download Win50KGraph
+
+Win50KGraph is a precomputed graph summary built with balanced blocks for
+individual SV calling. The archive is about 2.43 GB; allow additional space
+for extraction and reconstruction.
 
 ```bash
 curl -L -C - https://ndownloader.figshare.com/files/69451449 -o Win50KGraph.tar.gz
-```
-
-```bash
 tar -xzf Win50KGraph.tar.gz
 ```
 
-**Step 5. Reconstruct the local graphs** (once; reuse them for every later sample):
+The package record is [Figshare: Win50KGraph](https://doi.org/10.6084/m9.figshare.33930604).
+It contains local graph definitions, packed alternative sequences, and
+reference caches for CHM13 and GRCh38.
+
+### 2. Reconstruct the local graphs once
+
+Use the CHM13 FASTA matching the package, with its `.fai` index:
 
 ```bash
 python scripts/reconstruct_local_graph_folders.py \
@@ -113,9 +196,12 @@ python scripts/reconstruct_local_graph_folders.py \
   -o Win50KGraph -j 16 --resume
 ```
 
-Keep `cohort_minsetref_v3/` in place: `Win50KGraph/` links to it.
+Keep the extracted `cohort_minsetref_v3/` directory: `Win50KGraph/` links to
+its summary and reference caches. Reuse the reconstructed graph for later
+samples. Reconstruction always uses the package's CHM13 reference, even if
+subsequent calls use another reference.
 
-**Step 6. Call variants:**
+### 3. Call the prepared haplotypes
 
 ```bash
 python scripts/LinGraph.py individual \
@@ -126,32 +212,26 @@ python scripts/LinGraph.py individual \
   -O HG002_calls -t 16
 ```
 
-**Result:** one VCF per haplotype, `HG002_calls/samples/HG002_h1/HG002_h1.vcf`
-and `HG002_calls/samples/HG002_h2/HG002_h2.vcf`, with coverage reports beside
-them. Add `--merge` to also write merged `cohort.sv.vcf`, `cohort.indel.vcf`,
-and `cohort.snp.vcf` files. To use the calls with standard VCF tools, see
-[Convert to standard VCF](#convert-to-standard-vcf).
+Each haplotype gets its own grVCF and coverage reports under
+`HG002_calls/samples/NAME/`. For example:
+`HG002_calls/samples/HG002_h1/HG002_h1.vcf`.
 
-Tips:
-
-- Add `--dry-run` to any command to check the inputs and print the plan
-  without running anything.
-- If a run stops, **repeat the same command**: finished work is reused.
-- Calling takes about 1 hour per haplotype on 64 cores.
+To call one FASTA, replace `-I ...` with
+`-i /data/prepared/HG002_h1.fa --sample HG002_h1`. With several inputs, add
+`--merge` to also publish merged cohort files. The individual calling workflow
+merges these calls in CIGAR mode; use the [exact merge](#merge-existing-grvcfs)
+when you need shared-row identity for graph interpretation.
 
 ## Quick start B: build a cohort pangenome graph
 
-This route builds a new graph from a cohort, calls all haplotypes together, and
-exports the pangenome GFA. Install and prepare the assemblies as in
-[steps 1–3 above](#quick-start-a-call-variants-in-your-assemblies), listing every
-haplotype in the cohort. For a complete cohort example—including GFA/GAF
-losslessness checks and trio benchmarking—follow the
-[NA19240 trio graph demo](demo/NA19240trio_graph/README.md). If you only want
-individual SV calls with the precomputed Win50KGraph, see the
-[NA19240 trio SV-calling demo](demo/NA19240trio_SVcall/README.md).
+Use `graph` to build local graphs, call the cohort, and merge its variants.
+Add `--make-graph` to also export the GFA and per-haplotype GAFs. Follow the
+[NA19240 trio graph demo](demo/NA19240trio_graph/README.md) for a complete
+worked example.
 
-**Step 1. Create `cohort.list`** with the reference first, then every prepared
-haplotype:
+### 1. Create the cohort list
+
+List the reference and every prepared haplotype in `cohort.list`:
 
 ```text
 CHM13_h1 /data/references/chm13.fa
@@ -161,715 +241,234 @@ HG003_h1 /data/prepared/HG003_h1.fa
 HG003_h2 /data/prepared/HG003_h2.fa
 ```
 
-`CHM13_h1` and `HG38_h1` keep their native contig names and need only a `.fai`
-index. You can paste the rows from `prepared_assemblies/query_paths.prepared.txt`
-below the reference line.
+Use the actual paths from `prepared_assemblies/query_paths.prepared.txt`.
+Keep the reference first and select it explicitly with `-r CHM13_h1`.
 
-**Step 2. Build the graph, call the cohort, and export the GFA:**
+### 2. Build, call, merge, and export
 
 ```bash
 python scripts/LinGraph.py graph \
   -I cohort.list -G cohort_graph -O cohort_calls \
   -b windowprofs/geneblocks.bed --bed-grouped \
   -r CHM13_h1 --alternative data/alternatives.fa \
-  --exact --make-graph -t 16
+  --exact --make-graph -t 32
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `-G cohort_graph` | Where the graph is built and saved; reuse it for later runs |
-| `-O cohort_calls` | Where the VCFs and the GFA are written; keep it separate from `-G` and not nested inside it |
-| `-b windowprofs/geneblocks.bed --bed-grouped` | Use the supplied gene blocks (recommended for graph building) |
-| `--alternative data/alternatives.fa` | Add the recommended catalog of alternative sequences missing from CHM13 |
-| `--exact` | Merge the cohort calls exactly (the default; shown for clarity) |
-| `--make-graph` | Also export `cohort.gfa` and the per-sample GAFs |
+| `-G cohort_graph` | Saved local graphs and construction inputs |
+| `-O cohort_calls` | Calling, merge, and graph-export outputs |
+| `-b ... --bed-grouped` | Use the supplied block profile |
+| `--alternative data/alternatives.fa` | Add the recommended alternative-sequence catalog for CHM13 |
+| `--exact` | Recursive merge using indexed assemblies; this is the graph workflow's default |
+| `--make-graph` | Export `cohort.gfa` and `gaf/SAMPLE.gaf` after merging |
 
-**Result:** in `cohort_calls/`, the merged `cohort.sv.vcf`, `cohort.indel.vcf`,
-and `cohort.snp.vcf`; per-haplotype VCFs under `samples/NAME/`; `cohort.gfa`;
-and per-sample GAFs under `gaf/`. Graph mode needs at least 4 CPUs; a full
-cohort run should have 32 CPUs and 64 GB RAM or more. For large cohorts, add
-[SLURM options](#running-on-slurm-resuming-and-recovering).
+Keep `-G` and `-O` **separate, non-nested directories**. Omit `--make-graph`
+to stop after the VCFs; you can export later with `--gfa-only`. Repeat the
+same command to resume an interrupted run.
 
-## Commands at a glance
+### Blocks and alternative sequences
 
-All commands run from the repository root as `python scripts/LinGraph.py ...`.
+The supplied block profiles use CHM13 coordinates:
 
-| Task | Command |
+| Profile | Use |
 | --- | --- |
-| Prepare assemblies | `LinGraph.py prepare -q raw.list -O prepared --contignamefix` |
-| Call samples independently | `LinGraph.py individual -I samples.list -G GRAPH -r REF -O OUT` |
-| …and merge them | add `--merge` |
-| Call one FASTA | `LinGraph.py individual -i asm.fa --sample HG002_h1 -G GRAPH -r REF -O OUT` |
-| Build a reference cache only | `LinGraph.py individual -G GRAPH -r ref.fa --reference-only -O OUT` |
-| Build a graph and call a cohort | `LinGraph.py graph -I cohort.list -G GRAPH -O OUT -r REF --exact` |
-| …and export the GFA | add `--make-graph` |
-| Switch the backbone of a finished graph | `LinGraph.py graph -G GRAPH -O NEW_OUT -r OTHER_HAP --exact --make-graph` |
-| Export the GFA from existing merged VCFs | `LinGraph.py graph -G GRAPH -O OUT -r REF --gfa-only` |
-| Re-merge existing per-sample VCFs | add `--merge-only` |
-| Recall and merge from saved alignments | `LinGraph.py graph -G GRAPH -O OUT -r REF --recall-only --exact` |
-| Preview without running | add `--dry-run` |
-| Clear locks after an interrupted run | `LinGraph.py --unlock GRAPH OUT` |
-| Convert grVCF to standard VCF | `python tools/grvcf_to_vcf.py -i in.vcf -o out.vcf` |
-| Rename CHM13 contigs to `chr1`... | `python tools/vcf_chromfix.py -i in.vcf -o out.vcf --CHM13fix` |
-| Show all options | `LinGraph.py individual --help-all`, `LinGraph.py graph --help-all` |
+| `windowprofs/geneblocks.bed` | Recommended for graph building and gene-based downstream analysis |
+| `windowprofs/balanceblocks.bed` | Optimized for local alignment and SV calling; used by Win50KGraph |
 
-## Workflow overview
+Use either with `--bed-grouped`. Without a BED, LinGraph chooses blocks from
+the inputs. Optional novel-locus discovery is controlled by
+`--find-novel-loci`; `--static-block` keeps the initial block templates fixed.
 
-![LinGraph workflow: prepare and align local graphs, pair query and reference sequences, call and merge grVCF variants, and export a pangenome GFA.](figures/lingraph_workflow.png)
+For a new species with only one reference, use `blockindex` followed by
+`graph --construct-only --static-block`. See the
+[two-step single-reference guide](docs/blockindex.md) for commands and outputs.
 
-LinGraph divides the genome into blocks (loci). For each block, it builds a
-small local graph from the assemblies, aligns each assembly to it, and calls
-variants from those alignments. The calls are then joined back onto the
-reference. Cohort calls keep their sequence and graph relationships in grVCF
-and can be exported as a pangenome GFA. Novel-locus discovery is optional.
+The bundled [data/alternatives.fa](data/alternatives.fa) complements CHM13 and
+is recommended when constructing a CHM13 graph. Keep the same catalog when
+resuming. Its `.fai` is included; regenerate the index if you change the FASTA.
+The catalog supplements the reference FASTA and its row in `cohort.list`.
 
-- `individual` reuses an existing graph, such as the downloadable Win50KGraph,
-  and calls each haplotype on its own.
-- `graph` builds (or resumes) the graph from the cohort assemblies and calls
-  the cohort as part of that build.
+## Choose or change the reference (backbone)
 
-[Download the workflow figure (PDF)](figures/lingraph_workflow.pdf).
+`-r` accepts a saved haplotype name or an external FASTA path. For an external
+reference, use `--reference-name NAME_h1` when needed. Keep a separate calling
+output directory for each reference.
 
-## Installation and requirements
-
-You need Python **3.9 or later**, Conda, `make`, and a C++17-capable compiler.
-The workflows use Unix command-line tools and run locally or on SLURM.
-
-```bash
-cd /path/to/LinGraph
-python3 install.py --conda-env lingraph -j 8
-conda activate lingraph
-python install.py --check-only
-```
-
-Optionally, put the scripts on your `PATH` with `export PATH="$PWD/scripts:$PATH"`.
-
-The installer creates or updates the named Conda environment, builds the C++
-tools under `scripts/src/`, and copies the executables into `scripts/`. It
-installs:
-
-| Dependency | Requirement or purpose |
-| --- | --- |
-| Snakemake **6.15.1**, tabulate **0.8.10** | Pinned workflow versions |
-| HTSlib **≥1.19**, samtools | Indexed sequence access |
-| BLAST+ **≥2.14.0**, including WindowMasker | Alignment and assembly soft masking |
-| sdust | Optional fast assembly soft masking (`--masker sdust`) |
-| minimap2, Winnowmap2, meryl | Mapping and k-mer processing |
-| bcftools | VCF normalization, compression, and indexing |
-| numpy, polars ≥1.0, mappy, parasail, edlib, ssw-py | Python analysis and alignment libraries |
-
-Installer options:
-
-- `--check-only` checks runtime dependencies without installing or compiling.
-- `--no-install-deps` builds against an environment you manage yourself.
-
-The **graph-alignment helpers** (`graphcigarlight.py`, the BLAST/Winnowmap
-wrappers, and the natively built `KmerStrd` and other tools) are in `scripts/`.
-To check that they are found:
-
-```bash
-PYTHONPATH="$PWD/scripts" python -c 'from local_graph_whole_cigar import resolve_extension_dir; print(resolve_extension_dir())'
-```
-
-To use a separate helper installation, set `MINSETREF_GRAPH_TOOLS` to its
-directory.
-
-**Compute resources.** Graph mode requires at least **4 CPUs**; the examples
-use `-t 16`. For a full cohort run, we recommend **32 CPUs and at least 64 GB
-RAM**. Larger cohorts or high repeat complexity may need more memory and
-temporary storage. For cohorts with thousands of haplotypes, use shared storage
-and [SLURM](#running-on-slurm-resuming-and-recovering).
-
-## Prepare assembly FASTAs
-
-LinGraph needs each haplotype as **one uncompressed, soft-masked FASTA with an
-adjacent `.fai` index**, and every contig named **`SAMPLE#N#CONTIG`**. The
-preparation command does all of this for you.
-
-### 1. Write the assembly list
-
-One haplotype per row, two whitespace-separated columns, no header:
-
-```text
-HG002_h1 /data/raw/HG002.h1.raw.fasta
-HG002_h2 /data/raw/HG002.h2.raw.fasta
-```
-
-The list name `HG002_h1` (underscore, `h`) corresponds to the contig prefix
-`HG002#1#` (`#` separators). For example, the raw header `>chr1` of `HG002_h1`
-becomes `>HG002#1#chr1`.
-
-### 2. Run preparation
-
-```bash
-python scripts/LinGraph.py prepare \
-  -q raw_assemblies.list -O prepared_assemblies \
-  --contignamefix -t 16
-```
-
-This is the same as `python tools/prepare_assemblies.py` with the same options.
-It soft-masks unmasked inputs with WindowMasker, adds missing contig prefixes,
-and writes uncompressed FASTAs with `.fai` indexes. Without `-j`, `-t` is the
-total CPU budget shared across the inputs; for a two-haplotype sample, `-t 16`
-uses two preparations at once with about 8 masking processes each. The source
-FASTAs are not changed. **Use `prepared_assemblies/query_paths.prepared.txt`
-as the input list for calling.**
-
-WindowMasker is slow, but there is a much faster alternative: sdust. However,
-sdust masks only low-complexity sequence, not transposons, and drops SV calling
-accuracy by about 0.3–0.6%. To use it, add `--masker sdust`:
-
-```bash
-python scripts/LinGraph.py prepare \
-  -q raw_assemblies.list -O prepared_assemblies \
-  --contignamefix --masker sdust -t 16
-```
-
-| Option | Effect |
-| --- | --- |
-| `-q LIST` / `-i FASTA --name HG002_h1` | Prepare a list, or a single FASTA |
-| `-O DIR` | Output folder for prepared FASTAs, indexes, and the new list |
-| `--contignamefix` | Add the `SAMPLE#N#` prefix to contigs that lack it |
-| `--remask` | Regenerate soft masking even if the FASTA is already masked |
-| `--masker sdust` | Mask with sdust instead of WindowMasker (much faster, no transposon masking) |
-| `-t THREADS` | Total CPU budget, shared across inputs unless `-j` is set |
-| `-j JOBS` | Set the number of assemblies at once; with `-j`, `-t` is masking processes per assembly (about `-j × -t` CPUs) |
-
-To fix contig names only, without masking:
-
-```bash
-python tools/namecontigsfix.py -i assembly.fa -n HG002_h1
-samtools faidx assembly.namefixed.fa
-```
-
-This writes `assembly.namefixed.fa` (use `-o` to choose another path). `-n`
-accepts `HG002_h1` or `HG002#1`.
-
-### Input rules
-
-- **Every haplotype name in the first column must be unique across the whole
-  list.** Two rows named `HG002_h1` make inputs and outputs ambiguous and can
-  attribute one assembly's results to another.
-- A contig must belong to exactly one haplotype. Do not nest prefixes, such as
-  `HG002#1#HG002#2#chr1`; the name fixer rejects this. Correct the source
-  header or the list label instead.
-- **`CHM13_h1` and `HG38_h1` keep their native contig names and masking.** They
-  only need an index: `samtools faidx reference.fa`.
-- Preparation accepts compressed inputs; calling requires the uncompressed,
-  indexed output.
-- Relative FASTA paths are resolved from the list's directory. Paths cannot
-  contain whitespace. Do not add an index column.
-- Calling checks the first sequence and index entry and stops if the input is
-  not prepared. `--force-prepare` instead prepares temporary copies (see
-  [the input format question](#why-is-a-specific-input-assembly-format-required-and-what-is-it)).
-
-See [assembly preparation](tools/assembly_preparation.md) for more options.
-
-## Individual mode: call samples independently
-
-`individual` calls **one sample or a batch of samples, each haplotype
-independently**, against an **existing LinGraph graph** passed with `-G`. You
-can either:
-
-- [download and reconstruct Win50KGraph](#get-the-win50kgraph-graph) (recommended), or
-- build your own graph with [graph mode](#graph-mode-build-a-pangenome-graph-from-a-cohort).
-
-### Get the Win50KGraph graph
-
-**`Win50KGraph.tar.gz`** is the precomputed LinGraph graph summary built with
-**balanced blocks**, recommended for individual SV calling. It reconstructs all
-local graphs used for calling, including repetitive regions. You reconstruct it
-once and reuse it for every new sample.
-
-**Figshare DOI:** [10.6084/m9.figshare.33930604](https://doi.org/10.6084/m9.figshare.33930604)
-(file `Win50KGraph.tar.gz`, about 2.43 GB). The download is available after the
-record is published and the DOI is active.
-
-**1. Download and extract.** In the folder where you want the archive
-(`-C -` resumes an interrupted download):
-
-```bash
-curl -L -C - https://ndownloader.figshare.com/files/69451449 -o Win50KGraph.tar.gz
-tar -xzf Win50KGraph.tar.gz
-```
-
-The package extracts into `cohort_minsetref_v3/summary/`:
-
-| File or directory | Purpose |
-| --- | --- |
-| `local_graphs.tsv` | Local graph definitions, source intervals, and path metadata |
-| `alternatives.fasta` and `.fai` | Packed alternative and novel sequences, with their index |
-| `references/CHM13_h1_rig/` | Supplied CHM13 reference alignment and block coordinates |
-| `references/HG38_h1_rig/` | Supplied GRCh38 reference alignment and block coordinates |
-
-The archive holds the graph summary, not the full graph, so reconstruct it
-before calling.
-
-**2. Reconstruct all local graphs.** Use the **CHM13 FASTA used to build the
-package**, with its `.fai` index. The original cohort assemblies are not needed.
-
-```bash
-python scripts/reconstruct_local_graph_folders.py \
-  -i cohort_minsetref_v3/summary \
-  -r /data/references/chm13.fa --reference-haplotype CHM13_h1 \
-  -o Win50KGraph -j 16 --resume
-```
-
-This writes local graph FASTAs, template FASTAs, BED files, BLAST databases,
-and graph lists under `Win50KGraph/`. It also links `summary/` and
-`references/` to the extracted package, so **keep the extracted package in
-place**. If interrupted, repeat the command; `--resume` reuses finished
-outputs. Reconstruction needs extra disk space, and RAM for the uncompressed
-reference and packed sequences.
-
-**3. Call variants.** Against CHM13, reusing the supplied reference alignment:
-
-```bash
-python scripts/LinGraph.py individual \
-  -I prepared_assemblies/query_paths.prepared.txt \
-  -G Win50KGraph \
-  -r /data/references/chm13.fa --reference-name CHM13_h1 \
-  --reference-caches Win50KGraph/references/CHM13_h1_rig \
-  -O sample_calls_chm13 -t 16
-```
-
-For GRCh38, use the GRCh38 FASTA, `--reference-name HG38_h1`,
-`--reference-caches Win50KGraph/references/HG38_h1_rig`, and a separate `-O`.
-For any other reference, omit `--reference-caches` and LinGraph aligns that
-reference itself (see [Add another reference](#add-another-reference-hg19-example)).
-Reconstruction always uses the package's CHM13 reference, whichever reference
-you call against.
-
-### Call multiple samples in one command
-
-List the prepared haplotypes in `samples.list`. Two diploid samples have four
-rows:
-
-```text
-HG002_h1 /data/prepared/HG002_h1.fa
-HG002_h2 /data/prepared/HG002_h2.fa
-HG003_h1 /data/prepared/HG003_h1.fa
-HG003_h2 /data/prepared/HG003_h2.fa
-```
-
-```bash
-python scripts/LinGraph.py individual \
-  -I samples.list -G cohort_graph -r CHM13_h1 \
-  -O sample_calls_chm13 -t 16
-```
-
-Each of the four haplotypes is called independently and gets its own VCF and
-coverage reports under `sample_calls_chm13/samples/NAME/`. The graph and the
-reference alignment are shared across inputs. Add `--merge` to also merge the
-calls into cohort VCFs.
-
-To call a single FASTA without a list, replace `-I ...` with
-`-i /data/prepared/HG002_h1.fa --sample HG002_h1`.
-
-### Choose the reference
-
-`-r` takes either a **haplotype name** saved in the graph's cohort list or a
-**FASTA path**. Use a separate `-O` for each reference.
-
-| Reference | Option |
-| --- | --- |
-| CHM13 or GRCh38 saved in the graph | `-r CHM13_h1` or `-r HG38_h1` |
-| Any other haplotype saved in the graph | `-r HG002_h1` |
-| An external FASTA | `-r /data/references/custom.fa --reference-name CUSTOM_h1` |
-| Default (no `-r`) | The first assembly in the graph's saved cohort list |
-
-```bash
-python scripts/LinGraph.py individual \
-  -I prepared_assemblies/query_paths.prepared.txt \
-  -G cohort_graph -r HG38_h1 -O sample_calls_hg38 -t 16
-```
-
-Notes:
-
-- An external reference must follow the [preparation rules](#prepare-assembly-fastas)
-  for its name, except native CHM13 or GRCh38 FASTAs, which you name with
-  `--reference-name CHM13_h1` or `--reference-name HG38_h1`.
-- For `HG38_h1`, LinGraph uses chr1–22, chrX, and chrY; chrM and non-primary
-  scaffolds are excluded.
-- Changing the reference requires a new calling run. To call the same
-  assemblies against another reference faster, add
-  `--reuse-alignments PREVIOUS_OUTPUT` to reuse their graph alignments from an
-  earlier run with the same graph.
-
-### Add another reference: HG19 example
-
-A graph can call against any reference once that reference's cache exists in
-`GRAPH/references/NAME_rig`. Win50KGraph ships caches for `CHM13_h1` and
-`HG38_h1`. This example builds one for HG19 (UCSC, chr1–22, X and Y).
-
-**1. Download and prepare HG19.** A reference other than CHM13 or GRCh38 needs
-the `NAME#1#` prefix, so `--contignamefix` renames `chr1` to `HG19#1#chr1`:
-
-```bash
-mkdir -p logs references && cd references
-curl -L -O https://hgdownload.soe.ucsc.edu/goldenPath/hg19/bigZips/hg19.fa.gz
-gzip -dc hg19.fa.gz > hg19.fa
-samtools faidx hg19.fa
-samtools faidx hg19.fa chr{1..22} chrX chrY > hg19_main.fa
-python ../LinGraph/tools/prepare_assemblies.py \
-  -i hg19_main.fa --name HG19_h1 -O hg19 \
-  --contignamefix --remask --threads 16 > ../logs/prepare_hg19.log 2>&1
-cd ..
-```
-
-**2. Build the reference cache once.** `--reference-only` aligns the reference
-to every local graph (this takes hours, like calling one haplotype), writes
-`Win50KGraph/references/HG19_h1_rig`, and calls no samples. If a different
-HG19 already uses that name, the cache goes to `HG19_h1_<fingerprint>_rig`
-instead. Rerun the same command to resume:
-
-```bash
-python LinGraph/scripts/LinGraph.py individual \
-  -G Win50KGraph -r references/hg19/hg19_main.fa \
-  --reference-only -O hg19_cache -t 64 > logs/hg19_cache.log 2>&1
-```
-
-The name `HG19_h1` is read from the contig prefix; add
-`--reference-name HG19_h1` to state it explicitly. To keep the cache elsewhere,
-add `--reference-caches DIR` here and to later calls. If you skip this step,
-the first HG19 call builds the cache in its own output folder.
-
-**3. Call against HG19.** The cache is found and reused automatically:
-
-```bash
-python LinGraph/scripts/LinGraph.py individual \
-  -I prepared_assemblies/query_paths.prepared.txt \
-  -G Win50KGraph -r references/hg19/hg19_main.fa \
-  -O sample_calls_hg19 -t 64 > logs/calls_hg19.log 2>&1
-```
-
-VCF records use the prepared names, such as `HG19#1#chr1`. To restore plain
-names, see [Reference contig names](#reference-contig-names).
-
-### How reference caches are found
-
-Calling needs a **reference cache**: the reference aligned to every local
-graph. Caches live in folders such as `GRAPH/references/CHM13_h1_rig/`, each
-with a `reference_cache.json` that records the reference name, the alignment
-mode, and a **contig fingerprint**: the SHA-256 of the sorted
-chromosome-name/length pairs from the `.fai`. The fingerprint ignores FASTA
-contents, file names, masking, line wrapping, `.fai` row order, offsets, and
-timestamps.
-
-`individual` finds the cache automatically:
-
-1. It checks `GRAPH/references/NAME_rig`, then
-   `GRAPH/references/NAME_<fingerprint>_rig` (the first 12 characters of the
-   reference's fingerprint). It uses the first complete cache with the same
-   reference name, mode, and fingerprint, and prints the folder it matched.
-2. Without a match, it builds the cache in `OUTPUT/references/NAME_rig`.
-   Rerunning with the same `-O` resumes or reuses it.
-
-`--reference-caches DIR` overrides this search. For `-r CHM13_h1` (or
-`--reference-name CHM13_h1`), `DIR` must supply `CHM13_h1.align.txt` and
-`CHM13_h1.align.txt_blocks.bed`. LinGraph uses these files directly, **without
-any name, fingerprint, mode, or content check**, so make sure they match the
-reference. The reference FASTA and its `.fai` are still required.
-
-When reconstructing a graph package, `reconstruct_local_graph_folders.py` links
-`OUTPUT/references` to `INPUT/references` if that folder exists. It keeps a
-matching existing link and refuses to overwrite a different one.
-
-### Individual-mode options
-
-| Option | Effect |
-| --- | --- |
-| `--merge` | With several haplotypes, also merge them into `cohort.sv.vcf`, `cohort.indel.vcf`, and `cohort.snp.vcf` |
-| `--all` / `--svonly` / `--svindel` / `--snp` | Choose which merged VCFs to write (all; SVs only; SVs and indels; SNPs only). Any of these also turns on merging |
-| `--svcutoff 50` | SV size boundary for merged files (default 20 bp) |
-| `-L partitions.list` | Call only the listed graph partitions (default: all) |
-| `--satellite-bed satellites.bed` | Add satellite annotations to coverage reports |
-| `--reuse-alignments DIR` | Reuse graph alignments from an earlier run with the same graph |
-| `--force-prepare` | Prepare temporary copies of unprepared inputs instead of stopping |
-| `--slurm` | Run one SLURM job per haplotype (see [SLURM](#running-on-slurm-resuming-and-recovering)) |
-| `--dry-run` | Check inputs and show planned commands without running or writing files |
-
-Calling is always independent per haplotype; merging is an extra step after
-calling, and a single input never produces merged files. The size cutoff
-applies to **merged representatives**, so the per-haplotype `.vcf` files can
-keep smaller candidate events for merging.
-
-## Graph mode: build a pangenome graph from a cohort
-
-**Graph mode builds (or resumes) a pangenome graph and calls the cohort as part
-of the build.** It scales to thousands of haplotypes. Use it to build a fresh
-graph; use `individual` when you already have a graph and want per-sample VCFs.
-
-### 1. Create the cohort list
-
-List the reference and every prepared haplotype:
-
-```text
-CHM13_h1 /data/references/chm13.fa
-HG002_h1 /data/prepared/HG002_h1.fa
-HG002_h2 /data/prepared/HG002_h2.fa
-HG003_h1 /data/prepared/HG003_h1.fa
-HG003_h2 /data/prepared/HG003_h2.fa
-```
-
-### 2. Choose the blocks
-
-Graph building divides the genome into blocks. The supplied BEDs in
-`windowprofs/` use CHM13 coordinates, so use them with a CHM13 reference:
-
-| Blocks | Option | Use |
-| --- | --- | --- |
-| Gene blocks | `-b windowprofs/geneblocks.bed --bed-grouped` | **Recommended for graph building**; block edges follow genes |
-| Balanced blocks | `-b windowprofs/balanceblocks.bed --bed-grouped` | Slightly better SV calling; used by Win50KGraph |
-| Automatic | omit `-b` and `--bed-grouped` | LinGraph chooses blocks from the inputs |
-
-See [What are local graphs?](#what-are-local-graphs-and-how-are-they-made) for the
-trade-offs.
-
-### 3. Run the build
-
-```bash
-python scripts/LinGraph.py graph \
-  -I cohort.list -G cohort_graph -O cohort_calls \
-  -b windowprofs/geneblocks.bed --bed-grouped \
-  -r CHM13_h1 --alternative data/alternatives.fa --exact --make-graph -t 16
-```
-
-- `--exact` is the default merge: it uses the indexed assemblies to realign
-  merged SVs.
-- `--make-graph` also exports `cohort.gfa` and the per-sample GAFs. Omit it to
-  produce only the VCFs; you can [export the GFA later](#export-through-lingraph).
-- Keep `-G` and `-O` **separate and not nested**. A completed graph saves its
-  cohort list, so later runs on it can omit `-I`.
-- Repeat the same command to resume after an interruption.
-
-### Recommended alternatives for CHM13
-
-[data/alternatives.fa](data/alternatives.fa) is the recommended catalog of
-alternative sequences to use with CHM13 (via `--alternative`). Its `.fai` index
-is included; if you edit or replace the FASTA, regenerate it with
-`samtools faidx data/alternatives.fa`.
-
-The catalog complements CHM13; it does not replace the reference FASTA or its
-row in `cohort.list`. Imported alternatives become part of the saved graph
-inputs, so use the same catalog when resuming a build.
-
-### Choose or change the reference (backbone)
-
-The reference (`-r`) is the backbone used for variant calling and graph output.
-It can be **any haplotype in `cohort.list`**, named exactly as in its first
-column. Without `-r`, LinGraph uses the first row.
-
-To build with `HG002_h2` as the backbone:
-
-```bash
-python scripts/LinGraph.py graph \
-  -I cohort.list -G cohort_graph -O cohort_calls_HG002_h2 \
-  -b windowprofs/geneblocks.bed --bed-grouped \
-  -r HG002_h2 --exact --make-graph -t 16
-```
-
-To produce results on **another backbone after a run has completed**, reuse the
-same `-G`, omit `-I` and the construction options, change `-r`, and use a new
-`-O`:
+For a completed cohort graph, reuse the graph and choose a different saved
+haplotype as the calling reference and exported backbone:
 
 ```bash
 python scripts/LinGraph.py graph \
   -G cohort_graph -O cohort_calls_HG003_h1 \
-  -r HG003_h1 --exact --make-graph -t 16
+  -r HG003_h1 --exact --make-graph -t 32
 ```
 
-LinGraph reuses the saved local graph alignments and reruns only the
-reference-dependent steps (matching, lifting, VCF, merge, and GFA). Use a
-normal `graph` run for this; `--recall-only` keeps the previous run's reference
-and cannot change backbones.
+Saved graph alignments are reused, and the reference-dependent steps run
+again. Use a normal `graph` run for a new reference; `--recall-only` keeps the
+existing calling reference. An existing graph-mode output can recover its
+reference from `inputs/cohort_call.run.json` when `-r` is omitted. For a new
+run, the default is the first saved cohort assembly. Set `-r` explicitly when
+you want a particular exported backbone.
 
-### Rerun parts of a finished run
+For individual calling, reuse an earlier output's graph alignments with
+`--reuse-alignments PREVIOUS_OUTPUT`. See the
+[HG002 CHM13 demo](demo/HG002_CHM13/README.md) for switching references.
 
-| Goal | Option |
-| --- | --- |
-| Export the GFA from existing merged VCFs | `--gfa-only` |
-| Re-merge saved per-sample VCFs | `--merge-only` (add `--make-graph` to also export) |
-| Regenerate VCFs and merge from saved calling alignments | `--recall-only` |
-| Keep the initial templates and skip extra novel-locus discovery | `--static-block` |
+### Reference caches
 
-For example, to regenerate the exact merged cohort outputs:
+A reference cache stores the reference's alignment to the local graphs.
+Win50KGraph supplies caches for `CHM13_h1` and `HG38_h1`. To use GRCh38, supply
+its FASTA, `--reference-name HG38_h1`, and the matching cache
+`Win50KGraph/references/HG38_h1_rig`.
+
+Build a cache for another prepared reference with:
 
 ```bash
-python scripts/LinGraph.py graph -G cohort_graph -O cohort_calls \
-  -r CHM13_h1 --recall-only --exact -t 16
+python scripts/LinGraph.py individual \
+  -G Win50KGraph \
+  -r /data/references/HG19.prepared.fa --reference-name HG19_h1 \
+  --reference-only -O HG19_cache -t 16
 ```
 
-`--recall-only` requires the saved alignments and calling inputs. The `--all`,
-`--svonly`, `--svindel`, and `--snp` options mainly select VCF contents for
-individual runs; they do not control graph construction. See
-[cohort calling](scripts/cohort_call_snakemake/README.md) for restart and merge
-details.
+This writes a reusable cache under `GRAPH/references/` and calls no samples.
+The [HG19 demo](demo/HG002_HG19/README.md) covers reference preparation.
+
+Automatic cache selection checks the reference name, alignment mode, and a
+fingerprint of contig names and lengths. The fingerprint does not compare
+sequence contents. An explicit `--reference-caches DIR` uses that cache
+without validation, so supply one that matches the reference.
 
 ## Output files
 
-| File | Mode | Contents |
-| --- | --- | --- |
-| `OUT/samples/NAME/NAME.vcf` | both | Calls for one haplotype (grVCF) |
-| `OUT/samples/NAME/NAME.coverage.summary.tsv` | individual | Assembly bases represented and uncovered |
-| `OUT/samples/NAME/NAME.coverage.missing_reference.bed`, `NAME.coverage.missing_query.bed` | individual | Uncovered reference and assembly intervals |
-| `OUT/cohort.sv.vcf`, `cohort.indel.vcf`, `cohort.snp.vcf` | graph; individual with `--merge` | Merged cohort calls (grVCF) |
-| `OUT/cohort.gfa` | graph with `--make-graph` | Pangenome graph (rGFA) |
-| `OUT/gaf/SAMPLE.gaf` | graph with `--make-graph` | Each sample's paths through the graph (`OUT/gaf/gaf_stats.tsv` summarizes them) |
-| `OUT/checkpoints/local_reference_templates.fa`, `alternative_loci.fa` | graph | [Alternative and novel sequences](#where-do-i-find-the-alternative-and-novel-sequences) for this reference (individual mode writes them under `samples/NAME/`) |
-| `OUT/lingraph/` | both | Run record (`run.json`), logs, and checkpoints |
+| Path under `OUT/` | Contents |
+| --- | --- |
+| `samples/NAME/NAME.vcf` | Per-haplotype grVCF |
+| `samples/NAME/NAME.coverage.summary.tsv` | Individual-call coverage summary |
+| `samples/NAME/NAME.coverage.missing_reference.bed`, `NAME.coverage.missing_query.bed` | Uncovered intervals from individual calling |
+| `cohort.sv.vcf`, `cohort.indel.vcf`, `cohort.snp.vcf` | Merged calls, according to the selected merge mode |
+| `cohort.sv.10Ksingleton.vcf` | Large singleton insertions separated from the main SV file by default |
+| `cohort.samples.headers.gz` | Per-sample coverage and mapping headers retained during merging |
+| `cohort.gfa` | Exported pangenome graph in rGFA format |
+| `gaf/SAMPLE.gaf`, `gaf/gaf_stats.tsv` | Per-haplotype walks and their summary |
+| `gaf/SAMPLE.gaf.breaks.tsv` | Reasons for breaks in a sample's walks |
+| `checkpoints/local_reference_templates.fa`, `checkpoints/alternative_loci.fa` | Reference-specific templates and alternative loci for cohort calling |
+| `lingraph/` | Run records, logs, and checkpoints |
 
-Keep the original grVCFs: graph export, merging, and the converters need them.
-See [the full command guide](scripts/LinGraph.md#outputs-and-restarting) for
-every output.
+Individual mode writes reference-specific template and alternative-locus
+FASTAs under each `samples/NAME/` directory. Preserve the original grVCFs,
+mapping headers, and matching reference/catalog FASTAs for reconstruction,
+conversion, and graph export.
 
-## Running on SLURM, resuming, and recovering
+### Large singleton insertions
 
-**SLURM.** Activate the environment first, then add `--slurm` and your
-`sbatch` options:
+By default, merging writes insertions **at least 10,000 bp long with `NSUP=1`**
+to `cohort.sv.10Ksingleton.vcf`, instead of `cohort.sv.vcf`. One supporting
+haplotype defines a singleton here. The main SV file and singleton file
+together retain the full published SV merge.
 
-```bash
-python scripts/LinGraph.py graph \
-  -I cohort.list -G cohort_graph -O cohort_calls -r CHM13_h1 --exact \
-  --slurm --slurm-jobs 20 --slurm-args '--account=myaccount --partition=compute'
-```
+The graph uses the main cohort VCFs and excludes these singleton insertions.
+LinGraph passes the singleton file to the exporter so each affected GAF walk
+ends before the excluded query interval and resumes afterward. These breaks
+are marked `excluded_row` in the sample's breaks table.
 
-In `individual` mode, `--slurm` runs one job per haplotype (up to
-`--slurm-jobs` at once, default 20). In `graph` mode, it submits the workflow
-stages as jobs. Memory defaults and options are listed in
-[the memory question](#how-much-memory-is-used-and-how-do-i-increase-it-after-an-out-of-memory-failure).
-
-**Resuming.** Repeat the same command. Finished stages are reused and only
-unfinished or failed ones run again.
-
-**Stale locks.** If a run was killed, clear its workflow locks after all of its
-jobs have exited, then repeat the command:
-
-```bash
-python scripts/LinGraph.py --unlock cohort_graph cohort_calls
-```
-
-Unlocking keeps checkpoints and outputs; add `--dry-run` to preview it.
-
-**Previewing.** `--dry-run` validates inputs and prints the planned commands
-without creating files or submitting jobs.
+Set `--large-singleton-size BP` during merging to change the threshold, or
+`--large-singleton-size 0` to retain all such insertions in the main SV file
+and subsequent graph. For a custom threshold, combine `--merge-only` and
+`--make-graph` in the same command so merging and export share the setting.
+**Include the singleton VCF when splitting a complete merge or checking its
+losslessness.**
 
 ## grVCF format and standard VCF conversion
 
-See the [Graph Recursive VCF (grVCF) guide](docs/LinGraph_Graph_Recursive_VCF.pdf)
-for the CIGAR and recursive representations, nested variants, and validation.
+grVCF uses the usual VCF columns plus sequence, assembly-coordinate, and
+mapping annotations. LinGraph writes grVCFs with the `.vcf` extension. The
+format is designed to preserve assembly sequence information and can encode
+graph topology through nested variants.
 
-### What grVCF stores
+### CIGAR and recursive representations
 
-grVCF keeps the information needed to describe variation in repetitive and
-non-reference sequence. It uses the usual VCF columns (`CHROM`, `POS`, `ID`,
-`REF`, `ALT`, `QUAL`, `FILTER`, `INFO`, `FORMAT`, and sample columns) plus
-graph-aware annotations. LinGraph writes these files with a `.vcf` extension,
-for both individual and merged outputs.
+| Representation | How it preserves an observation | Meaning of a shared row |
+| --- | --- | --- |
+| **CIGAR** (`##graphvcfmergeVersion=cigar`) | Per-observation sequence alignment, size, breakpoint offset, and assembly coordinates | Carriers can differ from the displayed representative in sequence and placement |
+| **Recursive / exact** (`##graphvcfmergeVersion=exact`) | Shared operations plus nested, flank, separated, and SNP rows that preserve remaining differences | All carriers share that row's sequence change and parent-relative coordinates |
 
-A merged row describes one **representative allele**: the largest insertion of
-its group, but the smallest deletion. Row IDs are unique:
+The recursive model preserves bases while making row-level comparisons
+unambiguous. A carrier's **complete allele** includes the parent operation and
+its carried child rows, so complete alleles can differ even when their parent
+row is shared. Indexed assemblies and reference FASTAs are used by the exact
+merge to resolve placements and sequence differences.
 
-| ID | Record |
-| --- | --- |
-| `I_...`, `D_...` | Insertions and deletions |
-| `S_<chrom>_<pos>_<alt>` | SNPs |
-| `<I\|D>_<parent>_<pos>_<size>` | A nested variant; its `CHROM` is the parent row's ID. Insertions of different bases at one position and size get `a`, `b`, ... appended |
+### Variants on insertions
 
-Each haplotype's FORMAT fields keep its supporting observations and how they
-relate to the representative allele. This preserves variation on the reference
-and within alternative, novel, or inserted sequence, including variants nested
-inside other alleles.
+Suppose Insertion A adds `ACGTTGCA` at a reference position. Child B is a
+**nested variant on Insertion A**, adding `GG` after A's fourth base:
 
-There are two downstream uses:
+| Haplotype | Carried rows | Complete inserted sequence |
+| --- | --- | --- |
+| h1 | A | `ACGTTGCA` |
+| h2 | A and B | `ACGTGGTGCA` |
 
-| Goal | Input and tool |
-| --- | --- |
-| Use reference-based VCF software | Convert with `tools/grvcf_to_vcf.py` |
-| Build a pangenome graph | Pass the original grVCFs to `merged_vcf_to_gfa.py`, or use `LinGraph.py graph --gfa-only` |
+B's `CHROM` is A's row ID, so B's coordinates refer to A's sequence.
+Additional SNPs, deletions, or insertions can be represented on A, and further
+variants can be nested on B. Each row retains one coordinate system; child
+coordinates are interpreted on the parent before sibling edits are applied.
 
-### Main fields
+### Fields to preserve
 
 | Field | Meaning |
 | --- | --- |
-| `ALT` | SNP bases or symbolic alleles such as `<INS>`, `<DEL>`, and `<SUB>` (replacement). |
-| `INFO/SVTYPE`, `END`, `SVLEN` | Event type, endpoint, and representative signed length. |
-| `INFO/SEQ` | Representative inserted/replacement sequence, which may be graph encoded. |
-| `INFO/EXTENDGRAPHCIGAR` | Representative alignment encoding, including graph targets when present. |
-| `FORMAT/GT` | Haplotype call: `1` supports the variant, `0` is callable reference, `.` is no call. |
-| `FORMAT/TYPE`, `SIZE` | Each observation's event type and signed size. |
-| `FORMAT/EXTENDGRAPHCIGAR` | Each observation's alignment to the representative. |
-| `FORMAT/BASE` | Observed alternate base for a SNP. |
-| `FORMAT/ASSEMBLYCONTIG`, `QUERYCOORD` | Original assembly contig and zero-based query coordinate/range with strand. |
-| `FORMAT/TEMPLATEOFFSET` | Signed displacement from the row's `POS` to an observation's breakpoint. |
-| `FORMAT/ALLELENAME`, `LABEL_H` | Source allele and local graph provenance. |
+| `CHROM`, `POS`, `ID` | Parent sequence, position, and row identity; nested rows name their parent ID in `CHROM` |
+| `INFO/SVTYPE`, `END`, `SVLEN`, `SEQ` | Representative operation, interval, size, and sequence |
+| `INFO/EXTENDGRAPHCIGAR` | Representative sequence/alignment encoding, including graph targets |
+| `FORMAT/GT` | Haploid state: `1` supports the variant, `0` is callable reference, `.` is missing |
+| `FORMAT/TYPE`, `SIZE`, `EXTENDGRAPHCIGAR` | Per-observation event, size, and alignment |
+| `FORMAT/ASSEMBLYCONTIG`, `QUERYCOORD` | Assembly contig and zero-based query coordinate or range, with strand |
+| `FORMAT/TEMPLATEOFFSET` | Observation breakpoint displacement from the representative's position |
+| `FORMAT/BASE`, `ALLELENAME`, `LABEL_H` | SNP base and optional provenance |
 
-Multiple observations in one sample are comma-separated, in the same order
-across the per-observation fields; they are not extra genotype copies. The
-older packed `HSV` and `HSNP` layouts are still supported by the converter.
+Multiple observations in a sample use corresponding comma-separated entries;
+they are not additional genotype copies. Read each record's FORMAT column,
+as optional fields can vary.
 
-The default SV FORMAT is:
+SNP positions are one-based. Symbolic root events use boundary coordinates
+such as `[POS, END)`, with `END=POS` for a pure insertion. Nested positions
+are interpreted on the parent allele; nested insertion offsets use `POS-1`.
+Some records can have `POS=0`. Preserve IDs and use LinGraph's tools to resolve
+these conventions and graph-encoded sequences. The
+[grVCF guide](docs/LinGraph_Graph_Recursive_VCF.pdf) explains the format in detail.
 
-```text
-GT:TYPE:SIZE:EXTENDGRAPHCIGAR:ASSEMBLYCONTIG:QUERYCOORD:TEMPLATEOFFSET:ALLELENAME:LABEL_H
-```
+### Merge existing grVCFs
 
-`TEMPLATEOFFSET=5` means that observation's breakpoint lies five bases after
-the row's `POS`, so a merged site keeps the individual breakpoints as well as
-its representative allele. Optional provenance fields may be omitted depending
-on the calling options; always read each record's FORMAT column.
-
-**Coordinates need care.** SNP positions are one-based. Symbolic variants on
-reference or template sequences describe the interval `[POS, END)`; an
-insertion has `END=POS`, and a boundary can be zero. Nested variants use an
-insertion's row ID as `CHROM`, and their default `POS` is the offset inside the
-insertion plus one. Graph CIGARs can reference other alleles or named FASTA
-sequences. LinGraph's converters resolve these details.
-
-### Reference contig names
-
-LinGraph names reference contigs so that chromosomes of different references
-never share a name (`chr1` of GRCh38, CHM13, and HG19 are different sequences,
-and one graph can use several references):
-
-| Reference | Contig names in VCFs |
-| --- | --- |
-| CHM13 | NCBI RefSeq accessions, `NC_060925.1` ... `NC_060948.1` |
-| GRCh38 | `chr1` ... `chrY` |
-| Any other reference or assembly | `NAME#N#` prefix, such as `HG19#1#chr1` or `HG002#1#chr1` |
-
-VCF records, `##contig` lines, and coverage headers use these names. To get
-plain chromosome names, rename the **finished** VCFs with `tools/vcf_chromfix.py`
-(nested rows keep pointing at their parents):
+Use a list with one per-sample VCF path per line. The standalone merge tool
+uses CIGAR mode by default:
 
 ```bash
-# CHM13: NC_060925.1 ... NC_060948.1 -> chr1 ... chr22, chrX, chrY
-python tools/vcf_chromfix.py -i cohort.sv.vcf -o cohort.sv.chr.vcf --CHM13fix
-# Other references: HG19#1#chr1 -> chr1
-python tools/vcf_chromfix.py -i cohort.sv.vcf -o cohort.sv.chr.vcf --noprefix
+python tools/merge_grvcfs.py -I vcfs.list -O merged_cigar -t 16
 ```
 
-Rename the indel and SNP files the same way. Keep the original files as input
-to LinGraph's merge, GFA export, and converters, because they match the
-prepared FASTA names. See the
-[renaming guide](tools/README.md#rename-reference-chromosomes-in-a-vcf) for
-`--fixtable` and other options.
+For recursive / exact output, also provide the assembly list and reference:
 
-### Known incompatibility: records at POS 0
+```bash
+python tools/merge_grvcfs.py -I vcfs.list -O merged_exact -t 16 \
+  --exact prepared_assemblies/query_paths.prepared.txt \
+  --reference-fasta /data/references/chm13.fa
+```
 
-Some records have `POS=0`: an insertion before the first base of its sequence,
-usually a nested variant at the very start of its parent allele. grVCF allows a
-zero boundary, but standard VCF positions start at 1, so some tools mishandle
-these records. With bcftools/htslib 1.22, for example, `bcftools view` and
-`bcftools sort` accept them, but `tabix` warns `Coordinate <= 0`, region queries
-(`-r`) skip them, and `bcftools norm` reports a REF mismatch. LinGraph's own
-tools read them correctly, and `tools/grvcf_to_vcf.py` removes them when it
-exports a standard VCF.
+Repeat `--reference-fasta` for any local reference templates and alternative
+loci required by the calls. Graph-mode calling selects exact merging by
+default. Explicit `--all`, `--svonly`, `--svindel`, or `--snp` select CIGAR
+merge categories instead. The default SV/indel size boundary is **20 bp**;
+use `--svcutoff 50` when you need a 50-bp boundary.
+
+To add samples to an existing cohort, call them against the same graph and
+reference, split the existing merge with `tools/convert_merged_grvcf.py split`,
+and merge the resulting per-sample files with the new calls. Supply all
+categories and the singleton VCF, if present, when splitting. Keep
+`cohort.samples.headers.gz` alongside the merge to retain per-sample coverage.
+See the [merge and conversion tools](tools/README.md).
 
 ### Convert to standard VCF
-
-`tools/grvcf_to_vcf.py` exports a plain VCF in one streaming pass, without a
-reference FASTA. Convert one file at a time:
 
 ```bash
 python tools/grvcf_to_vcf.py \
@@ -877,304 +476,204 @@ python tools/grvcf_to_vcf.py \
   -o cohort_calls/cohort.sv.standard.vcf
 ```
 
-Repeat for the indel and SNP files. Plain and gzip-compressed inputs are
-accepted; write `.vcf.gz` for BGZF output (requires `bgzip`; no index is
-created). `--force` replaces an existing output.
+Repeat for other categories and the singleton file when those calls are needed.
+The streaming converter removes nested rows and `POS=0` records, keeps GT and
+a small INFO subset, and converts symbolic insertions with a plain `SEQ` to
+explicit REF/ALT bases. Graph-encoded insertion sequences remain symbolic.
+It does not normalize, sort, or validate alleles against a reference.
 
-What the converter does:
+This export represents the displayed alleles; it drops information needed
+for lossless reconstruction and graph building. Keep the original grVCFs.
+Plain and gzip inputs are supported; `.vcf.gz` output requires `bgzip` and is
+not indexed automatically. See the [converter guide](tools/README.md#convert-grvcf-to-standard-vcf).
 
-- **Removes** nested records (on `I_`, `D_`, `SUB_`, or `DUP_` parents;
-  `INS_`/`DEL_` in older runs) and records at `POS=0`.
-- Converts `<INS>` with a plain `INFO/SEQ` into explicit bases (`ALT=REF+SEQ`).
-  Other symbolic alleles, including insertions with graph-encoded sequence,
-  stay symbolic.
-- Keeps record order, IDs, REF, QUAL, FILTER, sample names, and GT. INFO keeps
-  only `SVTYPE`, `END`, `SVLEN`, and `NSUP`; FORMAT keeps only GT.
-- Does **not** validate against a reference, normalize or sort alleles,
-  compute allele frequencies, or write an unplaced-record sidecar. Records on
-  alternative loci keep their original coordinate system.
+### Reference contig names
 
-This is a representative-allele export, **not a lossless assembly export**.
-Keep the original grVCF for nested variation and graph construction. Check the
-reported `written`, `nested_removed`, and `position_zero_removed` counts before
-using the output. The legacy `-r` option is accepted but ignored; `-a` and
-`--normalize` are not supported. See
-[the converter guide](tools/README.md#convert-grvcf-to-standard-vcf) or
-`python tools/grvcf_to_vcf.py --help`.
+CHM13 calls use RefSeq accessions (`NC_060925.1` … `NC_060948.1`); GRCh38 uses
+`chr1` … `chrY`. Other assemblies use their `NAME#N#` prefix. To produce copies
+with plain chromosome names:
+
+```bash
+python tools/vcf_chromfix.py \
+  -i cohort_calls/cohort.sv.vcf -o cohort_calls/cohort.sv.chr.vcf --CHM13fix
+# For another reference, remove its prefix:
+python tools/vcf_chromfix.py -i calls.vcf -o calls.chr.vcf --noprefix
+```
+
+Keep the original names for LinGraph processing so they match the FASTAs.
+Nested rows retain their parent references during renaming.
 
 ## Build a pangenome GFA from grVCF
 
-Graph export uses the **original merged grVCFs** and their graph annotations to
-build `cohort.gfa`; the bases come from the grVCFs and the reference, template,
-and catalog FASTAs, never from the assemblies. Converting copies to
-standard VCF removes information needed here, so keep the grVCFs.
-
-### Export through LinGraph
-
-To export the merged cohort VCFs of a finished run, without calling or merging
-again:
+To export a finished cohort's merged calls without recalling or re-merging:
 
 ```bash
-python scripts/LinGraph.py graph -G cohort_graph -O cohort_calls \
-  -r CHM13_h1 --gfa-only -t 16
+python scripts/LinGraph.py graph \
+  -G cohort_graph -O cohort_calls -r CHM13_h1 --gfa-only -t 16
 ```
 
-The output is **`cohort_calls/cohort.gfa`**, plus the per-sample GAFs under
-`cohort_calls/gaf/`. Use the same graph, reference, and merged VCFs as the
-calling run, and keep the saved template files and the graph's catalog FASTAs
-(with their `.fai` indexes) available. The export runs the C++ tool
-`GrvcfGraph` (built by `install.py`), which writes the GFA and every sample's
-GAF in one assembly-free pass; `--svonly` merges are not supported. To do
-everything in one run instead, add `--make-graph` to the
-[build command](#3-run-the-build).
+**`--gfa-only` generates both the GFA and per-sample GAFs.** It selects only
+the export stage. The current C++ exporter, `GrvcfGraph`, writes
+`cohort_calls/cohort.gfa`, `cohort_calls/gaf/SAMPLE.gaf`, and summary/debug
+tables. Links needed by sample walks are included in the exported GFA.
 
-The default export is **rGFA**, a GFA with stable sequence coordinates. It
-contains the reference backbone and branches for the SNPs, indels, and SVs; its
-named paths are the source sequences, and the `SN`/`SO` tags of each variant's
-segments name its allele.
+Export reads the merged grVCFs, reference, templates, sequence catalogs, and
+sample mapping headers. It obtains sequence bases from those files without
+rereading the assemblies. Keep the matching FASTAs and their `.fai` indexes
+available. Use all variant categories from the exact merge for a complete
+graph; the C++ export does not support `--svonly` or `--insertion-only`.
 
-- `--gaf-threads N` sets how many samples are walked at once for the GAFs
-  (default: `-t`); each holds about 400 bytes per carried allele.
-- `--max-node-length` sets the maximum segment length (default 1,024 bases).
-- An explicit `-r` makes that haplotype the backbone. Without `-r`, export uses
-  `GRAPH/inputs/reference_alternatives_novels.fa`, the combined catalog of
-  reference, alternative, and novel sequences.
+- `--gaf-threads N` controls how many samples are walked concurrently
+  (default: `-t`); reduce it to lower memory use.
+- `--max-node-length N` sets the maximum segment length (default: 1,024 bp).
+- An explicit `-r` selects the backbone. Without it, export uses the saved
+  combined reference/alternative/novel catalog.
+- Large singleton insertions follow the [merge policy above](#large-singleton-insertions).
 
-### Convert grVCF files directly
+The output is **rGFA**, with sequence-origin and offset tags (`SN`, `SO`) on
+segments. Variants define branches and links, and GAF records describe each
+haplotype's walks. A GAF can contain multiple records for a contig when part
+of that contig is excluded or cannot be represented by a valid walk.
 
-To choose the input files yourself, run `merged_vcf_to_gfa.py`. Pass the SV,
-indel, and SNP files of an exact cohort run together so nested variants can
-find their parent alleles across files. Here, `--all` tells the converter that
-all three categories are supplied.
+For direct input selection and the Python conversion workflow, see
+[merged grVCF to GFA](scripts/merged_vcf_to_gfa.md). Standard-VCF exports lack
+the annotations needed for graph construction.
+
+## Running on SLURM, resuming, and recovering
+
+Activate the Conda environment, then add the cluster options to your command:
 
 ```bash
-python scripts/merged_vcf_to_gfa.py \
-  -v cohort_calls/cohort.sv.vcf \
-     cohort_calls/cohort.indel.vcf \
-     cohort_calls/cohort.snp.vcf \
-  -q cohort.list \
-  -r /data/references/chm13.fa --reference-haplotype CHM13_h1 \
-  --graph-folder cohort_graph \
-  --local-reference-templates cohort_calls/checkpoints/local_reference_templates.fa \
-  --local-path-fasta cohort_graph/summary/alternatives.fasta \
-  --all --processes 16 -o cohort_calls/cohort.gfa
+python scripts/LinGraph.py graph \
+  -I cohort.list -G cohort_graph -O cohort_calls \
+  -b windowprofs/geneblocks.bed --bed-grouped \
+  -r CHM13_h1 --alternative data/alternatives.fa \
+  --exact --make-graph -t 32 \
+  --slurm --slurm-jobs 20 \
+  --slurm-account ACCOUNT --slurm-partition PARTITION
 ```
 
-Requirements:
+Individual mode submits one job per haplotype. Full graph runs submit workflow
+stages separately; partial runs such as `--gfa-only` use one allocation.
+`--slurm-jobs` defaults to 20. Additional `sbatch` arguments can be supplied
+through `--slurm-args`.
 
-- `cohort.list` maps the VCF sample names to their original prepared FASTAs.
-- The reference and template files match the calling run.
-- Every FASTA input has an adjacent `.fai` index.
-- `--local-path-fasta` supplies the summary catalog that resolves graph
-  coordinates. (`-a` instead adds whole FASTA records as extra graph paths.)
+### Memory defaults
 
-The converter writes GFA segments (`S`), links (`L`), and named paths (`P`),
-with rGFA tags recording sequence origins and offsets. SNPs and inserted or
-replacement sequences form branches; deletions connect across the skipped
-sequence. BED and mapping sidecars accompany the GFA for tracing coordinates.
-Use `--validate-only` to check sequence and topology without writing a GFA.
-See [the GFA export guide](scripts/merged_vcf_to_gfa.md) for coordinate
-conventions, filters, and validation.
+The cohort thresholds below count **input sample VCFs**, typically one per
+haplotype, rather than diploid individuals.
 
-## Benchmark trio consistency
-
-The [benchmark directory](benchmark/README.md) has two tools that check whether
-child variants are found in either parent:
-
-- **[QuickTriocheck.py](benchmark/QuickTriocheck.README.md):** compares separate
-  haplotype VCFs or one multi-sample VCF by position, variant type, and size.
-  Needs only Python's standard library.
-- **[truvari_trio.sh](benchmark/truvari_trio.README.md):** runs eight pairwise
-  Truvari benchmarks for two child and four parental haplotypes.
-
-Each guide explains requirements, coverage filtering, commands, and outputs.
-Use calls made against the same reference and keep their coverage headers.
-
-## Questions and answers
-
-### Why is a specific input assembly format required, and what is it?
-
-Each haplotype is one uncompressed, soft-masked FASTA with an adjacent `.fai`
-index, and every contig is named `SAMPLE#N#CONTIG` (for example `HG002#1#chr1`
-for `HG002_h1`); see [Prepare assembly FASTAs](#prepare-assembly-fastas). The
-prefix keeps every contig name unique across all assemblies of a run, so each
-call can be traced back to its contig in the original assembly; plain names
-such as `chr1` would collide between assemblies. Soft masking helps the
-aligners.
-
-If inputs are not in this format, LinGraph stops and prints a preparation
-command for each one. With `--force-prepare`, it instead prepares copies in
-`OUTPUT/PreparedAssemblies/` (in parallel, sharing `-t`) and deletes them when
-the run finishes. This needs
-temporary disk space for a full copy of each prepared assembly. It is fine for
-a few samples; for a large cohort, prepare the assemblies beforehand.
-
-### What are local graphs, and how are they made?
-
-Local graphs divide and conquer graph building and SV calling. The genome is
-divided into blocks; each block's sequences from all assemblies form one small
-local graph, which is built, aligned, and called on its own, and the results
-are joined back on the reference.
-
-Two block profiles are provided in `windowprofs/` (both in CHM13 coordinates,
-used with `-b BED --bed-grouped`):
-
-1. **Balanced blocks** (`balanceblocks.bed`): chosen automatically to optimize
-   the local alignments and avoid breakpoints in repeats. Better for SV calling
-   (about 0.1–0.2% fewer errors, a 10–20% improvement). Win50KGraph uses these
-   blocks.
-2. **Gene blocks** (`geneblocks.bed`): adjusted to gene coordinates, which helps
-   gene-based downstream work such as genotyping with ctyper. **Highly
-   recommended when building a graph.** SV calling is slightly less accurate
-   because block edges can fall in repeats, but the extra errors are generally
-   in tandem repeats, not gene bodies.
-
-### How long does a run take?
-
-About **1 hour per haplotype on 64 cores** for individual calling. Merging
-depends on the cohort size but usually adds 10–20% of the calling time. With
-`--slurm`, haplotypes are called in parallel (up to `--slurm-jobs`, default 20).
-
-### How much memory is used, and how do I increase it after an out-of-memory failure?
-
-Locally, LinGraph uses the machine's memory. With `--slurm`:
-
-| Job | Default memory | Increase with |
+| Job | Default memory | Override |
 | --- | --- | --- |
-| `individual`: one job per haplotype (and the `--merge` job) | 64G | `--slurm-memory` |
-| `graph`: per-sample matching, lifting, graph CIGAR, gap filling, VCF | 32G each | `--match-memory`, `--genomelift-memory`, `--graphcigar-memory`, `--gapfill-memory`, `--vcf-memory` |
-| `graph`: cohort extraction and local templates | 64G | `--extraction-memory` |
-| `graph`: run-once merge scans, concats, publish, GFA export | 64G below 100 sample VCFs, 128G from 100 on | `--slurm-memory` |
-| `graph`: per-chromosome merge jobs | 32G below 100 sample VCFs, 64G from 100 on (chr1 doubled) | `--merge-memory` |
-| `graph`: novel-locus discovery | 128G | `--novel-slurm-memory` |
+| Individual calling or its merge allocation | 64G | `--slurm-memory` |
+| Cohort matching, lifting, graph CIGAR, gap filling, VCF calling | 32G per job | `--match-memory`, `--genomelift-memory`, `--graphcigar-memory`, `--gapfill-memory`, `--vcf-memory` |
+| Cohort extraction and local templates | 64G | `--extraction-memory` |
+| Cohort merge scans, concats, and publish | 64G below 100 sample VCFs; 128G from 100 onward | `--slurm-memory` for run-once stages; `--merge-memory` for merge defaults |
+| Cohort SV chromosome merge | **32G below 100 sample VCFs; 64G from 100 onward; chr1 doubled** | `--merge-memory` |
+| Cohort small-variant chromosome merge | 64G below 100 sample VCFs; at least 128G from 100 onward, scaling with cohort size | Automatically sized by the workflow |
+| GFA export | 64G | `--slurm-memory` |
+| Novel-locus discovery | 128G | `--novel-slurm-memory` |
 
-To find the failed job, run `sacct -j JOBID` (state `OUT_OF_MEMORY`) and check
-the logs under `OUTPUT/lingraph/`. Then repeat the same command with the larger
-memory option; finished stages are reused and only the failed ones run again.
-See `--help-all` for every per-stage option.
+For an out-of-memory failure, inspect `sacct -j JOBID` and the run's SLURM
+logs, increase the relevant memory setting, and repeat the command. See
+`--help-all` for additional per-stage controls.
 
-### How do I output versions of the graph with different references as the backbone?
+### Resume or rerun a stage
 
-Run `graph` again with the same `-G`, a different `-r` (any haplotype in the
-cohort list), a new `-O`, and `--make-graph`. Saved local graph alignments are
-reused; only the reference-dependent steps run again. See
-[Choose or change the reference](#choose-or-change-the-reference-backbone).
+Repeating the same command reuses finished work. To select a later stage:
 
-### How are non-reference sequences represented in the VCF?
-
-At three levels:
-
-1. **Alternatives**: novel genes found in open-source assemblies, supplied
-   with `--alternative` (for example `data/alternatives.fa`).
-2. **Novel loci**: large insertions found in the cohort, usually novel
-   immune-related genes.
-3. **Insertions**: called dynamically in each sample. Variants inside an
-   inserted sequence are nested rows whose `CHROM` is the insertion's row ID.
-
-### Where do I find the alternative and novel sequences?
-
-Which sequences count as alternative or novel depends on the linear reference:
-a sequence absent from CHM13 can be present in GRCh38. So each calling run
-writes the sequences for its own `-r` reference:
-
-| Run | Files |
+| Task | Option |
 | --- | --- |
-| `graph` | `OUTPUT/checkpoints/local_reference_templates.fa` and `OUTPUT/checkpoints/alternative_loci.fa` |
-| `individual` | `OUTPUT/samples/NAME/local_reference_templates.fa` and `OUTPUT/samples/NAME/alternative_loci.fa` |
+| Export existing merged calls to GFA and GAF | `--gfa-only` |
+| Re-merge saved per-haplotype calls | `--merge-only` |
+| Recall VCFs from saved gap-filled alignments and merge them | `--recall-only` |
+| Export after re-merging or recalling | Also add `--make-graph` |
+| Validate inputs and print planned commands | `--dry-run` |
 
-VCF rows not placed on the reference are reported on these sequences. Each
-record header also records where it lifts onto the reference
-(`reference=CONTIG:START-END:STRAND`), or `lift_status=unmapped`. Runs from
-before `alternative_loci.fa` was added have only `local_reference_templates.fa`.
+After a killed run, clear stale workflow locks only once its jobs have exited:
 
-The graph itself keeps every local graph path that is not an exact slice of its
-construction reference in `GRAPH/summary/alternatives.fasta`. When a graph is
-built:
+```bash
+python scripts/LinGraph.py --unlock cohort_graph cohort_calls
+```
 
-- `GRAPH/inputs/reference_alternatives.fa` holds the reference with the
-  supplied alternatives;
-- `GRAPH/novel_loci.fa` holds the discovered novel loci (with `--find-novel-loci`);
-- `GRAPH/inputs/reference_alternatives_novels.fa` holds all of them together.
+This keeps checkpoints and outputs. See the
+[cohort workflow guide](scripts/cohort_call_snakemake/README.md) for recovery
+details and the [graph-building guide](scripts/graph_build_snakemake/README.md)
+for construction options.
 
-Supplied alternatives are tagged `sequence_role=imported_alternative` in their
-headers.
+## Workflow overview
 
-### How are duplicated genes represented?
+![LinGraph workflow: local graph alignment, variant calling and merging, and pangenome graph export.](figures/lingraph_workflow.png)
 
-By a primary alignment, reported as an insertion, and an alternative alignment
-to the closest reference gene.
+LinGraph divides the genome into blocks, builds and aligns local graphs, and
+projects the resulting calls onto the chosen reference and alternative loci.
+The merged grVCFs retain variant sequences and assembly coordinates. Recursive
+variant relationships then define the topology of the exported pangenome graph.
 
-### How do I convert grVCF to a normal VCF?
+`individual` reuses existing local graphs; `graph` constructs or resumes them
+from the cohort. Reference-specific alternative sequences are saved with each
+calling run, and packed graph sequences live in `GRAPH/summary/alternatives.fasta`.
+Overlapping source blocks can remain separate alternative loci, each with its
+own contig name.
 
-Use `tools/grvcf_to_vcf.py`; see [Convert to standard VCF](#convert-to-standard-vcf).
+[Download the workflow figure (PDF)](figures/lingraph_workflow.pdf).
 
-### How do I add my own samples to known VCFs?
+## Validation and benchmarking
 
-1. Call your samples with `individual`, using the same graph and reference as
-   the known VCFs.
-2. Split the known merged grVCFs (exact or CIGAR version) into one grVCF per
-   sample; each sample's call is rebuilt from the CIGAR in its sample fields:
+Lossless reconstruction, graph-walk validation, and trio consistency measure
+different properties:
 
-   ```bash
-   python tools/convert_merged_grvcf.py split \
-     -v known/cohort.sv.vcf known/cohort.indel.vcf known/cohort.snp.vcf \
-     -r reference.fa -o known_individual
-   ```
+| Check | Tool or guide |
+| --- | --- |
+| Reconstruct represented assembly regions from a per-sample grVCF | `tools/check_vcf_lossless.py` |
+| Check merged sequence reconstruction and shared-row identity | `tools/check_merge_lossless.py` |
+| Compare per-haplotype variant totals in merged VCFs and GAF walks | `tools/compare_vcf_gaf_stats.py` |
+| Check whether child variants are supported by either parent | [QuickTriocheck](benchmark/QuickTriocheck.README.md) or [Truvari trio benchmark](benchmark/truvari_trio.README.md) |
+| Inspect SLURM time by pipeline step | `tools/slurm_step_times.py` |
 
-3. List the split grVCFs and your samples' grVCFs in `all_vcfs.list`, then merge
-   them into new merged grVCFs:
+Use the [trio graph demo](demo/NA19240trio_graph/README.md) for validation
+commands, and the [benchmark guide](benchmark/README.md) for trio runs. Calls
+compared within a trio must use the same reference; preserve coverage headers
+so uncallable regions can be handled correctly.
 
-   ```bash
-   python tools/merge_grvcfs.py -I all_vcfs.list -O merged_new -t 16
-   ```
+For full merged reconstruction, include the separated singleton VCF. For
+VCF-versus-GAF comparisons, supply the VCFs actually included in the graph.
+Variant-total agreement is a diagnostic and does not replace a base-by-base
+reconstruction check. See the [utilities guide](tools/README.md) for each
+tool's assumptions and limits.
 
-See [the tools guide](tools/README.md#split-merged-grvcfs-or-convert-between-exact-and-cigar)
-for `--exact` merging and other options.
-
-### Which regions are not included?
-
-1. Regions with N gaps.
-2. The edges of scaffolds.
-3. Constitutive heterochromatin and other simple repeats longer than 1 Mb.
-
-Check each haplotype's coverage report, `samples/NAME/NAME.coverage.summary.tsv`,
-and the uncovered intervals in `NAME.coverage.missing_reference.bed` and
-`NAME.coverage.missing_query.bed`.
+Keep masking choices consistent when comparing runs. The sdust speed versus
+trio-consistency trade-off is described under [assembly preparation](#faster-masking-with-sdust).
 
 ## Repository layout
 
 ```text
-readme.md
-install.py               Root installer entry point
-scripts/                 Main pipeline scripts and installer implementation
-  LinGraph.py            Main command (prepare, individual, graph)
+install.py               Installer entry point
+scripts/                 Main pipeline and installer implementation
+  LinGraph.py            prepare, individual, and graph commands
   graph_build_snakemake/ Graph-building workflow
   cohort_call_snakemake/ Cohort-calling workflow
-  src/                   C++ sources
-figures/                 Workflow figure (PNG and PDF)
-data/                    Recommended CHM13 alternatives and FASTA index
-docs/                    Format and usage guides
-tools/                   Preparation and VCF conversion utilities
-windowprofs/             Gene and balanced block-interval BED files
-benchmark/               Trio benchmarks and a README for each script
+  src/                   Native-tool source code
+demo/                    Worked examples and validation commands
+data/                    Recommended CHM13 alternatives and index
+docs/                    grVCF format guide
+figures/                 Workflow figures
+tools/                   Preparation, conversion, validation, and reporting tools
+windowprofs/             Gene and balanced block profiles
+benchmark/               Trio benchmarking tools and saved summaries
 tests/                   Regression tests
-```
-
-Native tools are compiled during installation; platform-specific binaries are
-not included. Run the trio-reporting regression tests with:
-
-```bash
-python -m unittest discover -s tests -v
 ```
 
 ## More help
 
 ```bash
 python scripts/LinGraph.py --help
+python scripts/LinGraph.py prepare --help
 python scripts/LinGraph.py individual --help-all
 python scripts/LinGraph.py graph --help-all
-python scripts/LinGraph.py prepare --help
 ```
 
-For advanced options, compact graph packages, and SLURM execution, see
-[the full LinGraph guide](scripts/LinGraph.md).
+See the [full command guide](scripts/LinGraph.md),
+[utilities guide](tools/README.md), and
+[grVCF format guide](docs/LinGraph_Graph_Recursive_VCF.pdf) for details beyond
+these getting-started workflows.

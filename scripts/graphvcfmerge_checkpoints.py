@@ -1,18 +1,20 @@
 """Persistent split-stage merge status and atomic chromosome checkpoints."""
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
 from pathlib import Path
 import pickle
 import re
+import sys
 import tempfile
 from contextlib import contextmanager
 
 DEFAULT_SETTINGS = {
-    "minsvsize": 50, "merge_distance": 500, "size_similarity": .7,
-    "sequence_similarity": .7, "var_in_insert": 100, "emit_small": False,
+    "minsvsize": 50, "merge_distance": 500, "size_similarity": .5,
+    "sequence_similarity": .5, "var_in_insert": 100, "emit_small": False,
 }
 
 
@@ -27,6 +29,20 @@ def settings(context):
     if context.get("realignment") is False:
         # --no-realignment (absent by default, so older markers stay valid).
         value["realignment"] = False
+    if context.get("shift") is False or context.get("realignment") is False:
+        # --no-shift (absent by default). A --no-realignment run records it
+        # either way: before --no-shift existed it never shifted.
+        value["shift"] = context.get("shift") is not False
+    if context.get("partial_merge"):
+        # --partial-merge (absent by default).
+        value["partial_merge"] = True
+    if context.get("partial_merge_singleton"):
+        value["partial_merge_singleton"] = list(context["partial_merge_singleton"])
+    if context.get("merge_recurrent"):
+        # --merge-recurrent (absent by default).
+        value["merge_recurrent"] = True
+    if context.get("partial_merge_min_size") is not None:
+        value["partial_merge_min_size"] = int(context["partial_merge_min_size"])
     return value
 
 
@@ -83,6 +99,43 @@ def file_stamp(path):
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
+@functools.lru_cache(maxsize=None)
+def code_version():
+    """Digest of the merge code (the graphvcfmerge*.py files next to this
+    module): a chromosome merged by other code is not reused."""
+    digest = hashlib.sha256()
+    for path in sorted(Path(__file__).resolve().parent.glob("graphvcfmerge*.py")):
+        digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()[:16]
+
+
+def source_stamps(paths):
+    """Stamps of the files a scan reads (input VCFs, reference FASTAs and
+    indexes, --exact assemblies), by absolute path; None for a missing one."""
+    stamps = {}
+    for path in paths:
+        if path:
+            path = os.path.abspath(path)
+            stamps[path] = file_stamp(path) if os.path.isfile(path) else None
+    return stamps
+
+
+def check_sources(manifest, stage):
+    """Refuse a scan whose input VCFs, references or assemblies changed since
+    it was made: its records point into those files by byte offset."""
+    recorded = manifest.get("source_stamps")
+    if recorded is None:
+        print(f"[merge:{stage}] warning: this scan records no input stamps (made by older "
+              "code); changed inputs are not detected", file=sys.stderr, flush=True)
+        return
+    changed = [path for path, stamp in sorted(recorded.items())
+               if (file_stamp(path) if os.path.isfile(path) else None) != stamp]
+    if changed:
+        raise RuntimeError(
+            f"{len(changed)} input file(s) changed since the scan (rerun the scan stage): "
+            + ", ".join(changed[:5]))
+
+
 def identity(root, chrom, context):
     root = Path(root)
     inputs = {}
@@ -91,7 +144,31 @@ def identity(root, chrom, context):
                  root / "chroms" / locus_key(chrom) / "coverage.pkl"):
         if path.is_file():
             inputs[str(path.relative_to(root))] = file_stamp(path)
-    return {"version": 1, "chrom": chrom, "settings": settings(context), "inputs": inputs}
+    return {"version": 1, "chrom": chrom, "settings": settings(context), "inputs": inputs,
+            "code": code_version()}
+
+
+def check_concat_ready(root, chrom, suffixes):
+    """Concat publishes a chromosome's parts only when its merge.done marker
+    exists, was written by this merge code and still matches the parts."""
+    marker = marker_path(root, chrom)
+    if not marker.is_file():
+        return "no merge.done"
+    text = marker.read_text().strip()
+    if text in ("", "done"):
+        return "manual merge.done not yet checked by the chrom stage"
+    value = json.loads(text)
+    if value.get("code") != code_version():
+        return "merged by other merge code"
+    recorded = value.get("outputs") or {}
+    base = Path(root) / "parts" / locus_key(chrom)
+    for suffix in suffixes:
+        path = Path(str(base) + suffix)
+        if not path.is_file():
+            return f"{path.name} missing"
+        if recorded.get(path.name) != file_stamp(path):
+            return f"{path.name} changed after merge.done"
+    return None
 
 
 def atomic_write(path, writer, durable=True):
@@ -224,7 +301,8 @@ def is_done(root, chrom, context, adopt_manual=True):
     value = json.loads(text)
     expected = identity(root, chrom, context)
     if any(value.get(key) != item for key, item in expected.items()):
-        raise ValueError(f"stale completion marker (inputs/settings changed): {marker}")
+        raise ValueError(f"stale completion marker (scan, settings or merge code changed): "
+                         f"{marker}; delete it and this chromosome's parts to merge it again")
     paths = outputs(root, chrom, expected["settings"]["emit_small"], context.get("insertion_snps"))
     # Markers written before pointers alone were stamped also list the
     # insertions' records.bin files (by resolved path); their pointers are
@@ -256,7 +334,8 @@ def prepare(root, chrom, context):
     expected = identity(root, chrom, context)
     if record.is_file():
         if json.loads(record.read_text()) != expected:
-            raise ValueError(f"checkpoint inputs/settings changed: {record}")
+            raise ValueError(f"checkpoint scan, settings or merge code changed: {record}; "
+                             f"delete {directory} to merge this chromosome again")
     else:
         write_json(record, expected)
     return directory

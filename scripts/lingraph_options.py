@@ -130,6 +130,6 @@ def merge_settings(args):
         if settings.get(name, 0) < 0:
             raise ValueError('--' + name.replace('_', '-') + ' cannot be negative')
     for name in ('size_similarity', 'sequence_similarity'):
-        if not 0 <= settings.get(name, .7) <= 1:
+        if not 0 <= settings.get(name, .5) <= 1:
             raise ValueError('--' + name.replace('_', '-') + ' must be between 0 and 1')
     return settings

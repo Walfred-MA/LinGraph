@@ -718,6 +718,7 @@ class Sample:
                 sv_reach.append(max(b, sv_reach[-1] if sv_reach else b))
         pieces = []
         cursor = low
+        last = None          # (position, start) of the deletion spliced last
         for a, b, position, variant in chosen:
             position = abs(position)
             if G['var_kind'][variant] == KINDS['snp'] and sv_starts:
@@ -726,6 +727,18 @@ class Sample:
                     self.used[position] = True
                     stats['snp_inside_sv'] += 1
                     continue
+            if (a < cursor and a == b and last is not None and last[1] < a
+                    and (self.qe[position] == self.qs[last[0]] if descending
+                         else self.qs[position] == self.qe[last[0]])):
+                # The sample's own insertion inside the deletion it just
+                # walked (a substitution's insertion after the kept bases of
+                # a deletion moved onto a row starting earlier): it follows
+                # that deletion's allele on the query.
+                pieces.extend(self.allele(position, variant, stats))
+                self.used[position] = True
+                stats['inside_deletion_spliced'] += 1
+                last = (position, last[1])
+                continue
             if a < cursor:
                 stats['variant_overlap_skipped'] += 1
                 self.skipped.add(position)
@@ -735,6 +748,7 @@ class Sample:
             self.used[position] = True
             stats['variants_spliced'] += 1
             cursor = b
+            last = (position, a) if G['var_kind'][variant] == KINDS['deletion'] else None
         pieces.append(span(path, cursor, high, self.cache))
         return [piece for piece in pieces if piece]
 

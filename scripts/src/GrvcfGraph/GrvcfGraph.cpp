@@ -1964,6 +1964,9 @@ class SampleWalker {
             }
         vector<Piece> pieces;
         uint64_t cursor = low;
+        bool has_last = false;  // a deletion spliced last: (last_position, last_start)
+        size_t last_position = 0;
+        uint64_t last_start = 0;
         for (auto &[a, b, signed_position, variant] : chosen) {
             size_t position = size_t(signed_position < 0 ? -signed_position : signed_position);
             if (g.var_kind[variant] == K_SNP && !sv_starts.empty()) {
@@ -1973,6 +1976,19 @@ class SampleWalker {
                     ++stats["snp_inside_sv"];
                     continue;
                 }
+            }
+            if (a < cursor && a == b && has_last && last_start < a &&
+                (descending ? rec[position].qe == rec[last_position].qs
+                            : rec[position].qs == rec[last_position].qe)) {
+                // The sample's own insertion inside the deletion it just walked
+                // (a substitution's insertion after the kept bases of a deletion
+                // moved onto a row starting earlier): it follows that allele.
+                vector<Piece> inner = allele(position, variant);
+                pieces.insert(pieces.end(), inner.begin(), inner.end());
+                used[position] = 1;
+                ++stats["inside_deletion_spliced"];
+                last_position = position;
+                continue;
             }
             if (a < cursor) {
                 ++stats["variant_overlap_skipped"];
@@ -1985,6 +2001,9 @@ class SampleWalker {
             used[position] = 1;
             ++stats["variants_spliced"];
             cursor = b;
+            has_last = g.var_kind[variant] == K_DEL;
+            last_position = position;
+            last_start = a;
         }
         span(path, cursor, high, pieces);
         return pieces;

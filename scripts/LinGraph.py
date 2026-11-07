@@ -48,6 +48,8 @@ def parser(show_advanced=False):
   individual   Call each sample/haplotype independently; write individual VCFs
              against an existing graph cache. A reference cache can be reused.
   blockindex   Automatically create grouped blocks and an index for one reference.
+  horalign   Align one query to one reference across a tandem repeat (HOR) array;
+             write one graph CIGAR.
   graph      Build/resume a pangenome graph from a cohort run; variants are
              called across the assemblies as part of graph construction.
 
@@ -96,6 +98,9 @@ Examples:
     blockindex = modes.add_parser('blockindex', add_help=False,
                                   help='create blocks for one reference; use blockindex --help')
     blockindex.add_argument('arguments', nargs=argparse.REMAINDER)
+    horalign = modes.add_parser('horalign', add_help=False,
+                                help='align one query to one reference across a repeat array; use horalign --help')
+    horalign.add_argument('arguments', nargs=argparse.REMAINDER)
     for mode in ("graph", "individual"):
         # Short help hides options inside mutually exclusive groups, which makes
         # Python < 3.12 argparse fail an assertion while wrapping the usage line.
@@ -1443,6 +1448,8 @@ def main(argv=None):
         return subprocess.call([sys.executable, str(ROOT / 'tools/prepare_assemblies.py'), *argv[1:]])
     if argv and argv[0] == 'blockindex':
         return subprocess.call([sys.executable, str(ROOT / 'blockindex.py'), *argv[1:]])
+    if argv and argv[0] == 'horalign':
+        return subprocess.call([sys.executable, str(ROOT / 'horalign.py'), *argv[1:]])
     p = parser(show_advanced="--help-all" in argv)
     args = p.parse_args(argv)
     construct_only = bool(getattr(args, 'construct_only', False))
@@ -1451,8 +1458,9 @@ def main(argv=None):
             if args.mc_graph:
                 p.error("--construct-only cannot be combined with --make-graph; GFA export requires variant calling")
             call_settings = cli_options.values(args, 'call')
-            if not call_settings.get('no_merge_realignment'):
-                call_settings.pop('no_merge_realignment', None)
+            for flag in ('no_merge_realignment', 'no_shift'):
+                if not call_settings.get(flag):
+                    call_settings.pop(flag, None)
             if args.graph_list or args.snakemake_args or call_settings.keys() - cli_options.values(args, 'build').keys():
                 p.error("calling-only settings cannot be used with --construct-only")
             if not args.output:
@@ -1464,8 +1472,8 @@ def main(argv=None):
             p.error("--unlock is a standalone command; omit graph/individual and run options")
         return unlock_workflows(args.unlock, args.dry_run)
     if args.mode is None:
-        p.error("choose blockindex, graph or individual, or use --unlock")
-    if args.mode in {'prepare', 'blockindex'}:
+        p.error("choose blockindex, horalign, graph or individual, or use --unlock")
+    if args.mode in {'prepare', 'blockindex', 'horalign'}:
         p.error(f'put options after the command: LinGraph.py {args.mode} --help')
     if getattr(args, 'dag_dry_run', False):
         if args.merge_only or args.recall_only or args.gfa_only:
@@ -1504,11 +1512,12 @@ def main(argv=None):
         settings = cli_options.values(args, 'call' if args.mode == 'graph' else 'sample')
         if args.mode == 'graph':
             settings.update(cli_options.values(args, 'build'))
-        # LinGraph's own --no-merge-realignment flag is always present; only
-        # an explicit one is a setting, and it belongs to merging.
-        if not settings.get('no_merge_realignment'):
-            settings.pop('no_merge_realignment', None)
-        allowed = (set(cli_options.values(args, 'merge')) | {'no_merge_realignment'}
+        # LinGraph's own --no-merge-realignment/--no-shift flags are always
+        # present; only an explicit one is a setting, and it belongs to merging.
+        for flag in ('no_merge_realignment', 'no_shift'):
+            if not settings.get(flag):
+                settings.pop(flag, None)
+        allowed = (set(cli_options.values(args, 'merge')) | {'no_merge_realignment', 'no_shift'}
                    if not args.gfa_only else set())
         if getattr(args, 'recall_only', False):
             allowed |= RECALL_SETTINGS | {'samples'}
@@ -1558,6 +1567,7 @@ def main(argv=None):
                          cutoff=args.svcutoff, dry_run=args.dry_run,
                          exact=cohort_merge.resolve_exact(args),
                          realignment=cohort_merge.resolve_realignment(args),
+                         shift=cohort_merge.resolve_shift(args),
                          **cli_options.merge_settings(args))
         if not args.mc_graph:
             return 0

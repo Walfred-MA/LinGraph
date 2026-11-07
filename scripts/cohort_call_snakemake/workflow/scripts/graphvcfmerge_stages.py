@@ -256,6 +256,8 @@ def completion_context(command):
     context["emit_small"] = "--output-small" in command
     if "--no-realignment" in command:
         context["realignment"] = False
+    if "--no-shift" in command:
+        context["shift"] = False
     _remaining, insertion_snps = take_option(command, "--insertion-snps")
     if insertion_snps:
         context["insertion_snps"] = insertion_snps
@@ -269,6 +271,18 @@ def completion_context(command):
             kmermatch = str(Path(merger).resolve().with_name("KmerMatch"))
     if kmermatch:
         context["kmermatch"] = kmermatch
+    # As graphvcfmerge.merge_locus_vcfs records --partial-merge and
+    # --merge-recurrent (its large singleton size is always 10 kb there).
+    _remaining, min_size = take_option(command, "--partial-merge-min-size")
+    min_size = int(min_size) if min_size is not None else 300
+    if "--partial-merge" in command:
+        context["partial_merge"] = True
+        context["partial_merge_singleton"] = (10_000, float(context["size_similarity"]))
+        context["partial_merge_min_size"] = min_size
+        context["size_similarity"] = 0.0
+    if "--merge-recurrent" in command:
+        context["merge_recurrent"] = True
+        context["partial_merge_min_size"] = min_size
     return context
 
 

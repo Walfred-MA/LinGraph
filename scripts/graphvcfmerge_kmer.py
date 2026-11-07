@@ -269,12 +269,10 @@ def _direct_task(args):
                 continue
             if max(len(query), len(template)) > SHORT_SEQUENCE_LIMIT:
                 raise ValueError("Direct comparison exceeds short sequence limit")
-            # The traceback's X/I/D total is the Levenshtein distance: score
-            # with it first and trace back only the members that pass.
-            distance = merger._levenshtein_distance(query, template)
-            similarity = 1.0 - distance / float(len(query) + len(template))
+            # Scored and aligned like every short pair: the member keeps the
+            # alignment its similarity was computed from.
+            similarity, body = merger._fast_parasail_alignment(query, template)
             if similarity >= cutoff:
-                body = merger._fast_python_global_cigar(query, template)
                 merger._fast_validate_alignment_body(
                     body, len(query), len(template),
                     context=f"short KmerMatch member {index}",
@@ -296,10 +294,8 @@ def _direct_pair_task(args):
                 continue
             if max(len(query), len(reference)) > SHORT_SEQUENCE_LIMIT:
                 raise ValueError("Direct paired comparison exceeds short sequence limit")
-            # Only the score is used: the Levenshtein distance (edlib), which
-            # equals the X/I/D total of the full Python traceback.
-            distance = merger._levenshtein_distance(query, reference)
-            similarity = 1.0 - distance / float(len(query) + len(reference))
+            # Only the score is used, the same as for every short pair.
+            similarity = merger._fast_parasail_alignment(query, reference)[0]
             scores.append((query_index, reference_index, similarity))
     return scores
 
@@ -354,30 +350,15 @@ def _alignment_pair_task(args):
 
 
 def mappy_body_once(query, template, aligner):
-    """One map() invocation, forward primary hit only; no exact rescue.
-
-    D covers unmatched reference ends and I preserves unmatched query ends, so
-    the body spans the whole template. A failed mapping is kept separate.
+    """Body of QUERY on TEMPLATE as every pair is aligned
+    (graphvcfmerge._pair_body: the best global alignment up to
+    _GLOBAL_ALIGN_MAX, otherwise the stitched forward hits of ALIGNER, the
+    template's index); no exact rescue. A failed mapping is kept separate.
     """
+    import graphvcfmerge as merger
     if not query or not template:
         return None
-    if query.upper() == template.upper():
-        return f"{len(query)}="  # Identity needs no mapper invocation.
-    best = None
-    for hit in aligner.map(query):
-        if hit.is_primary and hit.strand == 1 and hit.cigar_str and (
-            best is None or hit.mlen > best.mlen
-        ):
-            best = hit
-    if best is None:
-        return None
-    if not (0 <= best.r_st < best.r_en <= len(template)
-            and 0 <= best.q_st < best.q_en <= len(query)):
-        raise ValueError("mappy returned invalid alignment coordinates")
-    return ((f"{best.r_st}D" if best.r_st else "")
-            + (f"{best.q_st}I" if best.q_st else "") + best.cigar_str
-            + (f"{len(query) - best.q_en}I" if best.q_en < len(query) else "")
-            + (f"{len(template) - best.r_en}D" if best.r_en < len(template) else ""))
+    return merger._pair_body(query, template, lambda: aligner)
 
 
 def _align_task(args):
@@ -597,8 +578,8 @@ class OnlineGroupMatcher:
     def closest(self, query, groups, mapped=None, workers=1):
         return _closest_group_members(
             query, groups, self.members, self.locators, self.store, self.root,
-            self.executable, float(self.context.get("size_similarity", 0.7)),
-            float(self.context.get("sequence_similarity", 0.7)), mapped or _serial_map, workers,
+            self.executable, float(self.context.get("size_similarity", 0.5)),
+            float(self.context.get("sequence_similarity", 0.5)), mapped or _serial_map, workers,
         )
 
     def close(self):
@@ -756,8 +737,8 @@ def refine_loaded(members, sequences, row_ids, context, pooled_map=None, workers
     import graphvcfmerge as merger
     mapped = pooled_map or _serial_map
     executable = resolve_kmermatch(context.get("kmermatch", DEFAULT_KMERMATCH))
-    size_threshold = float(context.get("size_similarity", 0.7))
-    sequence_threshold = float(context.get("sequence_similarity", 0.7))
+    size_threshold = float(context.get("size_similarity", 0.5))
+    sequence_threshold = float(context.get("sequence_similarity", 0.5))
     with tempfile.TemporaryDirectory(prefix="merge-kmer-") as directory:
         root = Path(directory)
         store = str(root / "sequences.bin")
@@ -996,8 +977,8 @@ def refine_kmer_first(members, sequences, row_ids, context,
     import graphvcfmerge as merger
     mapped = pooled_map or _serial_map
     executable = resolve_kmermatch(context.get("kmermatch", DEFAULT_KMERMATCH))
-    size_threshold = float(context.get("size_similarity", 0.7))
-    sequence_threshold = float(context.get("sequence_similarity", 0.7))
+    size_threshold = float(context.get("size_similarity", 0.5))
+    sequence_threshold = float(context.get("sequence_similarity", 0.5))
     with tempfile.TemporaryDirectory(prefix="merge-kmer-timeout-") as directory:
         root = Path(directory)
         store = str(root / "sequences.bin")
@@ -1182,4 +1163,35 @@ def refine_cluster(members, context, pooled_map=None, workers=1):
 
     if exact_small(members, context):
         return refine_exact(members, list(sequences()), row_ids)
-    return refine_loaded(members, sequences(), row_ids, context, pooled_map, workers)
+    refined = refine_loaded(members, sequences(), row_ids, context, pooled_map, workers)
+    if context.get("partial_merge_singleton"):
+        refined = _split_partial_singletons(refined, context, pooled_map, workers)
+    return refined
+
+
+def _split_partial_singletons(refined, context, pooled_map, workers):
+    """--partial-merge: a representative of at least the large-singleton size
+    whose largest other member is below the size cutoff (--size-similarity)
+    of it is a singleton. It keeps a row of its own; the other members are
+    refined again, so the largest one mapping becomes their representative."""
+    minimum, ratio = context["partial_merge_singleton"]
+    split = []
+    for representative, group in refined:
+        others = [member for member in group if member[4] != representative[4]]
+        if (not others or representative[2] < minimum
+                or max(member[2] for member in others) >= ratio * representative[2]):
+            split.append((representative, group))
+            continue
+        print(
+            f"[merge:kmer] partial-merge singleton {representative[4]} "
+            f"({representative[2]} bp): {len(others)} member(s) re-refined",
+            file=sys.stderr, flush=True,
+        )
+        split.append((representative, [representative + (None,)]))
+        others = [member[:-1] for member in others]
+        if len(others) == 1:
+            split.append((others[0], [others[0] + (None,)]))
+        else:
+            split.extend(refine_cluster(others, context, pooled_map, workers))
+    split.sort(key=lambda group: (min(m[0] for m in group[1]), min(m[4] for m in group[1])))
+    return split

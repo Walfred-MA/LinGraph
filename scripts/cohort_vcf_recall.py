@@ -201,7 +201,7 @@ def run(output, mode='svonly', *, graph=None, reference=None, assembly_list=None
     if missing:
         raise FileNotFoundError('--recall-only requires existing inputs; it will not rebuild them:\n' + '\n'.join(sorted(missing)))
     settings = {key: merge_config.get(key, default) for key, default in (
-        ('merge_distance', 500), ('size_similarity', .7), ('sequence_similarity', .7), ('var_in_insert', 100))}
+        ('merge_distance', 500), ('size_similarity', .5), ('sequence_similarity', .5), ('var_in_insert', 100))}
     ignore_full_locus_dup_insertions = bool(
         merge_config.get(
             'ignore_full_locus_dup_insertions',

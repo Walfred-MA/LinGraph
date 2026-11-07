@@ -17,6 +17,7 @@ import time
 
 import graphvcfmerge as sv
 import graphvcfmerge_snp as snp
+import cohort_merge_stats as merge_stats
 
 
 def add_modes(parser):
@@ -38,7 +39,11 @@ def add_modes(parser):
     parser.add_argument(
         '--no-merge-realignment', action='store_true',
         help='with --exact: do not realign shifted members onto their row\'s '
-             'breakpoint; each keeps its own row')
+             'breakpoint (the forced shift still moves small shifts unless --no-shift)')
+    parser.add_argument(
+        '--no-shift', action='store_true',
+        help='with --exact: no forced shift (movement rule with edge I/D) of shifted '
+             'members; with --no-merge-realignment every shifted member keeps its own row')
     return group
 
 
@@ -62,13 +67,23 @@ def resolve_realignment(args):
     return False
 
 
+def resolve_shift(args):
+    """False for --no-shift, which only applies to --exact."""
+    if not getattr(args, 'no_shift', False):
+        return True
+    if resolve_exact(args) is None:
+        raise ValueError('--no-shift applies to --exact only')
+    return False
+
+
 def mode_arguments(args):
     """Command-line form of the resolved mode, for forwarding to a backend."""
     exact = resolve_exact(args)
     if exact is None:
         return ['--' + resolve_mode(args)]
     return (['--exact'] + ([] if exact == 'auto' else [str(exact)])
-            + ([] if resolve_realignment(args) else ['--no-merge-realignment']))
+            + ([] if resolve_realignment(args) else ['--no-merge-realignment'])
+            + ([] if resolve_shift(args) else ['--no-shift']))
 
 
 def file_stamp(path):
@@ -214,7 +229,9 @@ def input_paths(output, listing=None):
 def combine(paths, output, split=None):
     """Union compatible headers/samples and coordinate-sort VCF records on disk.
     SPLIT = (route, other path): the rows ROUTE(row) accepts are written to
-    the other file (same header) instead of OUTPUT; ROUTE.reset() restarts it."""
+    the other file (same header) instead of OUTPUT; ROUTE.reset() restarts it.
+    Returns [(path, cohort_merge_stats table)] for OUTPUT (and the other file):
+    the rows each one received, counted while they are written."""
     paths = [str(path) for path in paths]
     samples, metadata, seen, file_samples, definitions = [], [], set(), [], {}
     known = set()
@@ -246,8 +263,15 @@ def combine(paths, output, split=None):
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     contig_order = sv._contig_order(metadata)
-    if len(paths) == 1 and _combine_sorted(paths[0], output, metadata, samples, contig_order, split):
-        return
+    stats = [merge_stats.RowStats(output)] + ([merge_stats.RowStats(split[1])] if split else [])
+
+    def tables():
+        return [(s.path, s.table()) for s in stats]
+
+    if len(paths) == 1 and _combine_sorted(paths[0], output, metadata, samples, contig_order, split, stats):
+        return tables()
+    for s in stats:
+        s.reset()
     import tempfile
     with tempfile.TemporaryDirectory(prefix='combine-vcf-', dir=output.parent) as directory:
         body, ordered = Path(directory)/'rows.tsv', Path(directory)/'sorted.tsv'
@@ -273,7 +297,13 @@ def combine(paths, output, split=None):
             with ordered.open() as source:
                 for raw in source:
                     row = raw.split('\t', 1)[1]
-                    (other if other is not None and split[0](row) else handle).write(row)
+                    if other is not None and split[0](row):
+                        other.write(row)
+                        stats[1].add(row)
+                    else:
+                        handle.write(row)
+                        stats[0].add(row)
+    return tables()
 
 
 # A merged VCF arrives in (or close to) publication order: its rows are copied
@@ -285,7 +315,7 @@ class _Unsortable(Exception):
     """A row only the full parse and sort reproduces (or reports) exactly."""
 
 
-def _combine_sorted(path, output, metadata, samples, contig_order, split=None):
+def _combine_sorted(path, output, metadata, samples, contig_order, split=None, stats=None):
     """Write one file's rows in the order combine()'s external sort gives:
     contig rank, CHROM, POS, REF, ALT, ID, then the whole line (sort's last
     resort), compared as bytes like LC_ALL=C.  False when the full sort is
@@ -340,7 +370,12 @@ def _combine_sorted(path, output, metadata, samples, contig_order, split=None):
                 other_body = other.tell()
 
             def write(line):
-                (other if other is not None and split[0](line) else out).write(line + b'\n')
+                if other is not None and split[0](line):
+                    other.write(line + b'\n')
+                    stats and stats[1].add(line)
+                else:
+                    out.write(line + b'\n')
+                    stats and stats[0].add(line)
 
             starts, previous = [], None
             with open(path, 'rb') as source:
@@ -360,6 +395,8 @@ def _combine_sorted(path, output, metadata, samples, contig_order, split=None):
                     other.seek(other_body)
                     other.truncate()
                     split[0].reset()
+                for s in stats or ():
+                    s.reset()
                 ends = starts[1:] + [None]
                 for current in heapq.merge(*(keyed(start, end) for start, end in zip(starts, ends))):
                     write(current[-1])
@@ -457,15 +494,16 @@ def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
         # One process per category file: each combine is a separate stream.
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=len(targets)) as pool:
-            for done in [pool.submit(combine, [source], target, splits.get(str(target)))
-                         for source, target in zip(sources, targets)]:
-                done.result()
+            tables = [table for done in [pool.submit(combine, [source], target, splits.get(str(target)))
+                                         for source, target in zip(sources, targets)]
+                      for table in done.result()]
     else:
-        combine(sources, targets[0], splits.get(str(targets[0])))
+        tables = combine(sources, targets[0], splits.get(str(targets[0])))
     for _route, path in splits.values():
         rows = sum(1 for line in open(path) if not line.startswith('#'))
         print(f'[cohort-merge] large singleton insertions (NSUP=1, >= {large_singleton_size} bp): '
               f'{rows} row(s) in {path}', flush=True)
+    merge_stats.write_summary(output, tables)
     if sample_vcfs is None:
         try:
             sample_vcfs = input_paths(output)
@@ -483,15 +521,17 @@ def publish(output, mode, *, sv_input=None, snp_input=None, indel_input=None,
 
 
 def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=20,
-        merge_distance=500, size_similarity=.7, sequence_similarity=.7, var_in_insert=100,
+        merge_distance=500, size_similarity=.5, sequence_similarity=.5, var_in_insert=100,
         kmermatch=sv.DEFAULT_KMERMATCH, dry_run=False, keep_merge_tmpdir=False,
         ignore_full_locus_dup_insertions=True, exact=None, reference_fastas=(),
-        realignment=True, large_singleton_size=LARGE_SINGLETON_SIZE):
+        realignment=True, shift=True, large_singleton_size=LARGE_SINGLETON_SIZE):
     paths = list(paths) if paths is not None else input_paths(output, listing)
     if exact and mode != 'all':
         raise ValueError('--exact merges like --all')
     if not realignment and not exact:
         raise ValueError('--no-realignment applies to --exact only')
+    if not shift and not exact:
+        raise ValueError('--no-shift applies to --exact only')
     if not paths or processes < 1 or cutoff < 1:
         raise ValueError('merge requires input VCFs and positive process count/cutoff')
     print(f'[cohort-merge] mode={mode}; {len(paths)} input VCFs; {processes} workers', flush=True)
@@ -504,7 +544,8 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
                       size_similarity=size_similarity, sequence_similarity=sequence_similarity,
                       var_in_insert=var_in_insert, kmermatch=kmermatch,
                       ignore_full_locus_dup_insertions=ignore_full_locus_dup_insertions,
-                      exact=exact, reference_fastas=reference_fastas, realignment=realignment)
+                      exact=exact, reference_fastas=reference_fastas, realignment=realignment,
+                      shift=shift)
     plan['large_singleton_size'] = large_singleton_size
     stage_sv_scan(plan, processes)
     stage_sv_chrom(plan, sv_chroms(plan), processes)
@@ -523,11 +564,21 @@ def run(output, mode='svonly', *, listing=None, paths=None, processes=1, cutoff=
 # (locally one after another, or as Slurm jobs) from the JSON plan. A stage
 # that does not apply to the plan's mode does nothing.
 
-def merge_plan(output, mode, paths, *, cutoff=20, merge_distance=500, size_similarity=.7,
-               sequence_similarity=.7, var_in_insert=100, kmermatch=sv.DEFAULT_KMERMATCH,
+def merge_plan(output, mode, paths, *, cutoff=20, merge_distance=500, size_similarity=.5,
+               sequence_similarity=.5, var_in_insert=100, kmermatch=sv.DEFAULT_KMERMATCH,
                ignore_full_locus_dup_insertions=True, exact=None, reference_fastas=(),
-               realignment=True):
-    """Inputs, settings and work folder (OUTPUT/tmp/merge_only/IDENTITY) of a merge."""
+               realignment=True, shift=True, partial_merge=False,
+               large_singleton_size=LARGE_SINGLETON_SIZE,
+               partial_merge_min_size=sv._PARTIAL_MERGE_MIN_SIZE, merge_recurrent=False):
+    """Inputs, settings and work folder (OUTPUT/tmp/merge_only/IDENTITY) of a merge.
+    partial_merge: no size cutoff, --exact moves judged on the shorter allele,
+    an insertion representative of at least large_singleton_size whose
+    largest other member is below size_similarity of it keeps its own row,
+    and insertion similarity leaves trimmed edges out of its denominator but
+    needs a score of min(partial_merge_min_size, half the shorter).
+    merge_recurrent (--exact): insertion rows of at least
+    partial_merge_min_size merge into longer nearby rows at the end of the
+    top level (graphvcfmerge._exact_merge_recurrent)."""
     paths = [str(path) for path in paths]
     exact_query_paths, reference_fastas = (
         exact_inputs(output, exact, reference_fastas) if exact else (None, [])
@@ -539,6 +590,20 @@ def merge_plan(output, mode, paths, *, cutoff=20, merge_distance=500, size_simil
     if exact and not realignment:
         # Only when off: default --exact merges keep their work folder.
         settings['realignment'] = False
+    if exact and not (realignment and shift):
+        # Only when off: before --no-shift, --no-realignment merges never shifted.
+        settings['shift'] = bool(shift)
+    if partial_merge:
+        # Only when on: default merges keep their work folder.
+        # The chromosome stage drops the size cutoff; size_similarity stays
+        # for its singleton test.
+        settings['partial_merge'] = True
+        settings['large_singleton_size'] = large_singleton_size
+        settings['partial_merge_min_size'] = partial_merge_min_size
+    if exact and merge_recurrent:
+        # Only when on: default merges keep their work folder.
+        settings['merge_recurrent'] = True
+        settings['partial_merge_min_size'] = partial_merge_min_size
     identity_settings = dict(
         settings,
         ignore_full_locus_dup_insertions=bool(
@@ -658,8 +723,8 @@ def main(argv=None):
     parser.add_argument('-t', '--processes', type=int, default=1)
     parser.add_argument('--svcutoff', type=int, default=20)
     parser.add_argument('--merge-distance', type=int, default=500)
-    parser.add_argument('--size-similarity', type=float, default=.7)
-    parser.add_argument('--sequence-similarity', type=float, default=.7)
+    parser.add_argument('--size-similarity', type=float, default=.5)
+    parser.add_argument('--sequence-similarity', type=float, default=.5)
     parser.add_argument('--var-in-insert', type=int, default=100)
     parser.add_argument('--kmermatch', default=sv.DEFAULT_KMERMATCH)
     parser.add_argument('--reference-fasta', action='append', default=[],
@@ -706,7 +771,8 @@ def main(argv=None):
             ignore_full_locus_dup_insertions=(
                 args.ignore_full_locus_dup_insertions
             ), exact=resolve_exact(args), reference_fastas=args.reference_fasta,
-            realignment=resolve_realignment(args), large_singleton_size=args.large_singleton_size)
+            realignment=resolve_realignment(args), shift=resolve_shift(args),
+            large_singleton_size=args.large_singleton_size)
     return 0
 
 

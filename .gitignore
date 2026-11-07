@@ -7,6 +7,10 @@ __pycache__/
 .snakemake/
 *.o
 *.d
+.venv-mutant/
+/scripts/KmerTree
+/scripts/KmerTree.build.json
+/scripts/.KmerTree.build.lock
 
 # Compiled pipeline executables
 /scripts/KmerSearcher

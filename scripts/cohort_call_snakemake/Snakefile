@@ -177,14 +177,25 @@ if MERGE_EXACT and MERGE_MODE != "all":
 MERGE_REALIGNMENT = as_bool(MERGE_RUN.get("merge_realignment", True))
 if not MERGE_REALIGNMENT and not MERGE_EXACT:
     raise ValueError("merge config: merge_realignment false requires exact")
+# --no-shift: --exact without the forced shift (movement rule) of shifted members.
+MERGE_SHIFT = as_bool(MERGE_RUN.get("merge_shift", True))
+if not MERGE_SHIFT and not MERGE_EXACT:
+    raise ValueError("merge config: merge_shift false requires exact")
 MERGE_EMIT_SMALL = MERGE_MODE in ("all", "svindel")
 MERGE_SMALL_OPTION = "--output-small" if MERGE_EMIT_SMALL else ""
 MERGE_DISTANCE = int(MERGE_RUN.get("merge_distance", 500))
-MERGE_SIZE_SIMILARITY = float(MERGE_RUN.get("size_similarity", 0.7))
+MERGE_SIZE_SIMILARITY = float(MERGE_RUN.get("size_similarity", 0.5))
 MERGE_SEQUENCE_SIMILARITY = float(
-    MERGE_RUN.get("sequence_similarity", 0.7)
+    MERGE_RUN.get("sequence_similarity", 0.5)
 )
 MERGE_VAR_IN_INSERT = int(MERGE_RUN.get("var_in_insert", 100))
+# --partial-merge: no size cutoff, insertion similarity without the trimmed
+# edges in its denominator (score at least min(min size, half the shorter)).
+MERGE_PARTIAL = as_bool(MERGE_RUN.get("partial_merge", False))
+MERGE_PARTIAL_MIN_SIZE = int(MERGE_RUN.get("partial_merge_min_size", 300))
+# --merge-recurrent: insertion rows merged into longer nearby ones at the end
+# of the top level (graphvcfmerge._exact_merge_recurrent).
+MERGE_RECURRENT = as_bool(MERGE_RUN.get("merge_recurrent", False))
 # Publish writes large singleton insertions to cohort.sv.10Ksingleton.vcf
 # instead of cohort.sv.vcf (0 = off); a Snakemake --config value, not part of
 # the run configuration.
@@ -324,6 +335,14 @@ def merge_chrom_runner():
         command.extend(["--insertion-snps", str(MERGE_TMPDIR / "insertion_snps")])
     if not MERGE_REALIGNMENT:
         command.append("--no-realignment")
+    if not MERGE_SHIFT:
+        command.append("--no-shift")
+    if MERGE_PARTIAL:
+        command.extend(["--partial-merge", "--partial-merge-min-size", str(MERGE_PARTIAL_MIN_SIZE)])
+    if MERGE_RECURRENT:
+        command.append("--merge-recurrent")
+        if not MERGE_PARTIAL:
+            command.extend(["--partial-merge-min-size", str(MERGE_PARTIAL_MIN_SIZE)])
     return shlex.join(command)
 
 

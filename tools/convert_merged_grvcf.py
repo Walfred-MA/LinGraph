@@ -348,10 +348,12 @@ def trim(r0, r1, bases, q0, q1, strand, reference, chrom):
     return r0 + left, r1 - right, bases, q0, q1
 
 
-def closest_shift(r0, bases, q0, q1, strand, representative, reference, chrom):
+def closest_shift(r0, bases, q0, q1, strand, representative, reference, chrom,
+                  blocked=lambda position: False):
     """An insertion slides through reference bases equal to its own ends. The
     exact version keeps no sample breakpoint, so take the placement whose
-    sequence best matches the row's representative (fewest edits on re-merge)."""
+    sequence best matches the row's representative (fewest edits on re-merge).
+    It never slides to a blocked position (inside the sample's own deletion)."""
     def score(sequence):
         prefix = 0
         while prefix < min(len(sequence), len(representative)) and \
@@ -368,6 +370,8 @@ def closest_shift(r0, bases, q0, q1, strand, representative, reference, chrom):
     for step in (1, -1):
         position, sequence, shift = r0, bases, 0
         while abs(shift) < len(bases):
+            if blocked(position + step):
+                break
             if step == 1:
                 if position >= length or reference.fetch(chrom, position, position + 1).upper() \
                         != sequence[0].upper():
@@ -419,6 +423,30 @@ def join_family(pieces, reference, chrom, stats):
     return w0, w1, hap, q0, q1
 
 
+def join_by_query(pieces, stats):
+    """One call from pieces laid end to end in query order (no query gap) whose
+    reference intervals cover one interval, e.g. a deletion row, its _F piece
+    and the sample's own substitution insertion inside the row's deletion;
+    else None."""
+    strand, contig = pieces[0][4].strand, pieces[0][4].contig
+    if any(obs.contig != contig or obs.strand != strand for *_rest, obs in pieces):
+        return None
+    ordered = sorted(pieces, key=lambda piece: piece[4].q0 if strand != '-' else -piece[4].q1)
+    for before, after in zip(ordered, ordered[1:]):
+        if (after[4].q0 != before[4].q1) if strand != '-' else (after[4].q1 != before[4].q0):
+            return None
+    spans = sorted((r0, r1) for r0, r1, *_rest in pieces)
+    reach = spans[0][1]
+    for r0, r1 in spans[1:]:
+        if r0 > reach:
+            return None
+        reach = max(reach, r1)
+    first, last = ordered[0][4], ordered[-1][4]
+    q0, q1 = (last.q0, first.q1) if strand == '-' else (first.q0, last.q1)
+    stats['joined_calls_by_query'] += 1
+    return spans[0][0], reach, ''.join(piece[2] for piece in ordered), q0, q1
+
+
 def sample_calls(sample, exact, reference, stats):
     """The sample's SV calls: (chrom, r0, r1, bases, contig, q0, q1, strand, obs, record)."""
     rebuild = Rebuild(sample, exact, stats)
@@ -431,12 +459,29 @@ def sample_calls(sample, exact, reference, stats):
         for record, obs in snps:
             families[(chrom, family)].append((record.pos - 1, record.pos, record.alt, record, obs))
     calls = []
-    for (chrom, _family), pieces in families.items():
+    consumed = set()
+    # Families with pieces first: one whose pieces do not line up may also
+    # hold the sample's own calls inside its reference window (exact).
+    for key in sorted(families, key=lambda key: (len(families[key]) < 2, key)):
+        if key in consumed:
+            continue
+        (chrom, _family), pieces = key, families[key]
         main = next((piece for piece in pieces if piece[3].svtype != 'SNP'
                      and not FLANK.search(piece[3].id)),
                     next((piece for piece in pieces if piece[3].svtype != 'SNP'), pieces[0]))
         record, obs = main[3], main[4]
         joined = join_family(pieces, reference, chrom, stats) if len(pieces) > 1 else None
+        if joined is None and exact and len(pieces) > 1:
+            w0, w1 = min(piece[0] for piece in pieces), max(piece[1] for piece in pieces)
+            inside = [other for other in families
+                      if other not in consumed and other != key and other[0] == chrom
+                      and len(families[other]) == 1
+                      and families[other][0][3].svtype != 'SNP'
+                      and w0 <= families[other][0][0] and families[other][0][1] <= w1]
+            if inside:
+                joined = join_by_query(pieces + [families[other][0] for other in inside], stats)
+                if joined is not None:
+                    consumed.update(inside)
         if joined is None:
             if len(pieces) > 1:
                 for r0, r1, bases, piece_record, piece_obs in pieces:
@@ -451,13 +496,23 @@ def sample_calls(sample, exact, reference, stats):
         else:
             r0, r1, bases, q0, q1 = joined
         r0, r1, bases, q0, q1 = trim(r0, r1, bases, q0, q1, obs.strand, reference, chrom)
-        if exact and r1 == r0 and bases and record.svtype == 'INS' and record.seq:
-            moved = closest_shift(r0, bases, q0, q1, obs.strand, record.seq, reference, chrom)
-            if moved[0] != r0:
-                stats['insertions_reslid'] += 1
-            r0, bases, q0, q1 = moved
-            r1 = r0
         calls.append((chrom, r0, r1, bases, obs.contig, q0, q1, obs.strand, obs, record))
+    # Insertions slide last, around the sample's own deletions (an insertion
+    # at a deletion's start keeps bases equal to the deleted ones).
+    deleted = defaultdict(list)
+    for call in calls:
+        if call[2] > call[1]:
+            deleted[call[0]].append((call[1], call[2]))
+    for index, (chrom, r0, r1, bases, contig, q0, q1, strand, obs, record) in enumerate(calls):
+        if not (exact and r1 == r0 and bases and record.svtype == 'INS' and record.seq):
+            continue
+        spans = deleted.get(chrom, ())
+        moved = closest_shift(r0, bases, q0, q1, strand, record.seq, reference, chrom,
+                              lambda position: any(a < position < b for a, b in spans))
+        if moved[0] != r0:
+            stats['insertions_reslid'] += 1
+        r0, bases, q0, q1 = moved
+        calls[index] = (chrom, r0, r0, bases, contig, q0, q1, strand, obs, record)
     for (chrom_parent), items in sample.children.items():
         for child, child_obs in items:
             if (child.id, child_obs.key()) not in rebuild.used:
